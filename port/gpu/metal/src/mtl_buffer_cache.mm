@@ -2,6 +2,12 @@
 // tlg Metal renderer: guest memory as MTLBuffers (see buffer_cache.h in metal/shadow).
 
 #include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+#include <string>
+#include <mutex>
+#include <map>
+#include <chrono>
 #include <cstring>
 
 #include "common/alignment.h"
@@ -13,6 +19,75 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace VideoCore {
+
+namespace {
+// TLG_LOG_WRITE_RACE: guest page -> command buffer tick of the last binding that reads it.
+struct ReadPages {
+    std::mutex mutex;
+    std::unordered_map<u64, u64> last_read;
+    std::map<std::pair<u64, u64>, u64> big_reads; // [start, end) -> tick (bindings over 4 MiB)
+    u64 writes = 0, raced = 0, big_bindings = 0;
+    std::map<std::pair<std::string, u64>, u64> where; // (what, size) -> count
+    std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+ReadPages& Reads() {
+    static ReadPages reads;
+    return reads;
+}
+constexpr u64 RacePage = 4096;
+} // namespace
+
+bool BufferCache::WriteRaceEnabled() {
+    static const bool enabled = std::getenv("TLG_LOG_WRITE_RACE") != nullptr;
+    return enabled;
+}
+
+void BufferCache::NoteCpuWrite(VAddr addr, u64 size, const char* what) {
+    auto& r = Reads();
+    std::scoped_lock lock{r.mutex};
+    ++r.writes;
+    bool raced = false;
+    for (u64 page = addr / RacePage; page <= (addr + std::max<u64>(size, 1) - 1) / RacePage; ++page) {
+        if (const auto it = r.last_read.find(page); it != r.last_read.end() && !scheduler.IsFree(it->second)) {
+            raced = true;
+            break;
+        }
+    }
+    for (const auto& [range, tick] : r.big_reads) {
+        if (raced) {
+            break;
+        }
+        if (addr < range.second && addr + size > range.first && !scheduler.IsFree(tick)) {
+            raced = true;
+        }
+    }
+    if (raced) {
+        ++r.raced;
+        ++r.where[{what, size}];
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - r.window >= std::chrono::seconds(5)) {
+        std::printf("Write race (5 s): %llu CP writes, %llu to pages queued GPU work reads "
+                    "(%llu bindings over 4 MiB, as ranges)",
+                    (unsigned long long)r.writes, (unsigned long long)r.raced,
+                    (unsigned long long)r.big_bindings);
+        std::printf(" [%zu big ranges]", r.big_reads.size());
+        int shown = 0;
+        for (const auto& [key, count] : r.where) {
+            if (shown++ < 6) {
+                std::printf("; %s %llu bytes x%llu", key.first.c_str(),
+                            (unsigned long long)key.second, (unsigned long long)count);
+            }
+        }
+        std::printf("\n");
+        r.writes = r.raced = r.big_bindings = 0;
+        r.where.clear();
+        if (r.last_read.size() > (1u << 22)) {
+            r.last_read.clear();
+        }
+        r.window = now;
+    }
+}
 
 namespace {
 constexpr u64 HostPage = 16_KB;
@@ -91,6 +166,19 @@ bool BufferCache::IsInPlace(VAddr addr, u64 size) {
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr addr, u64 size, bool is_written) {
+    if (WriteRaceEnabled() && addr && size) {
+        auto& r = Reads();
+        std::scoped_lock lock{r.mutex};
+        if (size > (4u << 20)) {
+            ++r.big_bindings;
+            r.big_reads[{addr, addr + size}] = scheduler.CurrentTick();
+        } else {
+            const u64 tick = scheduler.CurrentTick();
+            for (u64 page = addr / RacePage; page <= (addr + size - 1) / RacePage; ++page) {
+                r.last_read[page] = tick;
+            }
+        }
+    }
     if (addr >= unified_base && addr + size <= unified_end) {
         return {unified.get(), addr - unified->CpuAddr()};
     }

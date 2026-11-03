@@ -195,8 +195,50 @@ fixed shader: 30 FPS for 260 s, GPU idle afterwards.
 
 ## Known issues
 
-- Intro video, Metal build (2026-11-03, reported by the player): a few stutters and frames shown out of
-  order. Likely the video frame texture is read (CPU-written guest memory, presented or sampled)
-  before the decoder's new frame has landed, or a stale copy is reused: check how video frames
-  reach the GPU (texture cache invalidation of the CPU-written frame buffers vs the now-deeper
-  GPU queue; see "Frame rate": barriers no longer drain the GPU). Low priority.
+- Intro video, Metal build (2026-11-03, reported by the player: stutters, frames out of
+  order). Investigated, see "Intro video pacing" below; no out-of-order frame reproduced.
+
+## Intro video pacing (2026-11-03)
+
+Tools: `tests/play.sh intro` (Continue at the title, then no input), `DUMP_COUNT=<n>` bursts of
+consecutive frames, `TLG_METAL_CONTENT_STATS=1` (8 rows of each flipped frame read back and
+hashed: new pictures and runs of repeats every 5 s, no disk writes), `TLG_METAL_PRESENT_STATS=1`
+(GPU-ready and drawable waits), `TLG_LOG_UPLOAD_RACE=1` (CPU-written images changed between
+recording their upload and the GPU copying them).
+- Windowed and covered by other windows, macOS composites the layer at 30 Hz: `nextDrawable`
+  waited ~33 ms and everything ran at exactly 30 FPS. Fullscreen: 60 FPS. Benchmark Metal in
+  fullscreen (`work/tlg-metal-fs.ini`).
+- Fullscreen: the text crawl shows 60 new pictures per second, perfectly even; the cinematic
+  (~100-140 s) 30 per second with 0-8 per 5 s held 3 flips (the next 1). No repeated, skipped
+  or out-of-order picture in 400 burst frames; upload races 1 in 1780 (not the video).
+- The emulated vblank was a free-running 60 Hz timer drifting against the display. It now
+  ticks `TLG_VSYNC_LEAD_US` (6000) before a real refresh (CVDisplayLink on the main display,
+  `port/gpu/shim/tlg_vsync.h`, Metal only; `TLG_VSYNC_LOCK=0` = timer). The remaining 3/1
+  holds did not change measurably (game-side sampling of a 30 Hz animation at 60 Hz flips).
+- Likely what the player saw: the first runs after the macOS 27 update compiled every shader
+  cold on the command processor thread (33 s of stalls; fixed by the shader prewarm).
+
+## CPU writes vs queued GPU work (2026-11-03)
+
+Metal reads guest memory when the GPU runs, and the command processor thread runs ahead of the
+GPU, so its own writes (gfx/compute WRITE_DATA and DUMP_CONST_RAM are memcpys at record time)
+could reach memory that queued work has yet to read. `TLG_LOG_WRITE_RACE=1` tracks the guest
+pages each binding reads per command buffer (bindings over 4 MiB as ranges) and checks every
+such write: cannery gameplay, 30-45 writes/s, none to memory queued work reads. Images:
+`TLG_LOG_UPLOAD_RACE=1`, 1 of ~1780 uploads (an odd 182 MB "256x256" image), not visible.
+Nothing to fix so far; rerun both checks in new areas.
+
+## Async shaders (2026-11-03)
+
+The in-game `async_shaders` setting (off by default, as on Vulkan; `TLG_ASYNC_SHADERS=1`)
+now works on Metal: a new graphics permutation's MSL goes to the prewarm workers (they stay
+after startup) and its draws are skipped until the library is ready; the program remembers the
+pending permutation by its lookup specialization, so a skipped draw costs one lookup. Compute
+stays synchronous. With no MSL cache and a cold system cache (first visit): no compile stall
+(10-20 s bucket 26.9 FPS instead of a 33 s freeze), frames correct after the shaders land.
+
+## Fullscreen frame rate (2026-11-03)
+
+The "30 FPS locked" numbers above were windowed: a covered window is composited at 30 Hz.
+Fullscreen (`work/tlg-metal-fs.ini`), cannery route 40-130 s: Metal 49.7 FPS (median 16.7 ms,
+p95 33.3 ms), Vulkan (bundled app, player's fullscreen tlg.ini) 27.5 FPS (median 33.3 ms).

@@ -65,6 +65,6 @@ echo "  link $(basename "$EXE")"
 clang++ -o "$EXE" "$OBJ"/gen/*.o "$OBJ"/rt/*.o "$OBJ"/port/*.o "$OBJ"/atrac9/*.o \
     -Wl,-force_load,"$GPU/libtlggpu.a" "${GPU_LIBS[@]:1}" \
     -L/opt/homebrew/lib "${EXTRA_LIBS[@]}" -lfmt -lZydis -lxxhash "${PKG_LIBS[@]}" \
-    -framework Metal -framework QuartzCore -framework Foundation -framework IOKit -framework CoreFoundation \
+    -framework Metal -framework QuartzCore -framework CoreVideo -framework CoreGraphics -framework Foundation -framework IOKit -framework CoreFoundation \
     -Wl,-stack_size,0x4000000 -Wl,-segaddr,__TLGUSER,0x7000000000 -Wl,-segaddr,__TLGEND,0xfe00000000
 echo "Built $EXE"

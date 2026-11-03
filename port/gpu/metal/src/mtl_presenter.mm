@@ -1,3 +1,9 @@
+#include <chrono>
+#include "tlg_vsync.h"
+#import <QuartzCore/QuartzCore.h>
+#import <CoreVideo/CoreVideo.h>
+#include <mach/mach_time.h>
+#include <xxhash.h>
 // SPDX-License-Identifier: GPL-2.0-or-later
 // tlg Metal renderer: presentation to the window's CAMetalLayer.
 
@@ -84,6 +90,46 @@ MTLPixelFormat NonSrgb(MTLPixelFormat f) {
     }
 }
 
+// tlg: the display's refresh times for the emulated vblank (tlg_vsync.h). MTLDrawable
+// presentedTime stays 0 for this window on macOS, so a CVDisplayLink reports each upcoming
+// refresh (host time) instead. Deprecated, still the simplest source without a run loop.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+void StartDisplayLink() {
+    if (!TlgVsync::Enabled()) {
+        return;
+    }
+    static CVDisplayLinkRef link = nullptr;
+    if (link) {
+        return;
+    }
+    if (CVDisplayLinkCreateWithCGDisplay(CGMainDisplayID(), &link) != kCVReturnSuccess || !link) {
+        std::printf("GPU (Metal): no display link; vblank stays on the timer\n");
+        return;
+    }
+    static mach_timebase_info_data_t timebase;
+    mach_timebase_info(&timebase);
+    CVDisplayLinkSetOutputCallback(
+        link,
+        [](CVDisplayLinkRef, const CVTimeStamp*, const CVTimeStamp* out, CVOptionFlags,
+           CVOptionFlags*, void*) -> CVReturn {
+            if ((out->flags & kCVTimeStampHostTimeValid) && out->videoRefreshPeriod &&
+                out->videoTimeScale) {
+                const int64_t ns = int64_t(out->hostTime * timebase.numer / timebase.denom);
+                const int64_t period =
+                    int64_t(1e9 * double(out->videoRefreshPeriod) / double(out->videoTimeScale));
+                TlgVsync::NotePresented(ns, period);
+            }
+            return kCVReturnSuccess;
+        },
+        nullptr);
+    CVDisplayLinkStart(link);
+    const double period = CVDisplayLinkGetActualOutputVideoRefreshPeriod(link);
+    std::printf("GPU (Metal): display link on the main display (%.2f Hz)\n",
+                period > 0 ? 1.0 / period : 0.0);
+}
+#pragma clang diagnostic pop
+
 void WriteDump(id<MTLBuffer> buffer, u32 w, u32 h, int index) {
     const char* dir = std::getenv("TLG_DUMP_DIR");
     char path[512];
@@ -109,6 +155,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     metal_layer.framebufferOnly = YES;
     metal_layer.maximumDrawableCount = 3;
     metal_layer.displaySyncEnabled = TlgSettings::Get().vsync ? YES : NO;
+    StartDisplayLink();
     layer = (__bridge void*)metal_layer;
 
     NSError* error = nil;
@@ -296,6 +343,57 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         }
         draw_scheduler.EndEncoding();
+        // TLG_METAL_CONTENT_STATS=1: whether each flipped frame shows a new picture (8 rows of
+        // the frame are read back and hashed), as runs of repeats every 5 s. Flip timing alone
+        // cannot show a game that flips at 60 Hz but updates its picture at 15.
+        if (static const bool content_stats = std::getenv("TLG_METAL_CONTENT_STATS") != nullptr;
+            content_stats && frame->height >= 16) {
+            const u32 w = frame->width, rows = 8;
+            id<MTLBuffer> buffer = [Metal::Device() newBufferWithLength:size_t(w) * rows * 4
+                                                                options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(draw_scheduler);
+            for (u32 r = 0; r < rows; ++r) {
+                [blit copyFromTexture:target
+                                 sourceSlice:0
+                                 sourceLevel:0
+                                sourceOrigin:MTLOriginMake(0, (frame->height * (2 * r + 1)) / (2 * rows), 0)
+                                  sourceSize:MTLSizeMake(w, 1, 1)
+                                    toBuffer:buffer
+                           destinationOffset:size_t(r) * w * 4
+                      destinationBytesPerRow:w * 4
+                    destinationBytesPerImage:w * 4];
+            }
+            draw_scheduler.EndEncoding();
+            draw_scheduler.SignalOnCompletion([buffer, w, rows] {
+                static u64 last_hash = 0;
+                static u32 run = 0, frames = 0, fresh = 0, longest = 0;
+                static u32 runs[8] = {};
+                static auto window = std::chrono::steady_clock::now();
+                const u64 hash = XXH3_64bits(buffer.contents, size_t(w) * rows * 4);
+                ++frames;
+                if (hash != last_hash) {
+                    ++fresh;
+                    if (run) {
+                        ++runs[std::min<u32>(run, 7)];
+                    }
+                    longest = std::max(longest, run);
+                    run = 0;
+                    last_hash = hash;
+                } else {
+                    ++run;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now - window >= std::chrono::seconds(5)) {
+                    std::printf("Content stats (5 s): %u flips, %u new pictures; repeat runs "
+                                "1:%u 2:%u 3:%u 4+:%u, longest %u\n",
+                                frames, fresh, runs[1], runs[2], runs[3],
+                                runs[4] + runs[5] + runs[6] + runs[7], longest);
+                    frames = fresh = longest = 0;
+                    std::fill(std::begin(runs), std::end(runs), 0u);
+                    window = now;
+                }
+            });
+        }
         if (dump) {
             id<MTLBuffer> buffer =
                 [Metal::Device() newBufferWithLength:size_t(frame->width) * frame->height * 4
@@ -405,9 +503,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool) {
     if (!frame) {
         return;
     }
+    // TLG_METAL_PRESENT_STATS=1: time spent waiting for the frame's GPU work and the drawable.
+    static const bool present_stats = std::getenv("TLG_METAL_PRESENT_STATS") != nullptr;
+    static double ready_ms = 0, ready_max = 0, drawable_ms = 0, drawable_max = 0, gap_max = 0;
+    static u32 presents = 0;
+    static auto window_start = std::chrono::steady_clock::now();
+    static auto last_present = window_start;
+    const auto t_enter = std::chrono::steady_clock::now();
     if (frame->ready_tick) {
         draw_scheduler.Wait(frame->ready_tick);
     }
+    const auto t_ready = std::chrono::steady_clock::now();
     CAMetalLayer* metal_layer = (__bridge CAMetalLayer*)layer;
     const bool vsync = TlgSettings::Get().vsync;
     if (bool(metal_layer.displaySyncEnabled) != vsync) {
@@ -422,6 +528,26 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool) {
     }
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [metal_layer nextDrawable];
+        if (present_stats) {
+            const auto t_drawable = std::chrono::steady_clock::now();
+            const auto ms = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            const double r = ms(t_enter, t_ready), d = ms(t_ready, t_drawable);
+            ready_ms += r; drawable_ms += d;
+            ready_max = std::max(ready_max, r); drawable_max = std::max(drawable_max, d);
+            gap_max = std::max(gap_max, ms(last_present, t_enter));
+            last_present = t_enter;
+            ++presents;
+            if (ms(window_start, t_drawable) >= 5000.0) {
+                std::printf("Present stats (5 s): %u presents, GPU-ready wait avg %.1f max %.1f ms, "
+                            "drawable wait avg %.1f max %.1f ms, longest gap %.1f ms\n",
+                            presents, ready_ms / presents, ready_max, drawable_ms / presents,
+                            drawable_max, gap_max);
+                presents = 0; ready_ms = ready_max = drawable_ms = drawable_max = gap_max = 0;
+                window_start = t_drawable;
+            }
+        }
         if (!drawable) {
             if (!is_reusing_frame) {
                 std::scoped_lock lock{free_mutex};

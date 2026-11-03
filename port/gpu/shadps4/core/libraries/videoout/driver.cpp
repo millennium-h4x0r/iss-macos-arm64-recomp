@@ -21,6 +21,7 @@
 #include "tlg_freeze.h"
 #include "tlg_settings.h"
 #include "tlg_graphics.h"
+#include "tlg_vsync.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "common/debug.h"
@@ -799,6 +800,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
                                     : std::chrono::nanoseconds(0);
     auto next_flip = std::chrono::steady_clock::now();
+    auto last_tick = next_flip; // tlg: the previous vblank (TlgVsync)
+    bool vsync_locked = false;
     std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
                 EmulatorSettings.GetVblankFrequency(), frame_limit);
 
@@ -888,7 +891,26 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         if (!immediate_flips || main_port.flip_rate != 0) {
-            timer.End();
+            // tlg: tick just before a real display refresh when the presenter reports them.
+            std::chrono::steady_clock::time_point tick;
+            if (!immediate_flips && TlgVsync::NextTick(last_tick, vblank_period, tick)) {
+                if (!vsync_locked) {
+                    vsync_locked = true;
+                    std::printf("VideoOut: vblank locked to the display refresh (%.2f Hz, "
+                                "lead %.1f ms)\n",
+                                1e9 / double(TlgVsync::refresh_period_ns.load()),
+                                TlgVsync::Lead().count() / 1e6);
+                }
+                std::this_thread::sleep_until(tick);
+                last_tick = tick;
+            } else {
+                if (vsync_locked) {
+                    vsync_locked = false;
+                    std::printf("VideoOut: vblank back on the timer\n");
+                }
+                timer.End();
+                last_tick = std::chrono::steady_clock::now();
+            }
             continue;
         }
         while (!token.stop_requested()) {

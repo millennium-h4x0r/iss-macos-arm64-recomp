@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,7 @@
 #include "common/hash.h"
 #include "mtl_format.h"
 #include "mtl_objc.h"
+#include "tlg_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -50,6 +52,7 @@ std::atomic<u64> g_compile_ns{0};
 std::atomic<u32> g_compiles{0};
 std::atomic<u32> g_pipelines{0};
 std::atomic<u32> g_failed{0};
+std::atomic<u32> g_async_skips{0}, g_async_queued{0}; // tlg: async shaders
 std::atomic<u64> g_stage_ns[4]{}; // tlg: recompile+SPIR-V, SPIRV-Cross, MSL compile, render PSO
 inline u64 NsSince(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count();
@@ -112,6 +115,9 @@ struct Program {
     std::deque<Module> modules; ///< stable addresses: pipelines refer to them
     size_t last_used = 0;
     bool failed = false;
+    /// Async shaders: permutations whose MSL compiles in the background (lookup
+    /// specialization, MSL source); their draws are skipped meanwhile.
+    std::vector<std::pair<Shader::StageSpecialization, std::string>> pending;
     /// The inputs of the last permutation lookup: when a draw repeats them (user data, the
     /// flattened user data, runtime info, binding start and vertex attribute sharps), the
     /// permutation is the same and its specialization is not rebuilt (~15% of the command
@@ -301,7 +307,7 @@ public:
             }
             threads = std::max<u32>(cores, 3) - 2;
         }
-        if (!threads || sources.empty()) {
+        if (!threads) {
             return;
         }
         {
@@ -316,10 +322,39 @@ public:
         std::printf("GPU (Metal): precompiling %zu cached shaders on %u threads\n", queue.size(),
                     threads);
         start_time = std::chrono::steady_clock::now();
+        startup_left = queue.size();
         running = threads;
         for (u32 i = 0; i < threads; ++i) {
             std::thread([this] { Work(); }).detach();
         }
+    }
+
+    bool Running() const {
+        return running.load(std::memory_order_relaxed) != 0;
+    }
+
+    // Async shaders: the finished library for this source without taking it, or nil with
+    // `pending` set while it compiles (queued on first ask). nil without `pending`: compile it
+    // here (claimed, or already taken).
+    id<MTLLibrary> Poll(const std::string& source, bool& pending) {
+        const u64 key = XXH3_64bits(source.data(), source.size());
+        pending = false;
+        {
+            std::lock_guard lock{mutex};
+            const auto [it, inserted] = slots.emplace(key, Slot{});
+            if (inserted) {
+                queue.emplace_back(key, source);
+                pending = true;
+            } else if (it->second.state == State::Queued || it->second.state == State::Compiling) {
+                pending = true;
+            } else if (it->second.state == State::Done) {
+                return it->second.library;
+            }
+        }
+        if (pending) {
+            work_cv.notify_one();
+        }
+        return nil;
     }
 
     // A finished library for this source, after waiting for one in progress; nil when the
@@ -357,12 +392,16 @@ private:
             u64 key;
             std::string source;
             {
-                std::lock_guard lock{mutex};
-                while (next < queue.size() && slots[queue[next].first].state != State::Queued) {
-                    ++next;
-                }
-                if (next == queue.size()) {
-                    break;
+                std::unique_lock lock{mutex};
+                for (;;) {
+                    while (next < queue.size() && slots[queue[next].first].state != State::Queued) {
+                        ++next;
+                    }
+                    if (next < queue.size()) {
+                        break;
+                    }
+                    // Workers stay for async shaders (Poll queues more).
+                    work_cv.wait(lock);
                 }
                 key = queue[next].first;
                 source = std::move(queue[next].second);
@@ -382,20 +421,23 @@ private:
                 slot.library = library;
                 slot.state = State::Done;
                 ++compiled;
+                if (startup_left && --startup_left == 0) {
+                    std::printf("GPU (Metal): precompiled %u shaders in %.1f s (%u used so far)\n",
+                                compiled,
+                                std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                              start_time)
+                                    .count(),
+                                taken);
+                }
             }
             done_cv.notify_all();
-        }
-        if (--running == 0) {
-            std::lock_guard lock{mutex};
-            std::printf("GPU (Metal): precompiled %u shaders in %.1f s (%u used so far)\n", compiled,
-                        std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time)
-                            .count(),
-                        taken);
         }
     }
 
     std::mutex mutex;
     std::condition_variable done_cv;
+    std::condition_variable work_cv;
+    size_t startup_left = 0;
     std::unordered_map<u64, Slot> slots;
     std::vector<std::pair<u64, std::string>> queue;
     size_t next = 0;
@@ -793,6 +835,29 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         }
     }
 
+    // tlg: async shaders (the in-game setting, as on Vulkan): a new graphics permutation's MSL
+    // compiles on the prewarm workers and its draws are skipped until it is ready; compute
+    // stays synchronous (game logic). A pending permutation costs one lookup per draw.
+    const bool async = sw_stage != SwStage::Compute &&
+                       TlgSettings::Get().async_shaders.load(std::memory_order_relaxed) &&
+                       MslPrewarm::Get().Running();
+    std::optional<Shader::StageSpecialization> pending_key;
+    if (async) {
+        pending_key.emplace(info, runtime_info, profile, start);
+        for (auto it = program.pending.begin(); it != program.pending.end(); ++it) {
+            if (it->first == *pending_key) {
+                bool still = false;
+                MslPrewarm::Get().Poll(it->second, still);
+                if (still) {
+                    g_async_skips.fetch_add(1, std::memory_order_relaxed);
+                    return nullptr;
+                }
+                program.pending.erase(it); // ready: the compile below takes the library
+                break;
+            }
+        }
+    }
+
     // Compile a new permutation.
     const auto t0 = std::chrono::steady_clock::now();
     auto new_info = Shader::Info(hw_stage, sw_stage, params);
@@ -880,6 +945,17 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
                 return nullptr;
             }
             p = end ? end + 1 : p + n;
+        }
+    }
+    if (async) {
+        std::string source = MslSource(msl.msl);
+        bool still = false;
+        MslPrewarm::Get().Poll(source, still);
+        if (still) {
+            program.pending.emplace_back(*pending_key, std::move(source));
+            g_async_skips.fetch_add(1, std::memory_order_relaxed);
+            g_async_queued.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
         }
     }
     id<MTLFunction> fn = CompileMsl(msl, params.hash, sw_stage == SwStage::Compute ? "compute" : "graphics");
@@ -1321,6 +1397,12 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 }
 
 void PipelineCache::ReportCompilerStats() {
+    if (const u32 queued = g_async_queued.exchange(0), skips = g_async_skips.exchange(0);
+        queued || skips) {
+        std::printf("GPU (Metal): async shaders: %u queued, %u stage lookups skipped while "
+                    "compiling\n",
+                    queued, skips);
+    }
     const u32 compiles = g_compiles.exchange(0);
     if (compiles) {
         std::printf("GPU (Metal): %u shaders compiled (%.0f ms: recompile %.0f, spirv-cross %.0f, "

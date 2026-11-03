@@ -3,6 +3,7 @@
 # logging FPS, GPU utilization and memory every 10 s and dumping a frame every 10 s.
 #   tests/play.sh <route> [seconds] [save]
 # route: opening  - fresh start: skip cutscenes, tilt/shake the spray can, spray (L2)
+#        intro    - fresh start: Continue at the title, then the intro movie with no input
 #        explore  - free roaming: walk, sweep the camera, jump, climb, melee, interact
 # save:  fresh (no save: starts at the beginning), keep (whatever work/user has), or a
 #        folder name under work/saves (copied in; e.g. cannery-escape). Default: fresh for
@@ -13,12 +14,13 @@ set -uo pipefail
 cd -- "$(dirname -- "$0")/.."
 ROUTE=${1:?route: opening|explore}
 TOTAL=${2:-240}
-case $ROUTE in opening) DEFSAVE=fresh ;; *) DEFSAVE=cannery-escape ;; esac
+case $ROUTE in opening|intro) DEFSAVE=fresh ;; *) DEFSAVE=cannery-escape ;; esac
 SAVE=${3:-$DEFSAVE}
 WORK=$PWD/work
 OUT=$WORK/play/$ROUTE
 PY=${PY:-python3}
 DUMP_EVERY=${DUMP_EVERY:-10}   # seconds between frame dumps
+# DUMP_COUNT=<n>: consecutive frames per dump (frame_t<sec>_<index>.png when above 1)
 mkdir -p "$OUT"
 rm -f "$OUT"/frame_t*.png "$OUT"/*.raw "$OUT"/fps.txt
 
@@ -36,7 +38,7 @@ restore_save() {
 }
 trap 'pkill -x iss-recomp; pkill -9 -x iss-recomp-metal; restore_save; exit 1' INT TERM
 
-export TLG_PAD_FILE=$OUT/pad.txt TLG_DUMP_DIR=$OUT TLG_FRAME_DUMP_TRIGGER=$OUT/go TLG_FRAME_DUMP_COUNT=1
+export TLG_PAD_FILE=$OUT/pad.txt TLG_DUMP_DIR=$OUT TLG_FRAME_DUMP_TRIGGER=$OUT/go TLG_FRAME_DUMP_COUNT=${DUMP_COUNT:-1}
 export TLG_PERF_FRAMES=1
 : > "$TLG_PAD_FILE"
 : > "$OUT/stats.txt"
@@ -55,6 +57,10 @@ step_opening() {
     elif (( t >= 100 && t < 160 )); then pad tilt_right shake
     elif (( t >= 160 )); then pad l2 rx=$(( 64 + (t * 37) % 128 )) ry=$(( 64 + (t * 23) % 128 ))
     fi
+}
+step_intro() {   # press Continue once at the title, then watch the intro movie untouched
+    local t=$1
+    if (( t >= 42 && t < 44 )); then tap cross; fi
 }
 step_explore() {
     local t=$1
@@ -83,7 +89,11 @@ while kill -0 $PID 2>/dev/null; do
         echo "t=$now gpu_util=${util:-?}% gpu_mem_MB=$(( ${mem:-0} / 1048576 ))" >> "$OUT/stats.txt"
         touch "$OUT/go"
     fi
-    for f in "$OUT"/display_*.raw; do [[ -e $f ]] && mv "$f" "$OUT/frame_t$(printf %04d $now).raw"; done
+    for f in "$OUT"/display_*.raw; do
+        [[ -e $f ]] || continue
+        if [[ ${DUMP_COUNT:-1} == 1 ]]; then mv "$f" "$OUT/frame_t$(printf %04d $now).raw"
+        else idx=${f##*/display_}; mv "$f" "$OUT/frame_t$(printf %04d $now)_${idx%%_*}.raw"; fi
+    done
     rm -f "$OUT"/output_*.raw
     sleep 0.5
 done

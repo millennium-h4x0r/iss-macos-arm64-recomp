@@ -585,6 +585,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonConstRam);
             }
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
+#ifdef TLG_METAL
+            if (rasterizer && VideoCore::BufferCache::WriteRaceEnabled()) {
+                rasterizer->GetBufferCache().NoteCpuWrite(reinterpret_cast<VAddr>(dump_const->Address<void*>()),
+                                                          dump_const->Size(), "DUMP_CONST_RAM");
+            }
+#endif
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
             break;
@@ -1403,6 +1409,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     TlgWriteLog::NoteIntent(write_data->Address<u64>(), write_data->data,
                                            (count - 2) * sizeof(u32),
                                            TlgWriteLog::WriteDataIntent);
+#ifdef TLG_METAL
+                    if (VideoCore::BufferCache::WriteRaceEnabled()) {
+                        rasterizer->GetBufferCache().NoteCpuWrite(write_data->Address<VAddr>(),
+                                                                  (count - 2) * sizeof(u32),
+                                                                  "gfx WRITE_DATA");
+                    }
+#endif
                     if (rasterizer->RunInOrder(&RunWriteData, header, (count + 1) * sizeof(u32),
                                                TlgToggle::PipelinedMemoryWrites)) {
                         NotePendingWrite(*write_data, (count - 2) * sizeof(u32));
@@ -1919,6 +1932,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             ASSERT(!write_data->wr_one_addr.Value());
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
+#ifdef TLG_METAL
+            if (VideoCore::BufferCache::WriteRaceEnabled()) {
+                rasterizer->GetBufferCache().NoteCpuWrite(write_data->Address<VAddr>(), data_size,
+                                                          "compute WRITE_DATA");
+            }
+#endif
             if (pipelined) {
                 // In order with the draws and dispatches (on the draw recording thread).
                 if (rasterizer->RunInOrder(&RunWriteData, header,

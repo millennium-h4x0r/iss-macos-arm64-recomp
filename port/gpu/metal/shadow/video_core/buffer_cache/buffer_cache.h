@@ -40,6 +40,12 @@ public:
     /// The buffer holding [addr, addr + size) and the offset of addr in it. Guest memory outside
     /// every imported mapping is copied into the stream buffer (GPU writes there are lost).
     std::pair<const Buffer*, u64> ObtainBuffer(VAddr addr, u64 size, bool is_written);
+    /// tlg diagnosis (TLG_LOG_WRITE_RACE=1): a command processor write (WRITE_DATA, ...) to
+    /// guest pages that work in a command buffer the GPU has not finished reads. Metal reads
+    /// guest memory when the GPU runs, so that work would see the new value early.
+    static bool WriteRaceEnabled();
+    void NoteCpuWrite(VAddr addr, u64 size, const char* what);
+
     std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr addr, u64 size) {
         return ObtainBuffer(addr, size, false);
     }

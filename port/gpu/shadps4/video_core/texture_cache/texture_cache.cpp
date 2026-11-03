@@ -1526,6 +1526,33 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
 
+#ifdef TLG_METAL
+    // tlg diagnosis (TLG_LOG_UPLOAD_RACE=1): Metal's upload reads guest memory when the GPU runs
+    // the copy, not now. Hash the CPU-written image now and again when its command buffer
+    // completes; a difference means the CPU rewrote it in between (the GPU may have shown a
+    // later or torn picture).
+    if (static const bool race_log = std::getenv("TLG_LOG_UPLOAD_RACE") != nullptr;
+        race_log && !is_gpu_modified) {
+        static std::atomic<u32> checked{0}, raced{0};
+        const auto* addr = std::bit_cast<const u8*>(image.info.guest_address);
+        const u64 size = image.info.guest_size;
+        const u64 hash = XXH3_64bits(addr, size);
+        const u32 width = image.info.size.width, height = image.info.size.height;
+        const u32 format = u32(image.info.pixel_format);
+        scheduler.SignalOnCompletion([addr, size, hash, width, height, format] {
+            const u32 n = checked.fetch_add(1) + 1;
+            if (XXH3_64bits(addr, size) != hash) {
+                const u32 r = raced.fetch_add(1) + 1;
+                if (r <= 40 || r % 100 == 0) {
+                    std::printf("Upload race #%u of %u: image %p %ux%u format %u (%llu bytes) "
+                                "changed before the GPU copied it\n",
+                                r, n, (const void*)addr, width, height, format,
+                                (unsigned long long)size);
+                }
+            }
+        });
+    }
+#endif
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
