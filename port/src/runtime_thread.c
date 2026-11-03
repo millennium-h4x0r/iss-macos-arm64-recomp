@@ -23,7 +23,9 @@
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#ifdef __linux__
 #include <asm/prctl.h>
+#endif
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
@@ -52,6 +54,9 @@ typedef struct GuestThread {
     uint64_t os_tid;  /* freeze report: matches the OS thread list */
     uint32_t fp_mxcsr; uint16_t fp_x87cw; /* the creator's FP control: see host_start */
     RuntimeWait wait; /* freeze report: what the thread is blocked on */
+#ifdef TLG_RECOMP
+    void *guest_stack; size_t guest_stack_size;
+#endif
 #ifdef _WIN32
     tlg_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
 #else
@@ -90,6 +95,9 @@ static void set_gs(void *base) {
     if (!TlsSetValue(tls_slot,base)) { fprintf(stderr,"STOP: TlsSetValue failed (%lu)\n",GetLastError()); exit(21); }
 }
 #define tls_block_alloc(size) _aligned_malloc(size,64)
+#elif defined(TLG_RECOMP)
+static void set_gs(void *base) { recomp_set_fs(base); }
+#define tls_block_alloc(size) aligned_alloc(64,size)
 #else
 static void set_gs(void *base) {
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
@@ -230,6 +238,8 @@ static int thread_alive(uint64_t tid) {
     int alive=WaitForSingleObject(thread,0)==WAIT_TIMEOUT;
     CloseHandle(thread);
     return alive;
+#elif defined(__APPLE__)
+    (void)tid; return 1;
 #else
     return syscall(SYS_tgkill,(pid_t)getpid(),(pid_t)tid,0)==0 || errno!=ESRCH;
 #endif
@@ -416,7 +426,7 @@ static void wait_stats_start(void) {
         fputs("Runtime: wait stats thread not started\n",stderr);
         return;
     }
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     pthread_setname_np(thread,"tlg:waitstats");
 #endif
     pthread_detach(thread);
@@ -511,7 +521,11 @@ static ABI int32_t attr_set_guard(ThreadAttr **slot,uint64_t size) {
 static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
+#ifdef __APPLE__
+    pthread_setname_np(host);
+#else
     pthread_setname_np(pthread_self(),host);
+#endif
 }
 #ifdef _WIN32
 #define exit_setjmp(t) tlg_setjmp((t)->exit_jump)
@@ -524,6 +538,10 @@ static void (*thread_start_hook)(void);
 void runtime_set_thread_start_hook(void (*hook)(void)) { thread_start_hook=hook; }
 static void *host_start(void *p) {
     GuestThread *t=p;
+#ifdef TLG_RECOMP
+    recomp_thread_begin(t->guest_stack,t->guest_stack_size);
+    recomp_set_mxcsr(t->fp_mxcsr);
+#endif
     attach(t);
     if (thread_start_hook) thread_start_hook();
     /* The creator's SSE (MXCSR) and x87 control words, as FreeBSD's libthr gives a new thread
@@ -531,10 +549,12 @@ static void *host_start(void *p) {
      * inFAMOUS turns on flush-to-zero (MXCSR bit 15) in a thread, then creates its job workers
      * from it; without the bit there, denormals reach divisions in the particle/light code
      * (overexposed fire and smoke, flickering headlights, Windows only). */
+#ifndef TLG_RECOMP
     __asm__ volatile("ldmxcsr %0\n\tfldcw %1" : : "m"(t->fp_mxcsr), "m"(t->fp_x87cw));
+#endif
     set_host_name(t->name);
     apply_prio(t->os_tid,t->attr.prio); /* the priority is ours now; the creator had no host tid */
-    if (!exit_setjmp(t)) t->result=t->entry(t->argument);
+    if (!exit_setjmp(t)) t->result=(void *)GUEST_CALL1(t->entry,t->argument);
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
     return t->result;
@@ -547,7 +567,11 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     if (!t) return ERR(12);
     if (a) { t->attr=*a; t->attr.next=NULL; }
     t->entry=entry; t->argument=argument; t->detached=t->attr.detached;
+#ifdef TLG_RECOMP
+    t->fp_mxcsr=recomp_get_mxcsr(); t->fp_x87cw=0x37f;
+#else
     __asm__ volatile("stmxcsr %0\n\tfnstcw %1" : "=m"(t->fp_mxcsr), "=m"(t->fp_x87cw));
+#endif
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "guest");
     pthread_attr_t host;
     pthread_attr_init(&host);
@@ -558,6 +582,13 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     /* Windows places the stack itself (low: no high-entropy ASLR) and commits all of it:
      * guest code has no stack probes and would step over the guard page. */
     pthread_attr_setstacksize(&host,stack_bytes);
+#elif defined(TLG_RECOMP)
+    /* The guest stack (below 1 TiB) and a separate, larger host stack: recompiled guest frames
+     * are host frames. */
+    t->guest_stack=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
+    t->guest_stack_size=stack_bytes;
+    if (!t->guest_stack) { fputs("STOP: no guest stack\n",stderr); exit(21); }
+    pthread_attr_setstacksize(&host,stack_bytes*4<(64u<<20) ? (64u<<20) : stack_bytes*4);
 #else
     void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
     if (stack_memory) pthread_attr_setstack(&host,stack_memory,stack_bytes);

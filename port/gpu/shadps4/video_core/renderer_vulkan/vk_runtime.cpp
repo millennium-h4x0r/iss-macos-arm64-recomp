@@ -262,6 +262,10 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
         g_trace_next_flush.store(true, std::memory_order_relaxed);
     }
     BeforeImageAccess();
+    if (dst_access & (vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+                      vk::AccessFlagBits2::eMemoryWrite)) {
+        scheduler.NotePassShaderWrites(); // tlg: barrier hoisting
+    }
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
@@ -980,6 +984,10 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
+    if (src_access & (vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+                      vk::AccessFlagBits2::eMemoryWrite)) {
+        scheduler.NotePassShaderWrites(); // tlg: barrier hoisting
+    }
 }
 
 void Runtime::FlushBarriers() {
@@ -1023,6 +1031,19 @@ void Runtime::FlushBarriers() {
             TLG_IMG_TRACE("  ... and %u more barriers\n", u32(image_barriers.size() - 12));
         }
         TLG_IMG_TRACE("FlushBarriers: EndRendering\n");
+    }
+    // tlg: a barrier that orders nothing inside the open render pass goes ahead of it, and
+    // the pass stays open (Scheduler::TryHoistBarriers).
+    if (!trace_flush && scheduler.IsRendering() &&
+        scheduler.TryHoistBarriers(dep_info.memoryBarrierCount ? &memory_barrier : nullptr,
+                                   std::span<const vk::ImageMemoryBarrier2>(
+                                       image_barriers.data(), image_barriers.size()))) {
+        memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
+        memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
+        image_barriers.clear();
+        barrier_tracker.Clear();
+        ++access_epoch;
+        return;
     }
     scheduler.EndRendering();
     if (trace_flush) {

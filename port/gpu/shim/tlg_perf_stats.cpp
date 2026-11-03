@@ -10,7 +10,11 @@
 #ifndef _WIN32
 #include <cstring>
 #include <dlfcn.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#else
 #include <sys/sysinfo.h>
+#endif
 #include <unistd.h>
 #endif
 #ifdef _WIN32
@@ -204,8 +208,13 @@ void Run(const Vulkan::Instance* instance) {
             if (std::fscanf(f, "%llu %llu", &size, &resident) == 2) s.ram_used_gb = double(resident) * double(page) / GiB;
             std::fclose(f);
         }
+#ifdef __APPLE__
+        uint64_t mem = 0; size_t len = sizeof(mem);
+        if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) s.ram_total_gb = double(mem) / GiB;
+#else
         struct sysinfo info{};
         if (sysinfo(&info) == 0) s.ram_total_gb = double(info.totalram) * double(info.mem_unit) / GiB;
+#endif
         if (instance->CanReportMemoryUsage()) {
             s.vram_used_gb = double(instance->GetDeviceMemoryUsage()) / GiB;
 #ifdef TLG_RENDERER_V2

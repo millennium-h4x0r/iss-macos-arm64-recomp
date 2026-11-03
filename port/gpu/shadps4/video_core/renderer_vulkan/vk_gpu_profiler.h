@@ -62,7 +62,11 @@ private:
     void Print();
 
     static constexpr u32 NumSlices = 4;
+#ifdef __APPLE__
+    static constexpr u32 SliceQueries = 1024; // Metal counter heaps hold at most 4096 samples
+#else
     static constexpr u32 SliceQueries = 4096;
+#endif
     static inline GpuProfiler* instance_ptr = nullptr;
 
     vk::Device device;

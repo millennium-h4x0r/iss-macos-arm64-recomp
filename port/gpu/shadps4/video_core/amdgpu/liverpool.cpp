@@ -34,6 +34,32 @@
 
 namespace AmdGpu {
 
+namespace {
+// tlg: TLG_DRAW_STATS=1 logs the direct draws and their vertices (indices x instances) every
+// 5 s, the same for both renderers.
+void TlgCountDraw(const Regs& regs) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("TLG_DRAW_STATS");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static u64 draws = 0, verts = 0;
+    static auto last = std::chrono::steady_clock::now();
+    ++draws;
+    verts += u64(regs.num_indices) * std::max<u32>(regs.num_instances.NumInstances(), 1);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last >= std::chrono::seconds(5)) {
+        std::printf("GPU: draw stats: %llu direct draws, %.1fM vertices in 5 s\n",
+                    (unsigned long long)draws, double(verts) / 1e6);
+        draws = verts = 0;
+        last = now;
+    }
+}
+} // namespace
+
+
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
@@ -124,7 +150,7 @@ void Liverpool::Process(std::stop_token stoken) {
     TlgStats::gpu_thread_id.store(GetCurrentThreadId());
 #endif
     gpu_id = std::this_thread::get_id();
-#if defined(__linux__) || defined(_WIN32)
+#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
     gpu_tid = gettid();
 #endif
 
@@ -415,7 +441,10 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
     // Copies deferred to the recording thread precede writes the guest sees.
     rasterizer.WaitHostCopies();
+#ifndef TLG_METAL
+    // (Metal: deferred label writes run in command buffer order, after the earlier ones.)
     rasterizer.WaitDeferredSignals();
+#endif
     rasterizer.ProcessDownloadImages();
     const auto write_eos = [](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
@@ -439,6 +468,13 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     }
 }
 } // namespace
+
+/// tlg debugging: TLG_LOG_WAITS=<n> logs the first label waits that need the GPU, and the
+/// EOS/EOP label writes.
+static bool TlgLogWaits() {
+    static const bool on = std::getenv("TLG_LOG_WAITS") != nullptr;
+    return on;
+}
 
 void Liverpool::NotePendingFences(const auto& event) {
     const u64 position = rasterizer->DrawPipeHead();
@@ -1070,6 +1106,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const auto* prepared = draw_prep ? draw_prep->NextDraw() : nullptr;
+                TlgCountDraw(regs);
                 rasterizer->ScopeMarker("gfx:{}:DrawIndex2", fmt::make_format_args(cmd_address),
                                         [&] { rasterizer->Draw(true, 0, prepared); });
                 break;
@@ -1085,6 +1122,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const auto* prepared = draw_prep ? draw_prep->NextDraw() : nullptr;
+                TlgCountDraw(regs);
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndexOffset2", fmt::make_format_args(cmd_address),
                     [&] { rasterizer->Draw(true, draw_index_off->index_offset, prepared); });
@@ -1100,6 +1138,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const auto* prepared = draw_prep ? draw_prep->NextDraw() : nullptr;
+                TlgCountDraw(regs);
                 rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto", fmt::make_format_args(cmd_address),
                                         [&] { rasterizer->Draw(false, 0, prepared); });
                 break;
@@ -1316,6 +1355,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                if (static int n = 0; TlgLogWaits() && n++ < 60) {
+                    std::printf("EOS %#llx cmd %u\n", (unsigned long long)VAddr(event_eos->Address()),
+                                u32(event_eos->command.Value()));
+                }
                 if (rasterizer &&
                     rasterizer->RunInOrder(&RunEventWriteEos, event_eos, sizeof(*event_eos))) {
                     NotePendingFences(*event_eos);
@@ -1324,6 +1367,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                if (static int n = 0; TlgLogWaits() && n++ < 60) {
+                    std::printf("EOP %#llx sel %u\n", (unsigned long long)event_eop->Address<VAddr>(),
+                                u32(event_eop->data_sel.Value()));
+                }
                 if (rasterizer) {
                     if (rasterizer->RunInOrder(&RunEventWriteEop, event_eop, sizeof(*event_eop))) {
                         NotePendingFences(*event_eop);
@@ -1443,7 +1490,26 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // tlg: TLG_UNIFIED_MEMORY: memory the GPU writes in place is read once the GPU
                 // writes recorded before this wait are done.
                 if (rasterizer &&
-                    wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+                    wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
+#ifdef TLG_METAL
+                    // tlg (Metal): guest memory is the GPU's, so a value that already passes
+                    // is final; only a wait that does not pass yet needs the GPU's writes.
+                    && !wait_reg_mem->Test(regs.reg_array)
+#endif
+                ) {
+                    static const int log_waits = [] {
+                        const char* v = std::getenv("TLG_LOG_WAITS");
+                        return v ? std::atoi(v) : 0;
+                    }();
+                    static int logged_waits = 0;
+                    if (logged_waits < log_waits) {
+                        ++logged_waits;
+                        std::printf("WAIT_REG_MEM %#llx func %u ref %#x mask %#x now %#x\n",
+                                    (unsigned long long)wait_reg_mem->Address<VAddr>(),
+                                    u32(wait_reg_mem->function.Value()), wait_reg_mem->ref,
+                                    wait_reg_mem->mask,
+                                    *wait_reg_mem->Address<const u32*>());
+                    }
                     rasterizer->SyncUnifiedRead(wait_reg_mem->Address<VAddr>(), sizeof(u32));
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
@@ -1509,6 +1575,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
+#ifdef TLG_METAL
+                // tlg (Metal): label waits pass on pending fences, so the GPU may not have
+                // written the condition yet: wait for the work recorded before it.
+                if (rasterizer) {
+                    rasterizer->SyncUnifiedRead(reinterpret_cast<VAddr>(cond_exec->Address()), sizeof(u32));
+                }
+#endif
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
                     dcb = NextPacket(dcb,

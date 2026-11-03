@@ -49,6 +49,8 @@ def module(path):
             table[key] = identity
     def identity(name):
         parts = name.split('#')
+        if len(parts) == 1:
+            return None  # plain local name (some dumps keep e.g. __start__Ztext): never linked
         if len(parts) != 3:
             raise ValueError(f'unsupported symbol encoding {name!r}')
         n, lib, mod = parts

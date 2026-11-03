@@ -1,0 +1,1648 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// tlg Metal renderer: draws and dispatches. Per draw: the pipeline (pipeline cache), render
+// targets and resources from the texture cache, then the render pass (kept open while the targets
+// stay the same), state and the draw itself. Textures are hazard-tracked by Metal; guest memory
+// written by shaders orders later encoders through the scheduler's fence.
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <cstdlib>
+#include <unordered_map>
+
+#include "common/alignment.h"
+#include "common/assert.h"
+#include "core/memory.h"
+#include "mtl_draw.h"
+#include "mtl_format.h"
+#include "mtl_objc.h"
+#include "mtl_scheduler_internal.h"
+#include "mtl_stencil.h"
+#include "shader_recompiler/info.h"
+#include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_depth_stencil_state.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
+
+namespace Vulkan {
+
+namespace {
+// Profiling labels (TLG_METAL_LABEL=1), GPU thread only.
+u32 label_pass_draws = 0;
+u64 label_pass_verts = 0;
+} // namespace
+
+
+namespace {
+
+using Shader::SwStage;
+
+MTLCompareFunction Compare(vk::CompareOp op) {
+    switch (op) {
+    case vk::CompareOp::eNever: return MTLCompareFunctionNever;
+    case vk::CompareOp::eLess: return MTLCompareFunctionLess;
+    case vk::CompareOp::eEqual: return MTLCompareFunctionEqual;
+    case vk::CompareOp::eLessOrEqual: return MTLCompareFunctionLessEqual;
+    case vk::CompareOp::eGreater: return MTLCompareFunctionGreater;
+    case vk::CompareOp::eNotEqual: return MTLCompareFunctionNotEqual;
+    case vk::CompareOp::eGreaterOrEqual: return MTLCompareFunctionGreaterEqual;
+    default: return MTLCompareFunctionAlways;
+    }
+}
+
+MTLStencilOperation Stencil(vk::StencilOp op) {
+    switch (op) {
+    case vk::StencilOp::eZero: return MTLStencilOperationZero;
+    case vk::StencilOp::eReplace: return MTLStencilOperationReplace;
+    case vk::StencilOp::eIncrementAndClamp: return MTLStencilOperationIncrementClamp;
+    case vk::StencilOp::eDecrementAndClamp: return MTLStencilOperationDecrementClamp;
+    case vk::StencilOp::eInvert: return MTLStencilOperationInvert;
+    case vk::StencilOp::eIncrementAndWrap: return MTLStencilOperationIncrementWrap;
+    case vk::StencilOp::eDecrementAndWrap: return MTLStencilOperationDecrementWrap;
+    default: return MTLStencilOperationKeep;
+    }
+}
+
+/// Metal primitive of a guest primitive type, or false when it needs emulation.
+bool Primitive(AmdGpu::PrimitiveType type, MTLPrimitiveType& out) {
+    using P = AmdGpu::PrimitiveType;
+    switch (type) {
+    case P::QuadList: out = MTLPrimitiveTypeTriangle; return true; // converted indices
+    case P::PointList: out = MTLPrimitiveTypePoint; return true;
+    case P::LineList: out = MTLPrimitiveTypeLine; return true;
+    case P::LineStrip: out = MTLPrimitiveTypeLineStrip; return true;
+    case P::TriangleList: out = MTLPrimitiveTypeTriangle; return true;
+    case P::TriangleStrip: out = MTLPrimitiveTypeTriangleStrip; return true;
+    default: return false;
+    }
+}
+
+struct AttachmentKey {
+    void* texture = nullptr;
+    u32 level = 0;
+    u32 slice = 0;
+};
+
+} // namespace
+
+struct Rasterizer::DrawState::Impl {
+    id<MTLTexture> dummy_2d = nil;
+    id<MTLTexture> dummy_2d_array = nil;
+    id<MTLTexture> dummy_3d = nil;
+    id<MTLSamplerState> dummy_sampler = nil;
+    id<MTLBuffer> dummy_buffer = nil;
+    std::unordered_map<u64, id<MTLDepthStencilState>> depth_states;
+    id<MTLComputePipelineState> clamp_pipeline = nil;
+    id<MTLComputePipelineState> quad_pipeline = nil;
+    id<MTLComputePipelineState> copy_pipeline = nil;
+    id<MTLBuffer> quad_indices = nil;
+    u32 quad_count = 0;
+    std::array<AttachmentKey, 9> pass{}; ///< attachments of the open render pass
+    u32 pass_width = 0, pass_height = 0;
+    bool pass_open = false;
+};
+
+namespace {
+id<MTLTexture> Dummy(MTLTextureType type) {
+    MTLTextureDescriptor* d = [MTLTextureDescriptor new];
+    d.textureType = type;
+    d.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    d.width = d.height = 1;
+    d.depth = 1;
+    d.arrayLength = 1;
+    d.storageMode = MTLStorageModeShared;
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> t = [Metal::Device() newTextureWithDescriptor:d];
+    // Transparent black, as Vulkan's null descriptors read.
+    const u8 zero[4] = {};
+    [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:zero
+         bytesPerRow:4 bytesPerImage:4];
+    return t;
+}
+} // namespace
+
+Rasterizer::DrawState::DrawState(const Instance& instance, Scheduler&, Runtime&)
+    : impl{std::make_unique<Impl>()} {
+    gds = std::make_unique<VideoCore::Buffer>(instance, 0, 64_KB,
+                                              VideoCore::MemoryType::DeviceLocal, "GDS");
+    std::memset(gds->mapped_data.data(), 0, gds->mapped_data.size());
+    impl->dummy_2d = Dummy(MTLTextureType2D);
+    impl->dummy_2d_array = Dummy(MTLTextureType2DArray);
+    impl->dummy_3d = Dummy(MTLTextureType3D);
+    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+    impl->dummy_sampler = [Metal::Device() newSamplerStateWithDescriptor:sd];
+    impl->dummy_buffer = [Metal::Device() newBufferWithLength:64 * 1024
+                                                     options:MTLResourceStorageModeShared];
+    std::memset(impl->dummy_buffer.contents, 0, 64 * 1024);
+}
+
+Rasterizer::DrawState::~DrawState() = default;
+
+namespace {
+const char* kClampSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+// Copies indirect draw arguments, zeroing the draws at and past the count.
+kernel void clamp_args(const device uint* src [[buffer(0)]], const device uint* count [[buffer(1)]],
+                       device uint* dst [[buffer(2)]], constant uint2& p [[buffer(3)]],
+                       uint i [[thread_position_in_grid]]) {
+    const uint words = p.x / 4u;
+    if (i >= p.y * words) {
+        return;
+    }
+    const uint draw = i / words;
+    dst[i] = draw < count[0] ? src[i] : 0u;
+}
+)";
+} // namespace
+
+namespace {
+const char* kQuadSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct P { uint stride; uint max_count; uint indexed; uint is16; uint max_quads; };
+// One thread per indirect draw: indexed triangle-list arguments for its quads; for indexed draws
+// also the triangle indices (0 1 2 0 2 3 of each quad).
+kernel void quad_args(const device uint* src [[buffer(0)]], device uint* dst [[buffer(1)]],
+                      const device uchar* indices [[buffer(2)]], device uint* out_indices [[buffer(3)]],
+                      constant P& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.max_count) {
+        return;
+    }
+    const device uint* a = src + i * (p.stride / 4u);
+    device uint* d = dst + i * 5u;
+    if (p.indexed == 0u) {
+        // vertexCount, instanceCount, vertexStart, baseInstance
+        const uint quads = min(a[0] / 4u, p.max_quads);
+        d[0] = quads * 6u; d[1] = a[1]; d[2] = 0u; d[3] = a[2]; d[4] = a[3];
+        return;
+    }
+    // indexCount, instanceCount, indexStart, baseVertex, baseInstance
+    const uint quads = min(a[0] / 4u, p.max_quads);
+    const uint base = i * p.max_quads * 6u;
+    for (uint q = 0u; q < quads; ++q) {
+        uint v[4];
+        for (uint k = 0u; k < 4u; ++k) {
+            const uint at = a[2] + q * 4u + k;
+            v[k] = p.is16 != 0u ? uint(((const device ushort*)indices)[at]) : ((const device uint*)indices)[at];
+        }
+        device uint* o = out_indices + base + q * 6u;
+        o[0] = v[0]; o[1] = v[1]; o[2] = v[2]; o[3] = v[0]; o[4] = v[2]; o[5] = v[3];
+    }
+    d[0] = quads * 6u; d[1] = a[1]; d[2] = base; d[3] = a[3]; d[4] = a[4];
+}
+)";
+} // namespace
+
+id<MTLBuffer> Rasterizer::DrawState::QuadIndices(u32 quads) {
+    if (impl->quad_indices && impl->quad_count >= quads) {
+        return impl->quad_indices;
+    }
+    impl->quad_count = std::max<u32>(quads, 65536);
+    impl->quad_indices = [Metal::Device() newBufferWithLength:u64(impl->quad_count) * 6 * 4
+                                                      options:MTLResourceStorageModeShared];
+    u32* o = static_cast<u32*>(impl->quad_indices.contents);
+    for (u32 q = 0; q < impl->quad_count; ++q) {
+        const u32 b = q * 4;
+        o[q * 6 + 0] = b; o[q * 6 + 1] = b + 1; o[q * 6 + 2] = b + 2;
+        o[q * 6 + 3] = b; o[q * 6 + 4] = b + 2; o[q * 6 + 5] = b + 3;
+    }
+    return impl->quad_indices;
+}
+
+void Rasterizer::DrawState::ConvertQuadIndirect(Scheduler& scheduler, id<MTLBuffer> args,
+                                                u64 args_offset, u32 stride, u32 max_count,
+                                                bool indexed, id<MTLBuffer> indices,
+                                                u64 indices_offset, bool is16, u32 max_quads,
+                                                id<MTLBuffer> out_args, u64 out_args_offset,
+                                                id<MTLBuffer> out_indices, u64 out_indices_offset) {
+    if (!impl->quad_pipeline) {
+        NSError* error = nil;
+        id<MTLLibrary> lib = [Metal::Device() newLibraryWithSource:[NSString stringWithUTF8String:kQuadSource]
+                                                           options:nil
+                                                             error:&error];
+        ASSERT_MSG(lib, "quad_args: {}", error.localizedDescription.UTF8String);
+        impl->quad_pipeline = [Metal::Device()
+            newComputePipelineStateWithFunction:[lib newFunctionWithName:@"quad_args"]
+                                          error:&error];
+    }
+    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "quad_args");
+    [enc setComputePipelineState:impl->quad_pipeline];
+    [enc setBuffer:args offset:args_offset atIndex:0];
+    [enc setBuffer:out_args offset:out_args_offset atIndex:1];
+    [enc setBuffer:(indices ? indices : impl->dummy_buffer) offset:(indices ? indices_offset : 0) atIndex:2];
+    [enc setBuffer:out_indices offset:(indexed ? out_indices_offset : 0) atIndex:3];
+    const u32 p[5] = {stride, max_count, indexed ? 1u : 0u, is16 ? 1u : 0u, max_quads};
+    [enc setBytes:p length:sizeof(p) atIndex:4];
+    [enc dispatchThreads:MTLSizeMake(max_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+namespace {
+const char* kCopySource = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void copy_bytes(const device uchar* src [[buffer(0)]], device uchar* dst [[buffer(1)]],
+                       constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < n) {
+        dst[i] = src[i];
+    }
+}
+)";
+} // namespace
+
+namespace NanScan {
+namespace {
+constexpr u32 MaxSlots = 8192;
+const char* kNanSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void nan_scan(texture2d<float, access::read> t [[texture(0)]],
+                     device atomic_uint* out [[buffer(0)]], constant uint& slot [[buffer(1)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= t.get_width() || gid.y >= t.get_height()) return;
+    const float4 v = t.read(gid);
+    const bool n = any(isnan(v)), i = any(isinf(v));
+    if (!n && !i) return;
+    device atomic_uint* o = out + slot * 4;
+    if (n) atomic_fetch_add_explicit(&o[0], 1u, memory_order_relaxed);
+    if (i) atomic_fetch_add_explicit(&o[1], 1u, memory_order_relaxed);
+    const uint mask = (isnan(v.x) ? 1u : 0u) | (isnan(v.y) ? 2u : 0u) | (isnan(v.z) ? 4u : 0u) |
+                      (isnan(v.w) ? 8u : 0u) | (isinf(v.x) ? 16u : 0u) | (isinf(v.y) ? 32u : 0u) |
+                      (isinf(v.z) ? 64u : 0u) | (isinf(v.w) ? 128u : 0u);
+    atomic_fetch_or_explicit(&o[0], mask << 24, memory_order_relaxed);
+    atomic_fetch_min_explicit(&o[2], (gid.y << 16) | gid.x, memory_order_relaxed);
+    atomic_fetch_max_explicit(&o[3], (gid.y << 16) | gid.x, memory_order_relaxed);
+}
+)";
+struct State {
+    bool active = false;
+    id<MTLComputePipelineState> pso = nil;
+    id<MTLBuffer> counts = nil;
+    std::vector<std::string> labels;
+    std::vector<id<MTLTexture>> pass_targets;
+    std::vector<u32> pass_cbs;
+    std::vector<u64> pass_ps;
+    u64 pass_draw = 0;
+    u64 frame = 0;
+};
+State g;
+
+bool IsFloat(MTLPixelFormat pf) {
+    switch (pf) {
+    case MTLPixelFormatRGBA16Float: case MTLPixelFormatRG16Float: case MTLPixelFormatR16Float:
+    case MTLPixelFormatRGBA32Float: case MTLPixelFormatRG32Float: case MTLPixelFormatR32Float:
+    case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void Scan(Scheduler& scheduler, id<MTLTexture> tex, const std::string& label) {
+    if (!tex || tex.textureType != MTLTextureType2D || !IsFloat(tex.pixelFormat) ||
+        !(tex.usage & MTLTextureUsageShaderRead) || g.labels.size() >= MaxSlots) {
+        return;
+    }
+    if (!g.pso) {
+        NSError* error = nil;
+        id<MTLLibrary> lib = [Metal::Device() newLibraryWithSource:[NSString stringWithUTF8String:kNanSource]
+                                                           options:nil
+                                                             error:&error];
+        g.pso = [Metal::Device() newComputePipelineStateWithFunction:[lib newFunctionWithName:@"nan_scan"]
+                                                               error:&error];
+        ASSERT_MSG(g.pso, "NaN scan pipeline");
+    }
+    if (!g.counts) {
+        g.counts = [Metal::Device() newBufferWithLength:MaxSlots * 16 options:MTLResourceStorageModeShared];
+        u32* c = static_cast<u32*>(g.counts.contents);
+        for (u32 i = 0; i < MaxSlots; ++i) {
+            c[i * 4] = c[i * 4 + 1] = c[i * 4 + 3] = 0;
+            c[i * 4 + 2] = 0xFFFFFFFFu;
+        }
+    }
+    const u32 slot = u32(g.labels.size());
+    g.labels.push_back(label);
+    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "nan_scan");
+    [enc setComputePipelineState:g.pso];
+    [enc setTexture:tex atIndex:0];
+    [enc setBuffer:g.counts offset:0 atIndex:0];
+    [enc setBytes:&slot length:sizeof(slot) atIndex:1];
+    [enc dispatchThreads:MTLSizeMake(tex.width, tex.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+}
+
+/// Scans the targets of the pass that just ended.
+void FlushPass(Scheduler& scheduler) {
+    std::string ps;
+    for (const u64 h : g.pass_ps) {
+        char b[40];
+        char b2[40];
+        std::snprintf(b2, sizeof(b2), "%s%08x", ps.empty() ? "" : ",", u32(h));
+        if (h >> 32) {
+            std::snprintf(b2, sizeof(b2), "%s%08x/vs%08x", ps.empty() ? "" : ",", u32(h), u32(h >> 32));
+        }
+        std::snprintf(b, sizeof(b), "%s", b2);
+        ps += b;
+    }
+    for (size_t i = 0; i < g.pass_targets.size(); ++i) {
+        id<MTLTexture> t = g.pass_targets[i];
+        char label[256];
+        std::snprintf(label, sizeof(label), "pass@draw%llu cb%u %ux%u fmt%u ps[%s]",
+                      (unsigned long long)g.pass_draw, g.pass_cbs[i], u32(t.width), u32(t.height),
+                      u32(t.pixelFormat), ps.c_str());
+        Scan(scheduler, t, label);
+    }
+    g.pass_targets.clear();
+    g.pass_cbs.clear();
+    g.pass_ps.clear();
+}
+} // namespace
+
+bool Enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_NAN_SCAN");
+        return v && (*v == '1' || *v == '2');
+    }();
+    return on;
+}
+
+bool Active() {
+    return g.active;
+}
+
+bool PerDraw() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_NAN_SCAN");
+        return v && *v == '2';
+    }();
+    return on;
+}
+
+void BeginPass(Scheduler& scheduler, u64 draw, const id<MTLTexture>* targets, u32 count) {
+    FlushPass(scheduler);
+    g.pass_draw = draw;
+    for (u32 i = 0; i < count; ++i) {
+        if (targets[i]) {
+            g.pass_targets.push_back(targets[i]);
+            g.pass_cbs.push_back(i);
+        }
+    }
+}
+
+void NoteDraw(u64 ps_hash) {
+    if (g.pass_ps.size() < 8 && std::find(g.pass_ps.begin(), g.pass_ps.end(), ps_hash) == g.pass_ps.end()) {
+        g.pass_ps.push_back(ps_hash);
+    }
+}
+
+void AfterDispatch(Scheduler& scheduler, u64 cs_hash, const id<MTLTexture>* textures, u32 count) {
+    FlushPass(scheduler);
+    for (u32 i = 0; i < count; ++i) {
+        char label[96];
+        std::snprintf(label, sizeof(label), "cs %016llx t%u", (unsigned long long)cs_hash, i);
+        Scan(scheduler, textures[i], label);
+    }
+}
+
+void EndFrame(Scheduler& scheduler, bool next_active) {
+    if (g.active) {
+        FlushPass(scheduler);
+        scheduler.EndEncoding();
+        if (g.counts) {
+            id<MTLBuffer> counts = g.counts;
+            auto labels = std::make_shared<std::vector<std::string>>(std::move(g.labels));
+            const u64 frame = g.frame;
+            scheduler.SignalOnCompletion([counts, labels, frame] {
+                const u32* c = static_cast<const u32*>(counts.contents);
+                u32 hits = 0;
+                for (size_t i = 0; i < labels->size(); ++i) {
+                    if (c[i * 4] || c[i * 4 + 1]) {
+                        ++hits;
+                        std::printf("NaN scan frame %llu #%zu %s: nan %u inf %u (channels nan %x inf %x) first %u,%u last %u,%u\n",
+                                    (unsigned long long)frame, i, (*labels)[i].c_str(), c[i * 4] & 0xFFFFFF,
+                                    c[i * 4 + 1], (c[i * 4] >> 24) & 15, c[i * 4] >> 28,
+                                    c[i * 4 + 2] & 0xFFFF, c[i * 4 + 2] >> 16,
+                                    c[i * 4 + 3] & 0xFFFF, c[i * 4 + 3] >> 16);
+                    }
+                }
+                std::printf("NaN scan frame %llu: %zu scans, %u with NaN/Inf\n",
+                            (unsigned long long)frame, labels->size(), hits);
+            });
+        }
+        g.counts = nil;
+        g.labels.clear();
+    }
+    ++g.frame;
+    g.active = next_active;
+}
+} // namespace NanScan
+
+void Rasterizer::DrawState::CopyBytes(Scheduler& scheduler, id<MTLBuffer> src, u64 src_offset,
+                                      id<MTLBuffer> dst, u64 dst_offset, u64 size) {
+    if (!impl->copy_pipeline) {
+        NSError* error = nil;
+        id<MTLLibrary> lib = [Metal::Device() newLibraryWithSource:[NSString stringWithUTF8String:kCopySource]
+                                                           options:nil
+                                                             error:&error];
+        impl->copy_pipeline = [Metal::Device()
+            newComputePipelineStateWithFunction:[lib newFunctionWithName:@"copy_bytes"]
+                                          error:&error];
+    }
+    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "copy_bytes");
+    [enc setComputePipelineState:impl->copy_pipeline];
+    [enc setBuffer:src offset:src_offset atIndex:0];
+    [enc setBuffer:dst offset:dst_offset atIndex:1];
+    const u32 n = u32(size);
+    [enc setBytes:&n length:sizeof(n) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+void Rasterizer::DrawState::ClampIndirect(Scheduler& scheduler, id<MTLBuffer> src, u64 src_offset,
+                                          id<MTLBuffer> count, u64 count_offset, id<MTLBuffer> dst,
+                                          u64 dst_offset, u32 stride, u32 max_count) {
+    if (!impl->clamp_pipeline) {
+        NSError* error = nil;
+        id<MTLLibrary> lib = [Metal::Device() newLibraryWithSource:[NSString stringWithUTF8String:kClampSource]
+                                                           options:nil
+                                                             error:&error];
+        impl->clamp_pipeline = [Metal::Device()
+            newComputePipelineStateWithFunction:[lib newFunctionWithName:@"clamp_args"]
+                                          error:&error];
+    }
+    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "clamp_args");
+    [enc setComputePipelineState:impl->clamp_pipeline];
+    [enc setBuffer:src offset:src_offset atIndex:0];
+    [enc setBuffer:count offset:count_offset atIndex:1];
+    [enc setBuffer:dst offset:dst_offset atIndex:2];
+    const u32 p[2] = {stride, max_count};
+    [enc setBytes:p length:sizeof(p) atIndex:3];
+    const u32 n = stride / 4 * max_count;
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+}
+
+void Rasterizer::DrawState::OnSubmit() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report < std::chrono::seconds(5)) {
+        return;
+    }
+    last_report = now;
+    std::printf("GPU (Metal): %llu draws (%llu skipped: %llu no pipeline, %llu primitive), %llu "
+                "dispatches (%llu skipped), %llu passes in 5 s\n",
+                (unsigned long long)draws, (unsigned long long)skipped_draws,
+                (unsigned long long)no_pipeline, (unsigned long long)unsupported_primitive,
+                (unsigned long long)dispatches, (unsigned long long)skipped_dispatches,
+                (unsigned long long)passes);
+    std::string prims;
+    for (u32 i = 0; i < 32; ++i) {
+        if (prim_counts[i]) {
+            prims += " " + std::to_string(i) + ":" + std::to_string(prim_counts[i]);
+        }
+    }
+    if (unaligned_vertex_buffers) {
+        std::printf("GPU (Metal): %llu unaligned vertex buffers copied in 5 s\n",
+                    (unsigned long long)unaligned_vertex_buffers);
+        unaligned_vertex_buffers = 0;
+    }
+    if (!prims.empty() || indirect_draws) {
+        std::printf("GPU (Metal): skipped primitives (type:count)%s; indirect draws %llu, "
+                    "indirect dispatches %llu\n",
+                    prims.c_str(), (unsigned long long)indirect_draws,
+                    (unsigned long long)indirect_dispatches);
+    }
+    prim_counts = {};
+    indirect_draws = indirect_dispatches = 0;
+    draws = skipped_draws = dispatches = skipped_dispatches = 0;
+    no_pipeline = unsupported_primitive = passes = 0;
+}
+
+/// Resources of one stage, ready to bind. Unretained: the caches own every object for the
+/// draw and the encoder retains what it binds. Strong arrays cost ~30% of the command
+/// processor thread (1056 ARC slots set and released per draw).
+/// Only the first num_* entries are set (no zeroing: ~10 KB per draw); sizes past num_buffers
+/// are never read by the shaders.
+struct StageBindings {
+    std::array<__unsafe_unretained id<MTLBuffer>, 32> buffers;
+    std::array<u64, 32> offsets;
+    std::array<u32, 32> sizes;
+    std::array<__unsafe_unretained id<MTLTexture>, 128> textures;
+    std::array<__unsafe_unretained id<MTLSamplerState>, 16> samplers;
+    u32 num_buffers = 0, num_textures = 0, num_samplers = 0;
+    bool writes_memory = false;
+};
+
+/// Collects the resources of `stage` (texture cache and buffer cache work happens here, before
+/// any render pass is opened).
+bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& binding,
+                           Shader::PushData& push_data, StageBindings& out) {
+    const auto& info = *stage.info;
+    auto& d = *draw_state->impl;
+    info.PushUd(binding, push_data);
+    // Buffers.
+    u32 slot = 0;
+    for (u32 i = 0; i < info.buffers.size() && slot < 28; ++i, ++slot) {
+        const auto& desc = info.buffers[i];
+        id<MTLBuffer> buffer = d.dummy_buffer;
+        u64 offset = 0;
+        u32 size = 64 * 1024;
+        if (desc.IsSpecial()) {
+            if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
+                buffer = Metal::Buffer(draw_state->gds->Handle());
+                size = u32(draw_state->gds->SizeBytes());
+            } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                auto& stream = buffer_cache.GetStreamBuffer();
+                const u32 ubo_size = u32(info.FlatUserData().size() * sizeof(u32));
+                offset = stream.Copy(info.FlatUserData().data(), std::max<u32>(ubo_size, 4), 16);
+                buffer = Metal::Buffer(stream.Handle());
+                size = ubo_size;
+            } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
+                auto& stream = buffer_cache.GetStreamBuffer();
+                std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+                for (u32 p = 0; p < AmdGpu::NUM_CLIP_PLANES; ++p) {
+                    const auto& plane = liverpool->regs.clip_user_data[p];
+                    planes[p * 4 + 0] = std::bit_cast<float>(plane.data_x);
+                    planes[p * 4 + 1] = std::bit_cast<float>(plane.data_y);
+                    planes[p * 4 + 2] = std::bit_cast<float>(plane.data_z);
+                    planes[p * 4 + 3] = std::bit_cast<float>(plane.data_w);
+                }
+                offset = stream.Copy(planes.data(), sizeof(planes), 16);
+                buffer = Metal::Buffer(stream.Handle());
+                size = sizeof(planes);
+            } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
+                auto& stream = buffer_cache.GetStreamBuffer();
+                const auto& cs = liverpool->GetCsRegs();
+                const u32 lds_size = cs.SharedMemSize() * cs.NumWorkgroups();
+                const auto [data, off] = stream.Map(std::max<u32>(lds_size, 16), 16);
+                std::memset(data, 0, lds_size);
+                stream.Commit();
+                buffer = Metal::Buffer(stream.Handle());
+                offset = off;
+                size = lds_size;
+            }
+            // BDA page table and fault buffer: not used by the Metal profile.
+        } else {
+            const auto vsharp = desc.GetSharp(info);
+            if (vsharp.base_address != 0 && vsharp.GetSize() != 0) {
+                const u64 bytes = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                const auto [vb, voff] =
+                    buffer_cache.ObtainBuffer(vsharp.base_address, bytes, desc.is_written);
+                static int buffer_logs = 0;
+                static const int max_buffer_logs = [] {
+                    const char* v = std::getenv("TLG_METAL_LOG_BUFFERS");
+                    return v ? std::atoi(v) : 0;
+                }();
+                if (buffer_logs < max_buffer_logs) {
+                    ++buffer_logs;
+                    const float* f = reinterpret_cast<const float*>(vsharp.base_address);
+                    id<MTLBuffer> mb = Metal::Buffer(vb->Handle());
+                    const float* g = reinterpret_cast<const float*>(static_cast<const u8*>(mb.contents) + voff);
+                    std::printf("  buffer %u: %#llx size %llu -> mtl %p (cpu %#llx len %llu) off %llu: "
+                                "guest %g %g %g %g mtl %g %g %g %g\n",
+                                i, (unsigned long long)vsharp.base_address, (unsigned long long)bytes,
+                                (__bridge void*)mb, (unsigned long long)vb->CpuAddr(),
+                                (unsigned long long)mb.length, (unsigned long long)voff, f[0], f[1],
+                                f[2], f[3], g[0], g[1], g[2], g[3]);
+                }
+                const u64 aligned = voff & ~u64(3);
+                push_data.AddOffset(binding.buffer, u32(voff - aligned));
+                buffer = Metal::Buffer(vb->Handle());
+                offset = aligned;
+                size = u32(bytes + (voff - aligned));
+                if (desc.is_written) {
+                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, bytes);
+                    out.writes_memory = true;
+                }
+            }
+        }
+        out.buffers[slot] = buffer;
+        out.offsets[slot] = offset;
+        out.sizes[slot] = size;
+        ++binding.buffer;
+        ++binding.unified;
+    }
+    out.num_buffers = slot;
+    // Images.
+    u32 tslot = 0;
+    for (const auto& image_desc : info.images) {
+        const auto tsharp = image_desc.GetSharp(info);
+        const u32 num_bindings = image_desc.NumBindings(info);
+        for (u32 n = 0; n < num_bindings && tslot < out.textures.size(); ++n, ++tslot) {
+            id<MTLTexture> texture = nil;
+            if (tsharp.Address() != 0 &&
+                tsharp.GetDataFmt() != AmdGpu::DataFormat::FormatInvalid &&
+                memory->IsValidGpuMapping(tsharp.Address(), 0)) {
+                VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+                if (image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    desc.view_info.range.base.level += image_desc.constant_mip_index;
+                    desc.view_info.range.extent.levels = 1;
+                } else if (image_desc.mip_fallback_mode ==
+                           Shader::MipStorageFallbackMode::DynamicIndex) {
+                    desc.view_info.range.base.level += n;
+                    desc.view_info.range.extent.levels = 1;
+                }
+                auto image_id = texture_cache.FindImage(desc);
+                auto* image = &texture_cache.GetImage(image_id);
+                if (auto depth_id = texture_cache.GetAssociatedDepth(*image)) {
+                    image_id = depth_id;
+                    image = &texture_cache.GetImage(image_id);
+                }
+                image->binding.is_bound = 1u;
+                bound_images.push_back(image_id);
+                auto& view = texture_cache.FindTexture(image_id, desc);
+                static const bool log_formats = std::getenv("TLG_METAL_LOG_FORMATS") != nullptr;
+                if (log_formats) {
+                    static std::mutex m;
+                    static std::unordered_map<u64, u32> seen;
+                    std::scoped_lock lk{m};
+                    const u64 k = (u64(image->info.pixel_format) << 32) | u64(desc.view_info.format) << 1 |
+                                  u64(desc.type == VideoCore::TextureCache::BindingType::Storage);
+                    if (seen[k]++ == 0) {
+                        std::printf("Texture format: image %s view %s %s type %u swz %u%u%u%u dfmt %u nfmt %u\n",
+                                    vk::to_string(image->info.pixel_format).c_str(),
+                                    vk::to_string(desc.view_info.format).c_str(),
+                                    desc.type == VideoCore::TextureCache::BindingType::Storage ? "storage" : "sampled",
+                                    u32(image->info.type), u32(desc.view_info.mapping.r), u32(desc.view_info.mapping.g),
+                                    u32(desc.view_info.mapping.b), u32(desc.view_info.mapping.a),
+                                    u32(tsharp.GetDataFmt()), u32(tsharp.GetNumberFmt()));
+                    }
+                }
+                // Debugging: the images a given shader binds (TLG_METAL_LOG_PS=<hex pgm hash>).
+                static const u64 log_ps = [] {
+                    const char* v = std::getenv("TLG_METAL_LOG_PS");
+                    return v ? std::strtoull(v, nullptr, 16) : 0ull;
+                }();
+                if (log_ps && info.pgm_hash == log_ps) {
+                    static std::atomic<u32> ps_logs{0};
+                    if (ps_logs.fetch_add(1) < 4000) {
+                        const auto& ii = image->info;
+                        std::printf("PS %016llx image %u: addr %#llx size %u %ux%u pitch %u bits %u tile %u "
+                                    "array %u fmt %s mips %u flags %#x tsharp tile %u pitch %u type %u %ux%u view %u tex %ux%u type %u\n",
+                                    (unsigned long long)info.pgm_hash, n, (unsigned long long)ii.guest_address,
+                                    ii.guest_size, ii.size.width, ii.size.height, ii.pitch, ii.num_bits,
+                                    u32(ii.tile_mode), u32(ii.array_mode), vk::to_string(ii.pixel_format).c_str(),
+                                    ii.resources.levels, u32(image->flags), u32(tsharp.tiling_index),
+                                    u32(tsharp.Pitch()), u32(tsharp.GetType()), u32(tsharp.width + 1),
+                                    u32(tsharp.height + 1), u32(tsharp.GetHostViewType(image_desc.is_array)),
+                                    0u, 0u, 0u);
+                    }
+                }
+                const bool storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+                image->usage.storage |= storage;
+                image->usage.texture |= !storage;
+                texture = Metal::Texture(*view.image_view);
+            }
+            if (!texture) {
+                static std::atomic<u32> dummy_logs{0};
+                if (std::getenv("TLG_METAL_LOG_DUMMY") && dummy_logs.fetch_add(1) < 40) {
+                    std::printf("Dummy texture: shader %016llx image %u addr %#llx dfmt %u nfmt %u "
+                                "valid_mapping %d\n",
+                                (unsigned long long)info.pgm_hash, n, (unsigned long long)tsharp.Address(),
+                                u32(tsharp.GetDataFmt()), u32(tsharp.GetNumberFmt()),
+                                int(tsharp.Address() && memory->IsValidGpuMapping(tsharp.Address(), 0)));
+                }
+                const auto type = tsharp.GetViewType(image_desc.is_array);
+                texture = type == AmdGpu::ImageType::Color3D ? d.dummy_3d
+                          : (type == AmdGpu::ImageType::Color2DArray ||
+                             type == AmdGpu::ImageType::Color1DArray)
+                              ? d.dummy_2d_array
+                              : d.dummy_2d;
+            }
+            out.textures[tslot] = texture;
+        }
+        binding.unified += num_bindings;
+    }
+    out.num_textures = tslot;
+    // Samplers.
+    u32 sslot = 0;
+    for (const auto& sampler : info.samplers) {
+        const auto ssharp = sampler.GetSharp(info);
+        vk::Sampler vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base,
+                                                          sampler.is_depth, 0.0f);
+        if (sslot < out.samplers.size()) {
+            id<MTLSamplerState> s = Metal::SamplerState(vk_sampler);
+            out.samplers[sslot++] = s ? s : d.dummy_sampler;
+        }
+        ++binding.unified;
+    }
+    out.num_samplers = sslot;
+    return true;
+}
+
+void Rasterizer::ResetBindings() {
+    for (const auto image_id : bound_images) {
+        texture_cache.GetImage(image_id).binding = {};
+    }
+    bound_images.clear();
+}
+
+namespace {
+bool DebugFlag(const char* name) {
+    const char* v = std::getenv(name);
+    return v && *v == '1';
+}
+} // namespace
+
+void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw*) {
+    DrawImpl(is_indexed, index_offset, nullptr);
+}
+
+void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
+                              u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
+                              u16 instance_sgpr_offset) {
+    ++draw_state->indirect_draws;
+    if (max_count == 0) {
+        return;
+    }
+    const IndirectArgs indirect{arg_address + offset, count_address, stride, max_count,
+                                vertex_sgpr_offset, instance_sgpr_offset};
+    DrawImpl(is_indexed, 0, &indirect);
+}
+
+void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs* indirect) {
+    static const bool no_cull = DebugFlag("TLG_METAL_NOCULL");
+    static const bool no_depth = DebugFlag("TLG_METAL_NODEPTH");
+    static const int log_draws = [] {
+        const char* v = std::getenv("TLG_METAL_LOG_DRAWS");
+        return v ? std::atoi(v) : 0;
+    }();
+    static int logged_draws = 0;
+    static const bool debug_clear = DebugFlag("TLG_METAL_DEBUG_CLEAR");
+    static const bool skip_calls = DebugFlag("TLG_METAL_SKIP_CALLS");
+    ++draw_state->draws;
+    scheduler.PopPendingOperations();
+    const auto& regs = liverpool->regs;
+    using Mode = AmdGpu::ColorControl::OperationMode;
+    if (regs.color_control.mode == Mode::EliminateFastClear ||
+        regs.color_control.mode == Mode::FmaskDecompress ||
+        regs.color_control.mode == Mode::Resolve ||
+        regs.primitive_type == AmdGpu::PrimitiveType::None) {
+        ++draw_state->skipped_draws;
+        return;
+    }
+    MTLPrimitiveType primitive;
+    if (!Primitive(regs.primitive_type, primitive)) {
+        ++draw_state->skipped_draws;
+        ++draw_state->unsupported_primitive;
+        ++draw_state->prim_counts[u32(regs.primitive_type) & 31];
+        static int prim_logs = 0;
+        if (prim_logs < log_draws) {
+            ++prim_logs;
+            const auto& cb0 = regs.color_buffers[0];
+            std::printf("Skipped prim %u: n %u inst %u idx %d cb0 %#llx %ux%u stage_enable %#x\n",
+                        u32(regs.primitive_type), regs.num_indices,
+                        regs.num_instances.NumInstances(), int(is_indexed),
+                        (unsigned long long)(cb0 ? cb0.Address() : 0),
+                        cb0 ? cb0.Pitch() : 0, cb0 ? cb0.Height() : 0, regs.stage_enable.raw);
+        }
+        return;
+    }
+    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(
+        indirect ? PipelineCache::IndirectParams{indirect->vertex_sgpr_offset,
+                                                 indirect->instance_sgpr_offset, true}
+                 : PipelineCache::IndirectParams{});
+    if (!pipeline) {
+        ++draw_state->skipped_draws;
+        ++draw_state->no_pipeline;
+        return;
+    }
+    const auto& key = pipeline->key;
+    auto& d = *draw_state->impl;
+
+    // Render targets (before resources: both may record transfers).
+    struct Target {
+        id<MTLTexture> texture = nil;
+        u32 level = 0, slice = 0;
+        bool clear = false;
+        vk::ClearValue clear_value{};
+    };
+    std::array<Target, AmdGpu::NUM_COLOR_BUFFERS> colors{};
+    Target depth{};
+    bool depth_clear = false, stencil_clear = false;
+    u32 width = 16384, height = 16384;
+    const bool skip_cb = regs.color_control.mode == Mode::Disable;
+    for (u32 cb = 0; cb < key.num_color_attachments && !skip_cb; ++cb) {
+        const auto& col_buf = regs.color_buffers[cb];
+        if (!col_buf || !regs.color_target_mask.GetMask(cb) || !(key.mrt_mask & (1u << cb))) {
+            continue;
+        }
+        VideoCore::TextureCache::ImageDesc desc{col_buf, liverpool->last_cb_extent[cb]};
+        auto image_id = texture_cache.FindImage(desc);
+        auto* image = &texture_cache.GetImage(image_id);
+        image->binding.is_target = 1u;
+        bound_images.push_back(image_id);
+        texture_cache.UpdateImage(image_id);
+        runtime.SetBackingSamples(image, std::max<u32>(key.color_samples[cb], 1));
+        auto& view = texture_cache.FindRenderTarget(image_id, desc);
+        const u32 slice = view.info.range.base.layer;
+        const u32 mip = view.info.range.base.level;
+        auto& t = colors[cb];
+        t.clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
+        texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        if (t.clear) {
+            t.clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
+        }
+        // The view (its format is the color buffer's); a real view starts at its level/slice.
+        t.texture = Metal::Texture(*view.image_view);
+        const bool is_view = t.texture.parentTexture != nil;
+        t.level = is_view ? 0 : mip;
+        t.slice = is_view ? 0 : slice;
+        image->usage.render_target = 1u;
+        image->flags |= VideoCore::ImageFlagBits::GpuModified;
+        width = std::min(width, std::max(image->info.size.width >> mip, 1u));
+        height = std::min(height, std::max(image->info.size.height >> mip, 1u));
+    }
+    const auto ds_state = GetEffectiveDepthStencilState(regs);
+    if (ds_state.needs_attachment) {
+        const auto htile = regs.depth_htile_data_base.GetAddress();
+        VideoCore::TextureCache::ImageDesc desc{regs.depth_buffer, regs.depth_view,
+                                                regs.depth_control, htile,
+                                                liverpool->last_db_extent};
+        auto image_id = texture_cache.FindImage(desc);
+        auto& image = texture_cache.GetImage(image_id);
+        image.binding.is_target = 1u;
+        bound_images.push_back(image_id);
+        texture_cache.UpdateImage(image_id);
+        auto& view = texture_cache.FindDepthTarget(image_id, desc);
+        const u32 slice = view.info.range.base.layer;
+        depth_clear = (regs.depth_render_control.depth_clear_enable &&
+                       regs.depth_control.depth_enable && regs.depth_control.depth_write_enable) ||
+                      texture_cache.IsMetaCleared(htile, slice);
+        stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        texture_cache.TouchMeta(htile, slice, false);
+        depth.texture = Metal::Texture(*view.image_view);
+        depth.slice = depth.texture.parentTexture != nil ? 0 : slice;
+        image.usage.depth_target = true;
+        image.flags |= VideoCore::ImageFlagBits::GpuModified;
+        width = std::min(width, image.info.size.width);
+        height = std::min(height, image.info.size.height);
+    }
+
+    // Resources.
+    Shader::PushData push_data{};
+    push_data.xoffset = regs.viewport_control.xoffset_enable ? regs.viewports[0].xoffset : 0.f;
+    push_data.xscale = regs.viewport_control.xscale_enable ? regs.viewports[0].xscale : 1.f;
+    push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
+    push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
+    Shader::Backend::Bindings binding{};
+    std::array<StageBindings, MaxShaderStages> stage_bindings;
+    bool writes_memory = false;
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (pipeline->stages[i].info) {
+            BindStage(pipeline->stages[i], binding, push_data, stage_bindings[i]);
+            writes_memory |= stage_bindings[i].writes_memory;
+        }
+    }
+
+    // Vertex buffers.
+    struct VertexBinding {
+        __unsafe_unretained id<MTLBuffer> buffer = nil;
+        u64 offset = 0;
+    };
+    std::array<VertexBinding, 32> vertex_buffers{};
+    u32 num_vertex_buffers = 0;
+    const auto* vs_info = pipeline->Stage(SwStage::Vertex);
+    if (pipeline->fetch_shader && vs_info) {
+        for (const auto& attrib : pipeline->fetch_shader->attributes) {
+            if (num_vertex_buffers >= vertex_buffers.size()) {
+                break;
+            }
+            const auto sharp = attrib.GetSharp(*vs_info);
+            auto& vb = vertex_buffers[num_vertex_buffers++];
+            if (sharp.base_address != 0 && sharp.GetSize() != 0) {
+                const u64 bytes = memory->ClampRangeSize(sharp.base_address, sharp.GetSize());
+                const auto [buffer, offset] = buffer_cache.ObtainBuffer(sharp.base_address, bytes, false);
+                vb.buffer = Metal::Buffer(buffer->Handle());
+                vb.offset = offset;
+                // The skinned characters use 2-byte aligned vertex buffer offsets. Metal's
+                // validation wants 4, but Apple GPUs fetch vertices in shader code and read them
+                // correctly; the copy (TLG_METAL_UNALIGNED_VB=0) splits the render pass.
+                static const bool direct_unaligned = [] {
+                    const char* env = std::getenv("TLG_METAL_UNALIGNED_VB");
+                    return !(env && env[0] == '0');
+                }();
+                if (offset % 4 != 0 && !direct_unaligned) {
+                    // Metal wants 4-byte aligned vertex buffer offsets (the game uses 2-byte
+                    // ones): an aligned copy, made on the GPU (the data may be GPU-written).
+                    auto& stream = buffer_cache.GetStreamBuffer();
+                    const auto [data, copy_offset] = stream.Map(Common::AlignUp(bytes, 4) + 4, 16);
+                    stream.Commit();
+                    id<MTLBuffer> copy = Metal::Buffer(stream.Handle());
+                    draw_state->CopyBytes(scheduler, vb.buffer, offset, copy, copy_offset, bytes);
+                    vb.buffer = copy;
+                    vb.offset = copy_offset;
+                    ++draw_state->unaligned_vertex_buffers;
+                }
+            } else {
+                vb.buffer = d.dummy_buffer;
+            }
+        }
+    }
+    // Debugging (TLG_METAL_DUMP_TARGETS, frame dumps): the textures of skinned draws (vertex
+    // streams at 2-byte offsets, the characters).
+    {
+        bool skinned = false;
+        if (collect_targets && pipeline->fetch_shader && vs_info) {
+            for (const auto& attrib : pipeline->fetch_shader->attributes) {
+                const auto sharp = attrib.GetSharp(*vs_info);
+                skinned |= (sharp.base_address & 3) != 0;
+            }
+        }
+        static const bool all_textures = DebugFlag("TLG_METAL_DUMP_ALL_TEX");
+        if ((skinned || (collect_targets && all_textures)) && frame_targets.size() < 200) {
+            const auto& fs = stage_bindings[u32(SwStage::Fragment)];
+            for (u32 t = 0; t < fs.num_textures; ++t) {
+                id<MTLTexture> tex = fs.textures[t];
+                if (!tex || tex.textureType != MTLTextureType2D || tex.width < 8) {
+                    continue;
+                }
+                void* raw = (__bridge void*)tex;
+                if (std::any_of(frame_targets.begin(), frame_targets.end(),
+                                [&](const FrameTarget& f) { return f.label.find("tex") == 0 && f.texture == raw; })) {
+                    continue;
+                }
+                char label[96];
+                std::snprintf(label, sizeof(label), "tex_ps%08x_t%u_fmt%u",
+                              u32(pipeline->Stage(SwStage::Fragment) ? pipeline->Stage(SwStage::Fragment)->pgm_hash : 0),
+                              t, u32(tex.pixelFormat));
+                frame_targets.push_back({(__bridge_retained void*)tex, label});
+            }
+        }
+    }
+
+    // Index buffer.
+    id<MTLBuffer> index_buffer = nil;
+    u64 index_buffer_offset = 0;
+    MTLIndexType index_type = MTLIndexTypeUInt16;
+    if (is_indexed) {
+        const bool is16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+        index_type = is16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        const u32 index_size = is16 ? 2 : 4;
+        const VAddr address = regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+        const auto [buffer, offset] =
+            buffer_cache.ObtainBuffer(address, u64(regs.num_indices) * index_size, false);
+        index_buffer = Metal::Buffer(buffer->Handle());
+        index_buffer_offset = offset;
+        static const bool copy_indices = [] {
+            const char* env = std::getenv("TLG_METAL_COPY_INDICES");
+            return env && env[0] == '1';
+        }();
+        if (offset % 4 != 0 || copy_indices) {
+            // Metal wants 4-byte aligned index buffer offsets.
+            auto& stream = buffer_cache.GetStreamBuffer();
+            const u64 bytes = u64(regs.num_indices) * index_size;
+            index_buffer_offset =
+                stream.Copy(reinterpret_cast<const void*>(address), std::max<u64>(bytes, 4), 4);
+            index_buffer = Metal::Buffer(stream.Handle());
+        }
+    }
+
+    // Indirect arguments (guest memory); a draw count clamps them into a copy first.
+    id<MTLBuffer> args_buffer = nil;
+    u64 args_offset = 0;
+    if (indirect) {
+        const u64 bytes = u64(indirect->stride) * indirect->max_count;
+        const auto [buffer, offset] = buffer_cache.ObtainBuffer(indirect->args, bytes, false);
+        args_buffer = Metal::Buffer(buffer->Handle());
+        args_offset = offset;
+        if (indirect->count) {
+            const auto [count_buffer, count_offset] = buffer_cache.ObtainBuffer(indirect->count, 4, false);
+            auto& stream = buffer_cache.GetStreamBuffer();
+            const auto [data, copy_offset] = stream.Map(bytes, 16);
+            stream.Commit();
+            id<MTLBuffer> copy = Metal::Buffer(stream.Handle());
+            draw_state->ClampIndirect(scheduler, args_buffer, args_offset,
+                                      Metal::Buffer(count_buffer->Handle()), count_offset, copy,
+                                      copy_offset, indirect->stride, indirect->max_count);
+            args_buffer = copy;
+            args_offset = copy_offset;
+        }
+    }
+
+    // Indirect quad lists: triangle-list indices and indexed arguments made on the GPU.
+    bool quad_indirect = false;
+    if (indirect && regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
+        const u32 max_count = indirect->max_count;
+        const u32 max_quads = is_indexed ? std::max<u32>(regs.num_indices / 4, 1) : 65536;
+        auto& stream = buffer_cache.GetStreamBuffer();
+        const auto [args_data, new_args_offset] = stream.Map(max_count * 20, 16);
+        stream.Commit();
+        id<MTLBuffer> new_args = Metal::Buffer(stream.Handle());
+        id<MTLBuffer> new_indices = nil;
+        u64 new_indices_offset = 0;
+        if (is_indexed) {
+            const auto [idx_data, idx_offset] = stream.Map(u64(max_quads) * 6 * 4 * max_count, 16);
+            stream.Commit();
+            new_indices = Metal::Buffer(stream.Handle());
+            new_indices_offset = idx_offset;
+        } else {
+            new_indices = draw_state->QuadIndices(max_quads);
+        }
+        draw_state->ConvertQuadIndirect(scheduler, args_buffer, args_offset, indirect->stride,
+                                        max_count, is_indexed, index_buffer, index_buffer_offset,
+                                        index_type == MTLIndexTypeUInt16, max_quads, new_args,
+                                        new_args_offset, new_indices, new_indices_offset);
+        args_buffer = new_args;
+        args_offset = new_args_offset;
+        index_buffer = new_indices;
+        index_buffer_offset = new_indices_offset;
+        index_type = MTLIndexTypeUInt32;
+        quad_indirect = true;
+    }
+
+    // The render pass: kept open while the attachments are the same and nothing is cleared.
+    std::array<AttachmentKey, 9> pass{};
+    bool any_clear = depth_clear || stencil_clear;
+    for (u32 cb = 0; cb < colors.size(); ++cb) {
+        pass[cb] = {(__bridge void*)colors[cb].texture, colors[cb].level, colors[cb].slice};
+        any_clear |= colors[cb].clear;
+    }
+    pass[8] = {(__bridge void*)depth.texture, 0, depth.slice};
+    id<MTLRenderCommandEncoder> enc = MetalScheduler::Render(scheduler);
+    const bool same_pass = enc && d.pass_open && !any_clear &&
+                           std::memcmp(pass.data(), d.pass.data(), sizeof(pass)) == 0;
+    if (!same_pass) {
+        if (NanScan::Active()) {
+            std::array<id<MTLTexture>, 8> nan_targets{};
+            for (u32 cb = 0; cb < colors.size() && cb < 8; ++cb) {
+                nan_targets[cb] = colors[cb].texture;
+            }
+            NanScan::BeginPass(scheduler, draw_state->draws, nan_targets.data(), 8);
+        }
+        if (collect_targets && frame_targets.size() < 96) {
+            // Debugging: copies of the targets of each pass (taken before this pass).
+            scheduler.EndEncoding();
+            for (u32 cb = 0; cb < colors.size(); ++cb) {
+                if (!colors[cb].texture || colors[cb].texture.textureType != MTLTextureType2D) {
+                    continue;
+                }
+                id<MTLTexture> src = colors[cb].texture;
+                MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
+                                                                                              width:src.width
+                                                                                             height:src.height
+                                                                                          mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead;
+                td.storageMode = MTLStorageModePrivate;
+                id<MTLTexture> snap = [Metal::Device() newTextureWithDescriptor:td];
+                snapshots_pending.push_back({(__bridge_retained void*)src, (__bridge_retained void*)snap,
+                                             cb, draw_state->draws});
+            }
+            if (depth.texture && depth.texture.textureType == MTLTextureType2D &&
+                depth.texture.pixelFormat == MTLPixelFormatDepth32Float) {
+                id<MTLTexture> src = depth.texture;
+                MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
+                                                                                              width:src.width
+                                                                                             height:src.height
+                                                                                          mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead;
+                td.storageMode = MTLStorageModePrivate;
+                id<MTLTexture> snap = [Metal::Device() newTextureWithDescriptor:td];
+                snapshots_pending.push_back({(__bridge_retained void*)src, (__bridge_retained void*)snap,
+                                             8, draw_state->draws});
+            }
+        }
+        // Copies of the previous pass's targets are taken now (their content is final).
+        if (!snapshots_pending.empty()) {
+            for (auto& p : snapshots_pending) {
+                if (p.draw == draw_state->draws) {
+                    continue;
+                }
+                id<MTLTexture> src = (__bridge_transfer id<MTLTexture>)p.src;
+                id<MTLTexture> snap = (__bridge id<MTLTexture>)p.snap;
+                scheduler.EndEncoding();
+                [MetalScheduler::Blit(scheduler) copyFromTexture:src sourceSlice:0 sourceLevel:0
+                                                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                                                       sourceSize:MTLSizeMake(src.width, src.height, 1)
+                                                        toTexture:snap destinationSlice:0
+                                                 destinationLevel:0
+                                                destinationOrigin:MTLOriginMake(0, 0, 0)];
+                char label[96];
+                std::snprintf(label, sizeof(label), "pass%llu_cb%u_%u", (unsigned long long)p.draw, p.cb,
+                              u32(src.pixelFormat));
+                frame_targets.push_back({p.snap, label});
+                p.src = nullptr;
+            }
+            std::erase_if(snapshots_pending, [](const PendingSnap& p) { return p.src == nullptr; });
+            scheduler.EndEncoding();
+        }
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        for (u32 cb = 0; cb < colors.size(); ++cb) {
+            const auto& t = colors[cb];
+            if (!t.texture) {
+                continue;
+            }
+            auto* att = rp.colorAttachments[cb];
+            att.texture = t.texture;
+            att.level = t.level;
+            if (t.texture.textureType == MTLTextureType3D) {
+                att.depthPlane = t.slice;
+            } else {
+                att.slice = t.slice;
+            }
+            att.loadAction = (t.clear || debug_clear) ? MTLLoadActionClear : MTLLoadActionLoad;
+            if (debug_clear) {
+                att.clearColor = MTLClearColorMake(1, 0, 1, 1);
+            } else if (t.clear) {
+                const auto& c = t.clear_value.color.float32;
+                att.clearColor = MTLClearColorMake(c[0], c[1], c[2], c[3]);
+            }
+            att.storeAction = MTLStoreActionStore;
+        }
+        if (depth.texture) {
+            const MTLPixelFormat pf = depth.texture.pixelFormat;
+            const bool has_stencil = pf == MTLPixelFormatDepth32Float_Stencil8 ||
+                                     pf == MTLPixelFormatStencil8;
+            if (pf != MTLPixelFormatStencil8) {
+                rp.depthAttachment.texture = depth.texture;
+                rp.depthAttachment.slice = depth.slice;
+                rp.depthAttachment.loadAction = depth_clear ? MTLLoadActionClear : MTLLoadActionLoad;
+                rp.depthAttachment.clearDepth = regs.depth_clear;
+                rp.depthAttachment.storeAction = MTLStoreActionStore;
+            }
+            if (has_stencil) {
+                rp.stencilAttachment.texture = depth.texture;
+                rp.stencilAttachment.slice = depth.slice;
+                rp.stencilAttachment.loadAction = stencil_clear ? MTLLoadActionClear : MTLLoadActionLoad;
+                rp.stencilAttachment.clearStencil = regs.stencil_clear;
+                rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
+        }
+        if (!depth.texture && std::none_of(colors.begin(), colors.end(),
+                                           [](const Target& t) { return t.texture != nil; })) {
+            // No attachments (pixel shader side effects only).
+            rp.renderTargetWidth = width == 16384 ? 1 : width;
+            rp.renderTargetHeight = height == 16384 ? 1 : height;
+            rp.defaultRasterSampleCount = std::max<u32>(key.num_samples, 1);
+        }
+        scheduler.EndEncoding();
+        enc = [MetalScheduler::CommandBuffer(scheduler) renderCommandEncoderWithDescriptor:rp];
+        if (!enc) {
+            ++draw_state->skipped_draws;
+            ResetBindings();
+            return;
+        }
+        scheduler.SetRenderEncoder((__bridge void*)enc, 1);
+        d.pass = pass;
+        d.pass_open = true;
+        d.pass_width = width == 16384 ? 1 : width;
+        d.pass_height = height == 16384 ? 1 : height;
+        ++draw_state->passes;
+        label_pass_draws = 0;
+        label_pass_verts = 0;
+    }
+    if (MetalScheduler::LabelMode()) {
+        // Profiling: the pass's size, attachment formats, draws and vertices so far.
+        label_pass_draws += 1;
+        label_pass_verts += u64(regs.num_indices) * std::max<u32>(regs.num_instances.NumInstances(), 1);
+        char label[160];
+        std::snprintf(label, sizeof(label), "rp %ux%u c%u d%u draws=%u verts=%llu", d.pass_width,
+                      d.pass_height, colors[0].texture ? u32(colors[0].texture.pixelFormat) : 0,
+                      depth.texture ? u32(depth.texture.pixelFormat) : 0, label_pass_draws,
+                      (unsigned long long)label_pass_verts);
+        enc.label = [NSString stringWithUTF8String:label];
+    }
+
+    // State.
+    [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pipeline->pso];
+    const auto bind = [&](const StageBindings& b, bool vertex) {
+        for (u32 i = 0; i < b.num_buffers; ++i) {
+            if (vertex) {
+                [enc setVertexBuffer:b.buffers[i] offset:b.offsets[i] atIndex:i];
+            } else {
+                [enc setFragmentBuffer:b.buffers[i] offset:b.offsets[i] atIndex:i];
+            }
+        }
+        if (b.num_textures) {
+            if (vertex) {
+                [enc setVertexTextures:b.textures.data() withRange:NSMakeRange(0, b.num_textures)];
+            } else {
+                [enc setFragmentTextures:b.textures.data() withRange:NSMakeRange(0, b.num_textures)];
+            }
+        }
+        if (b.num_samplers) {
+            if (vertex) {
+                [enc setVertexSamplerStates:b.samplers.data() withRange:NSMakeRange(0, b.num_samplers)];
+            } else {
+                [enc setFragmentSamplerStates:b.samplers.data() withRange:NSMakeRange(0, b.num_samplers)];
+            }
+        }
+        if (vertex) {
+            [enc setVertexBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
+            [enc setVertexBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
+        } else {
+            [enc setFragmentBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
+            [enc setFragmentBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
+        }
+    };
+    bind(stage_bindings[u32(SwStage::Vertex)], true);
+    if (pipeline->stages[u32(SwStage::Fragment)].info) {
+        bind(stage_bindings[u32(SwStage::Fragment)], false);
+    }
+    for (u32 i = 0; i < num_vertex_buffers; ++i) {
+        [enc setVertexBuffer:vertex_buffers[i].buffer
+                      offset:vertex_buffers[i].offset
+                     atIndex:pipeline->vertex_buffer_base + i];
+    }
+
+    // Viewport and scissor.
+    {
+        const auto& vp = regs.viewports[0];
+        const auto& vp_ctl = regs.viewport_control;
+        MTLViewport viewport;
+        const float zoffset = vp_ctl.zoffset_enable ? vp.zoffset : 0.f;
+        const float zscale = vp_ctl.zscale_enable ? vp.zscale : 1.f;
+        if (regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW) {
+            viewport.znear = zoffset - zscale;
+            viewport.zfar = zoffset + zscale;
+        } else {
+            viewport.znear = zoffset;
+            viewport.zfar = zoffset + zscale;
+        }
+        viewport.znear = std::clamp(viewport.znear, 0.0, 1.0);
+        viewport.zfar = std::clamp(viewport.zfar, 0.0, 1.0);
+        if (regs.IsClipDisabled() || vp.xscale == 0) {
+            // Clip disabled: positions are screen coordinates over [0, 16384) (y down).
+            viewport.originX = 0;
+            viewport.originY = 16384;
+            viewport.width = 16384;
+            viewport.height = -16384;
+        } else {
+            const float xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
+            const float xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
+            const float yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
+            const float yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
+            // Vulkan maps clip y = -1 to the top (vy), Metal maps +1 to the top: the same window
+            // positions need originY = vy + vh and height = -vh. The PS4's negative y scale
+            // gives a positive height.
+            const float vy = yoffset - yscale;
+            const float vh = yscale * 2.0f;
+            viewport.originX = xoffset - xscale;
+            viewport.width = xscale * 2.0f;
+            viewport.originY = vy + vh;
+            viewport.height = -vh;
+        }
+        [enc setViewport:viewport];
+
+        const auto tl = [](s16 scr, s16 win, s16 gen, s16 off) {
+            return std::max({scr, s16(win + off), s16(gen + off)});
+        };
+        const auto br = [](s16 scr, s16 win, s16 gen, s16 off) {
+            return std::min({scr, s16(win + off), s16(gen + off)});
+        };
+        const bool offset = !regs.window_scissor.window_offset_disable;
+        const s16 ox = offset ? regs.window_offset.window_x_offset : 0;
+        const s16 oy = offset ? regs.window_offset.window_y_offset : 0;
+        s32 x0 = tl(regs.screen_scissor.top_left_x, s16(regs.window_scissor.top_left_x),
+                    s16(regs.generic_scissor.top_left_x), ox);
+        s32 y0 = tl(regs.screen_scissor.top_left_y, s16(regs.window_scissor.top_left_y),
+                    s16(regs.generic_scissor.top_left_y), oy);
+        s32 x1 = br(regs.screen_scissor.bottom_right_x, regs.window_scissor.bottom_right_x,
+                    regs.generic_scissor.bottom_right_x, ox);
+        s32 y1 = br(regs.screen_scissor.bottom_right_y, regs.window_scissor.bottom_right_y,
+                    regs.generic_scissor.bottom_right_y, oy);
+        if (regs.mode_control.vport_scissor_enable) {
+            x0 = std::max<s32>(x0, regs.viewport_scissors[0].top_left_x);
+            y0 = std::max<s32>(y0, regs.viewport_scissors[0].top_left_y);
+            x1 = std::min<s32>(x1, regs.viewport_scissors[0].bottom_right_x);
+            y1 = std::min<s32>(y1, regs.viewport_scissors[0].bottom_right_y);
+        }
+        x0 = std::clamp<s32>(x0, 0, d.pass_width);
+        y0 = std::clamp<s32>(y0, 0, d.pass_height);
+        x1 = std::clamp<s32>(x1, x0, d.pass_width);
+        y1 = std::clamp<s32>(y1, y0, d.pass_height);
+        static int scissor_logs = 0;
+        if (scissor_logs < log_draws) {
+            ++scissor_logs;
+            std::printf("  scissor %d,%d-%d,%d pass %ux%u viewport %.1f,%.1f %.1fx%.1f z %.2f-%.2f "
+                        "screen %d,%d-%d,%d window %d,%d-%d,%d generic %d,%d-%d,%d\n",
+                        x0, y0, x1, y1, d.pass_width, d.pass_height, viewport.originX,
+                        viewport.originY, viewport.width, viewport.height, viewport.znear,
+                        viewport.zfar, regs.screen_scissor.top_left_x, regs.screen_scissor.top_left_y,
+                        regs.screen_scissor.bottom_right_x, regs.screen_scissor.bottom_right_y,
+                        regs.window_scissor.top_left_x, regs.window_scissor.top_left_y,
+                        regs.window_scissor.bottom_right_x, regs.window_scissor.bottom_right_y,
+                        regs.generic_scissor.top_left_x, regs.generic_scissor.top_left_y,
+                        regs.generic_scissor.bottom_right_x, regs.generic_scissor.bottom_right_y);
+        }
+        if (x1 <= x0 || y1 <= y0) {
+            ResetBindings();
+            return; // nothing visible
+        }
+        [enc setScissorRect:MTLScissorRect{NSUInteger(x0), NSUInteger(y0), NSUInteger(x1 - x0),
+                                           NSUInteger(y1 - y0)}];
+    }
+
+    // Rasterization.
+    const bool culled = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type);
+    const auto cull = culled ? LiverpoolToVK::CullMode(regs.polygon_control.CullingMode())
+                             : vk::CullModeFlags{};
+    if (cull == vk::CullModeFlagBits::eFrontAndBack) {
+        ResetBindings();
+        return;
+    }
+    [enc setCullMode:no_cull ? MTLCullModeNone
+                     : cull == vk::CullModeFlagBits::eFront ? MTLCullModeFront
+                     : cull == vk::CullModeFlagBits::eBack ? MTLCullModeBack
+                                                            : MTLCullModeNone];
+    // Window positions match Vulkan's (viewport above), so does the winding.
+    [enc setFrontFacingWinding:LiverpoolToVK::FrontFace(regs.polygon_control.front_face) ==
+                                       vk::FrontFace::eClockwise
+                                   ? MTLWindingClockwise
+                                   : MTLWindingCounterClockwise];
+    [enc setTriangleFillMode:regs.polygon_control.PolyMode() == AmdGpu::PolygonMode::Fill
+                                 ? MTLTriangleFillModeFill
+                                 : MTLTriangleFillModeLines];
+    const bool clamp = !regs.depth_render_override.disable_viewport_clamp;
+    [enc setDepthClipMode:(!regs.clipper_control.ZclipEnable() && clamp) ? MTLDepthClipModeClamp
+                                                                         : MTLDepthClipModeClip];
+    if (regs.polygon_control.NeedsBias()) {
+        const bool front = regs.polygon_control.enable_polygon_offset_front;
+        const float slope = front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale;
+        const float constant = front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset;
+        [enc setDepthBias:constant slopeScale:slope / 16.f clamp:regs.poly_offset.depth_bias];
+    } else {
+        [enc setDepthBias:0 slopeScale:0 clamp:0];
+    }
+    [enc setBlendColorRed:regs.blend_constants[0]
+                    green:regs.blend_constants[1]
+                     blue:regs.blend_constants[2]
+                    alpha:regs.blend_constants[3]];
+
+    // Depth and stencil.
+    {
+        const bool depth_test = ds_state.depth_test_enable && depth.texture && !no_depth;
+        const bool depth_write = ds_state.depth_write_enable && depth.texture &&
+                                 !regs.depth_render_control.depth_clear_enable;
+        const bool stencil = ds_state.stencil_test_enable && depth.texture;
+        const auto& sc = regs.stencil_control;
+        const auto front = regs.stencil_ref_front;
+        const auto back = regs.depth_control.backface_enable ? regs.stencil_ref_back : front;
+        const bool stencil_clear_now = regs.depth_render_control.stencil_clear_enable;
+        const u32 front_write = stencil_clear_now ? 0u : front.stencil_write_mask;
+        const u32 back_write = stencil_clear_now ? 0u : back.stencil_write_mask;
+        const auto back_func = regs.depth_control.backface_enable ? regs.depth_control.stencil_bf_func
+                                                                  : regs.depth_control.stencil_ref_func;
+        const auto back_fail = regs.depth_control.backface_enable ? sc.stencil_fail_back : sc.stencil_fail_front;
+        const auto back_zpass = regs.depth_control.backface_enable ? sc.stencil_zpass_back : sc.stencil_zpass_front;
+        const auto back_zfail = regs.depth_control.backface_enable ? sc.stencil_zfail_back : sc.stencil_zfail_front;
+        struct Face {
+            MTLStencilOperation fail, pass, zfail;
+            MTLCompareFunction func;
+            u32 reference, read_mask, write_mask;
+        };
+        const auto setup = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref,
+                              u32 write_mask, AmdGpu::StencilFunc fail, AmdGpu::StencilFunc zpass,
+                              AmdGpu::StencilFunc zfail) {
+            Face f{};
+            f.func = Compare(LiverpoolToVK::CompareOp(func));
+            f.read_mask = ref.stencil_mask;
+            f.write_mask = write_mask;
+            if (const auto r = ResolveStencilFace(func, ref, write_mask, fail, zpass, zfail)) {
+                f.fail = Stencil(r->fail_op);
+                f.pass = Stencil(r->pass_op);
+                f.zfail = Stencil(r->depth_fail_op);
+                f.reference = r->reference;
+            } else {
+                f.fail = Stencil(LiverpoolToVK::StencilOp(fail));
+                f.pass = Stencil(LiverpoolToVK::StencilOp(zpass));
+                f.zfail = Stencil(LiverpoolToVK::StencilOp(zfail));
+                const bool uses_op_val = fail == AmdGpu::StencilFunc::ReplaceOp ||
+                                         zpass == AmdGpu::StencilFunc::ReplaceOp ||
+                                         zfail == AmdGpu::StencilFunc::ReplaceOp;
+                f.reference = uses_op_val ? ref.stencil_op_val : ref.stencil_test_val;
+            }
+            return f;
+        };
+        Face ff{}, bf{};
+        if (stencil) {
+            ff = setup(regs.depth_control.stencil_ref_func, front, front_write, sc.stencil_fail_front,
+                       sc.stencil_zpass_front, sc.stencil_zfail_front);
+            bf = regs.depth_control.backface_enable
+                     ? setup(back_func, back, back_write, back_fail, back_zpass, back_zfail)
+                     : ff;
+        }
+        u64 ds_key = u64(depth_test) | u64(depth_write) << 1 | u64(stencil) << 2 |
+                     u64(regs.depth_control.depth_func) << 3;
+        if (stencil) {
+            const auto face_bits = [](const Face& f) {
+                return u64(f.fail) | u64(f.pass) << 3 | u64(f.zfail) << 6 | u64(f.func) << 9 |
+                       u64(f.read_mask & 0xff) << 12 | u64(f.write_mask & 0xff) << 20;
+            };
+            ds_key |= face_bits(ff) << 6;
+            ds_key ^= face_bits(bf) * 0x9E3779B97F4A7C15ull;
+            ds_key |= 4;
+        }
+        auto& ds = d.depth_states[ds_key];
+        if (!ds) {
+            MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+            dd.depthCompareFunction =
+                depth_test ? Compare(LiverpoolToVK::CompareOp(regs.depth_control.depth_func))
+                           : MTLCompareFunctionAlways;
+            dd.depthWriteEnabled = depth_write;
+            if (stencil) {
+                const auto make = [](const Face& face) {
+                    MTLStencilDescriptor* sdesc = [MTLStencilDescriptor new];
+                    sdesc.stencilCompareFunction = face.func;
+                    sdesc.stencilFailureOperation = face.fail;
+                    sdesc.depthStencilPassOperation = face.pass;
+                    sdesc.depthFailureOperation = face.zfail;
+                    sdesc.readMask = face.read_mask;
+                    sdesc.writeMask = face.write_mask;
+                    return sdesc;
+                };
+                dd.frontFaceStencil = make(ff);
+                dd.backFaceStencil = make(bf);
+            }
+            ds = [Metal::Device() newDepthStencilStateWithDescriptor:dd];
+        }
+        [enc setDepthStencilState:ds];
+        if (stencil) {
+            [enc setStencilFrontReferenceValue:ff.reference backReferenceValue:bf.reference];
+        }
+    }
+
+    if (NanScan::Active() && pipeline->Stage(SwStage::Fragment)) {
+        const u64 vs_hash = pipeline->Stage(SwStage::Vertex) ? pipeline->Stage(SwStage::Vertex)->pgm_hash : 0;
+        NanScan::NoteDraw(NanScan::PerDraw() ? (vs_hash << 32) | u32(pipeline->Stage(SwStage::Fragment)->pgm_hash)
+                                             : pipeline->Stage(SwStage::Fragment)->pgm_hash);
+    }
+    if (logged_draws < log_draws) {
+        ++logged_draws;
+        const auto& vp = regs.viewports[0];
+        std::printf("Draw %d: cb0 %#llx tex %p vs %016llx ps %016llx prim %u n %u inst %u idx %d rt0 %ux%u fmt %u "
+                    "depth %d samples %u vp xo %.1f xs %.1f yo %.1f ys %.1f zs %.2f zo %.2f "
+                    "clip_disabled %d cull %u ff %u mrt %#x\n",
+                    logged_draws, (unsigned long long)regs.color_buffers[0].Address(),
+                    (__bridge void*)colors[0].texture,
+                    (unsigned long long)(pipeline->Stage(SwStage::Vertex) ? pipeline->Stage(SwStage::Vertex)->pgm_hash : 0),
+                    (unsigned long long)(pipeline->Stage(SwStage::Fragment) ? pipeline->Stage(SwStage::Fragment)->pgm_hash : 0),
+                    u32(regs.primitive_type), regs.num_indices, regs.num_instances.NumInstances(),
+                    int(is_indexed), colors[0].texture ? u32(colors[0].texture.width) : 0,
+                    colors[0].texture ? u32(colors[0].texture.height) : 0,
+                    colors[0].texture ? u32(colors[0].texture.pixelFormat) : 0,
+                    depth.texture != nil, key.num_samples, vp.xoffset, vp.xscale, vp.yoffset,
+                    vp.yscale, vp.zscale, vp.zoffset, int(regs.IsClipDisabled()),
+                    u32(regs.polygon_control.CullingMode()), u32(regs.polygon_control.front_face),
+                    key.mrt_mask);
+        for (u32 c = 0; c < key.num_color_attachments; ++c) {
+            const auto& sw = key.color_buffers[c].swizzle;
+            std::printf("  cb%u dfmt %u nfmt %u swizzle %u%u%u%u export %u\n", c,
+                        u32(key.color_buffers[c].data_format), u32(key.color_buffers[c].num_format),
+                        u32(sw.r), u32(sw.g), u32(sw.b), u32(sw.a),
+                        u32(key.color_buffers[c].export_format));
+        }
+        std::printf("  key: wm %#x %#x blend %d num_att %u cdf %u nf %u | pso %p\n",
+                    key.write_masks[0], key.write_masks[1], int(key.blend_controls[0].enable),
+                    key.num_color_attachments, u32(key.color_buffers[0].data_format),
+                    u32(key.color_buffers[0].num_format), pipeline->pso);
+    }
+    // Quad lists: two triangles per quad (0 1 2, 0 2 3), through an index buffer.
+    u32 num_indices = regs.num_indices;
+    bool draw_indexed = is_indexed;
+    if (regs.primitive_type == AmdGpu::PrimitiveType::QuadList && !indirect) {
+        const u32 quads = num_indices / 4;
+        auto& stream = buffer_cache.GetStreamBuffer();
+        const auto [data, offset] = stream.Map(std::max<u32>(quads * 6 * 4, 4), 4);
+        u32* out = reinterpret_cast<u32*>(data);
+        const u8* src = is_indexed ? static_cast<const u8*>(index_buffer.contents) + index_buffer_offset
+                                   : nullptr;
+        const bool is16 = index_type == MTLIndexTypeUInt16;
+        const auto index = [&](u32 i) -> u32 {
+            if (!src) {
+                return i;
+            }
+            return is16 ? reinterpret_cast<const u16*>(src)[i] : reinterpret_cast<const u32*>(src)[i];
+        };
+        static constexpr u32 order[6] = {0, 1, 2, 0, 2, 3};
+        for (u32 q = 0; q < quads; ++q) {
+            for (u32 k = 0; k < 6; ++k) {
+                out[q * 6 + k] = index(q * 4 + order[k]);
+            }
+        }
+        stream.Commit();
+        index_buffer = Metal::Buffer(stream.Handle());
+        index_buffer_offset = offset;
+        index_type = MTLIndexTypeUInt32;
+        num_indices = quads * 6;
+        draw_indexed = true;
+    }
+    // The draw.
+    const u32 num_instances = std::max<u32>(regs.num_instances.NumInstances(), 1);
+    u32 vertex_offset = regs.index_offset;
+    u32 instance_offset = 0;
+    if (pipeline->fetch_shader && vs_info) {
+        const auto& fs = *pipeline->fetch_shader;
+        if (vertex_offset == 0 && fs.vertex_offset_sgpr != -1) {
+            vertex_offset = vs_info->UserData()[fs.vertex_offset_sgpr];
+        }
+        if (fs.instance_offset_sgpr != -1) {
+            instance_offset = vs_info->UserData()[fs.instance_offset_sgpr];
+        }
+    }
+    if (indirect && !skip_calls) {
+        for (u32 i = 0; i < indirect->max_count; ++i) {
+            const u64 at = args_offset + u64(i) * (quad_indirect ? 20 : indirect->stride);
+            if (is_indexed || quad_indirect) {
+                [enc drawIndexedPrimitives:primitive
+                                 indexType:index_type
+                               indexBuffer:index_buffer
+                         indexBufferOffset:index_buffer_offset
+                            indirectBuffer:args_buffer
+                      indirectBufferOffset:at];
+            } else {
+                [enc drawPrimitives:primitive indirectBuffer:args_buffer indirectBufferOffset:at];
+            }
+        }
+    } else if (num_indices && !skip_calls) {
+        if (draw_indexed) {
+            [enc drawIndexedPrimitives:primitive
+                            indexCount:num_indices
+                             indexType:index_type
+                           indexBuffer:index_buffer
+                     indexBufferOffset:index_buffer_offset
+                         instanceCount:num_instances
+                            baseVertex:s32(vertex_offset)
+                          baseInstance:instance_offset];
+        } else {
+            [enc drawPrimitives:primitive
+                    vertexStart:vertex_offset
+                    vertexCount:num_indices
+                  instanceCount:num_instances
+                   baseInstance:instance_offset];
+        }
+    }
+    if (writes_memory) {
+        MetalScheduler::NoteUntrackedWrite(scheduler);
+    }
+    if (NanScan::Active() && NanScan::PerDraw()) {
+        // Every draw its own pass, so the scan names the draw that wrote the first NaN.
+        scheduler.EndEncoding();
+        d.pass_open = false;
+    }
+    ResetBindings();
+}
+
+void Rasterizer::DispatchDirect() {
+    DispatchImpl(0);
+}
+
+void Rasterizer::DispatchImpl(VAddr indirect_args) {
+    ++draw_state->dispatches;
+    scheduler.PopPendingOperations();
+    const auto& cs = liverpool->GetCsRegs();
+    if (!indirect_args && (cs.dim_x == 0 || cs.dim_y == 0 || cs.dim_z == 0)) {
+        return;
+    }
+    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    if (!pipeline) {
+        ++draw_state->skipped_dispatches;
+        return;
+    }
+    Shader::PushData push_data{};
+    Shader::Backend::Bindings binding{};
+    StageBindings b;
+    BindStage(pipeline->stage, binding, push_data, b);
+    char label[96] = "";
+    if (MetalScheduler::LabelMode()) {
+        std::snprintf(label, sizeof(label), "cs %016llx %ux%ux%u%s",
+                      (unsigned long long)pipeline->hash, cs.dim_x, cs.dim_y, cs.dim_z,
+                      indirect_args ? " indirect" : "");
+    }
+    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, label);
+    draw_state->impl->pass_open = false;
+    [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)pipeline->pso];
+    for (u32 i = 0; i < b.num_buffers; ++i) {
+        [enc setBuffer:b.buffers[i] offset:b.offsets[i] atIndex:i];
+    }
+    if (b.num_textures) {
+        [enc setTextures:b.textures.data() withRange:NSMakeRange(0, b.num_textures)];
+    }
+    if (b.num_samplers) {
+        [enc setSamplerStates:b.samplers.data() withRange:NSMakeRange(0, b.num_samplers)];
+    }
+    [enc setBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
+    [enc setBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
+    const auto& wg = pipeline->workgroup_size;
+    const MTLSize threads = MTLSizeMake(std::max(wg[0], 1u), std::max(wg[1], 1u), std::max(wg[2], 1u));
+    if (indirect_args) {
+        const auto [buffer, offset] = buffer_cache.ObtainBuffer(indirect_args, 12, false);
+        [enc dispatchThreadgroupsWithIndirectBuffer:Metal::Buffer(buffer->Handle())
+                               indirectBufferOffset:offset
+                              threadsPerThreadgroup:threads];
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake(cs.dim_x, cs.dim_y, cs.dim_z) threadsPerThreadgroup:threads];
+    }
+    if (b.writes_memory) {
+        MetalScheduler::NoteUntrackedWrite(scheduler);
+    }
+    if (NanScan::Active()) {
+        NanScan::AfterDispatch(scheduler, pipeline->hash, b.textures.data(), b.num_textures);
+    }
+    ResetBindings();
+}
+
+void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    ++draw_state->indirect_dispatches;
+    DispatchImpl(address + offset);
+}
+
+} // namespace Vulkan

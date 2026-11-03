@@ -8,6 +8,8 @@
 #include <algorithm>
 #ifdef _WIN32
 asm(".section .rdata,\"dr\"\n.balign 16\n.global iss_wheel_png\niss_wheel_png:\n.incbin \"" TLG_POWER_WHEEL_PATH "\"\n.global iss_wheel_png_end\niss_wheel_png_end:\n.text\n");
+#elif defined(__APPLE__)
+asm(".section __DATA,__const\n.p2align 4\n.private_extern _iss_wheel_png\n_iss_wheel_png:\n.incbin \"" TLG_POWER_WHEEL_PATH "\"\n.private_extern _iss_wheel_png_end\n_iss_wheel_png_end:\n.text\n");
 #else
 asm(".section .rodata\n.balign 16\n.hidden iss_wheel_png\n.global iss_wheel_png\niss_wheel_png:\n.incbin \"" TLG_POWER_WHEEL_PATH "\"\n.hidden iss_wheel_png_end\n.global iss_wheel_png_end\niss_wheel_png_end:\n.previous\n");
 #endif

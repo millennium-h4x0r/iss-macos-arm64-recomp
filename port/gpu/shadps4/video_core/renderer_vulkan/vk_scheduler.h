@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -714,6 +715,33 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
+    /// tlg: barrier hoisting (TLG_HOIST_BARRIERS=1, opt-in). On Apple GPUs every render pass
+    /// stores its attachments to memory and loads them back; the port ended the pass for every
+    /// barrier a draw needed (80% of all pass ends). A barrier that only prepares data for
+    /// reading, touches none of the open pass's attachments, and follows no shader write made
+    /// in the pass orders nothing inside the pass: it is recorded before the pass begins (a
+    /// slot recorded ahead of beginRendering) and the pass goes on.
+    /// The images the next BeginRendering's attachments use; known=false (redirected
+    /// attachments) disables hoisting for that pass.
+    /// They apply only to a pass begun with exactly `state`.
+    void SetNextRenderImages(const RenderState& state, const std::array<vk::Image, 9>& images,
+                             bool known) {
+        next_render_state = state;
+        next_render_images = images;
+        next_render_images_known = known;
+    }
+    /// A shader writes memory other than its attachments. Draw preparation notes it before the
+    /// draw's own barrier flush, and the draw may then begin a new pass: the mark holds for the
+    /// open pass and carries into the next one.
+    void NotePassShaderWrites() {
+        pass_shader_writes = true;
+        pending_shader_writes = true;
+    }
+    /// Records the barriers ahead of the open pass when that is safe; false: end the pass.
+    bool TryHoistBarriers(const vk::MemoryBarrier2* memory,
+                          std::span<const vk::ImageMemoryBarrier2> images);
+    static bool HoistBarriersEnabled();
+
     /// tlg: TLG_FULL_BARRIERS=1 records a full memory barrier around every render pass and
     /// every compute dispatch, to tell a missing barrier from everything else.
     static bool FullBarriers();
@@ -1003,6 +1031,25 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    // tlg: barrier hoisting (TryHoistBarriers).
+    struct HoistSlot {
+        std::mutex mutex;
+        bool executed = false;
+        bool has_memory = false;
+        vk::MemoryBarrier2 memory{};
+        std::vector<vk::ImageMemoryBarrier2> images;
+    };
+    std::shared_ptr<HoistSlot> hoist_slot;
+    RenderState next_render_state{};
+    std::array<vk::Image, 9> next_render_images{};
+    std::array<vk::Image, 9> render_images{};
+    bool next_render_images_known = false;
+    bool render_images_known = false;
+    bool pass_shader_writes = false;
+    bool pending_shader_writes = false;
+    /// Barriers between attachment accesses of the open pass's own attachments (same layout):
+    /// inside the pass rasterization order already orders them; recorded after endRendering.
+    std::vector<vk::ImageMemoryBarrier2> end_barriers;
     RenderingObserver* rendering_observer = nullptr; ///< tlg
     // tlg: threaded recording
     std::unique_ptr<RecordChunk> record_chunk;

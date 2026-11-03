@@ -1,0 +1,202 @@
+# Native Metal backend: feasibility and plan (2026-11-02)
+
+## Why
+
+The game runs at ~24-25 FPS in the cannery through shadPS4's Vulkan renderer on KosmicKrisp
+(Vulkan -> Metal 4). Per frame (~40 ms): ~28 ms of GPU encoder time in ~180 render passes and
+~320 barriers, ~8 ms of bubbles between encoders, and 60 Hz vblank rounding. KosmicKrisp ends
+every encoder with a full GPU barrier, records Vulkan commands and re-encodes them at submit, and
+compiles shaders SPIR-V -> NIR -> MSL.
+
+A native backend could:
+- order work with Metal's own dependency tracking (or per-resource fences) instead of a full
+  barrier after every pass: the ~8 ms of bubbles, and overlap of independent passes;
+- treat guest memory as one `MTLBuffer` (`newBufferWithBytesNoCopy`, `gpuAddress`): no sparse
+  arenas, residency churn or readbacks;
+- choose load/store actions and memoryless targets with frame-level knowledge;
+- use hardware tessellation instead of compute emulation, and framebuffer fetch for the
+  attachment feedback loops that now end passes.
+
+Expected gain: removing the bubbles and some pass overhead is ~1.3-1.5x on GPU time, which
+would hold 30 FPS at the 60 Hz vblank (more with a frame rate patch and 120 Hz vblank). A 2-3x
+gain would also need the shaders themselves to run faster, which is not yet known.
+
+## Stage 1: shader translation (done)
+
+The port's SPIR-V shaders from the pipeline cache (`work/user/cache/CUSA00004-*/*.spv`, 1182
+shaders) translated with SPIRV-Cross 1.4.363 (`--msl --msl-version 30100 --msl-argument-buffers`)
+and compiled with the runtime Metal compiler (`MTLDevice newLibraryWithSource`, Metal 3.1):
+**1181/1182 compile**, ~46 ms each. The failure aliases 64-bit and 32-bit workgroup memory
+(`SPV_KHR_workgroup_memory_explicit_layout`); the recompiler's profile can turn that off.
+
+## Size
+
+No renderer interface exists: `Vulkan::Rasterizer`/`Presenter` are used directly by Liverpool,
+the page manager, the video out driver and the shim; the texture and buffer caches hold Vulkan
+objects (`vk::Format` is part of `ImageInfo`). The plan is a `renderer_metal/` with the same
+class names, chosen by CMake, with the PC-port extras (upscalers, DLSS/FSR, scene resolution,
+motion vectors, frame record, profiler, pipeline serialization) stubbed.
+Estimate: 13-17k new lines (rasterizer 3.5-4.5k, pipelines 2-2.5k, scheduler/runtime 2-2.5k,
+device/presenter 1.5k, formats 1.2k, cache backends 2-2.5k, SPIRV-Cross glue 1k, host shaders
+0.8k), plus 1-2k lines of stubs and type edits.
+
+## Milestones
+
+1. Build switch (`TLG_METAL=1`), stubs, Metal device, presenter clears the window, overlay.
+2. Formats, images/views/samplers, buffers over guest memory, copies (Runtime), detiling.
+3. Pipelines: SPIRV-Cross at pipeline creation (argument buffers for set 0, push constants via
+   `setBytes`, vertex descriptors), pipeline cache.
+4. Rasterizer: render passes, dynamic state, draws, dispatches: first game frames (intro).
+5. Gameplay correctness against the Vulkan path (frame dumps), then performance work.
+
+## Stage 2: shader code experiment (2026-11-02)
+
+KosmicKrisp's MSL for the game's shaders (`KK_MSL_DUMP`) has every float add/mul in
+`#pragma METAL fp math_mode(safe)`, an opaque `!&buf0.contents[0] ? 1 :` guard on every multiply
+(NaN preservation) and `coherent` on every buffer access. The first two come from the port's
+SPIR-V (every float op `NoContraction`, `SignedZeroInfNanPreserve`); SPIRV-Cross would emit a
+`[[clang::optnone]]` fma helper call per such op instead, which is no better. Cannery, explore
+route, FPS after 45 s:
+
+| Config | FPS |
+|---|---|
+| baseline | 23.6, 25.1 |
+| KK workarounds 6,14,17 off | 30.0, 28.3 |
+| + `TLG_FAST_FP=1` (no NoContraction / inf-nan preserve) | 31.6 (p90 33.3 ms) |
+
+So shader code is a large lever, and it is available in the Vulkan path (now the default in
+`run.sh`). The game has no frame cap: it calls `sceVideoOutSetFlipRate(0)` (every vblank;
+`TLG_FLIP_RATE` overrides and logs it), and frame intervals at a 120 Hz vblank were 25 ms
+(24%), 33 ms (59%) and 42 ms (12%); at 60 Hz, 24% of frames took 16.7 ms. It runs as fast as
+CPU and GPU allow, so a faster renderer does raise the frame rate.
+
+## Shader float math (2026-11-02)
+
+Delsin's vest and coat need unfused float math: with fused multiply-adds they render as
+white/black blotches. The recompiler can mark every float op NoContraction, but SPIRV-Cross
+turns each such op into a call to an `[[clang::optnone]]` helper (`spvFMul`, `spvFAdd`), which
+made gameplay about 5x more GPU-expensive (~4.5 FPS). The Metal renderer instead emits no
+per-op decorations (`profile.fast_fp = true`) and compiles every shader as MSL 3.2 with
+`#pragma METAL fp contract(off)` in Metal's safe math mode: correct vest, ~20 FPS in the
+cannery (Vulkan build: ~25).
+
+Switches: `TLG_METAL_FP=decorated` (old per-op path), `TLG_METAL_MATH=relaxed|fast`,
+`TLG_METAL_CONTRACT=1` (allow fusion), `TLG_METAL_UNALIGNED_VB=0` (copy 2-byte aligned vertex
+buffers instead of binding them directly), `TLG_METAL_LABEL=1` (one labeled encoder per compute
+job and per-pass draw/vertex counts, for Metal System Trace), `TLG_DRAW_STATS=1` (direct draws
+and vertices per 5 s, both renderers).
+
+## Black squares on faces (2026-11-03, fixed)
+
+The squares were NaN spread by the post-processing blurs. The skin vertex shader (`3f30e238`)
+read past the end of guest buffers: GCN returns 0 for loads past a buffer's `num_records` (and
+Vulkan gets the same from robust buffer access), Metal reads whatever guest memory follows.
+Huge interpolants made the G-buffer pixel shader (`62354dfb`) write Inf to render target 4,
+the tiled lighting (`ce1675e0`) turned it into NaN, and the bloom/DOF chain grew it into
+30-40 px squares. Fix: `Profile::buffer_bounds_check` (Metal): guest buffer loads past the
+bound range return 0 and stores are dropped (`OpArrayLength` against SPIRV-Cross's buffer size
+table; `OpArrayLength` was added to sirit). Also on the Metal profile, for GCN semantics:
+`nan_min_max` (NMin/NMax/NClamp; SPIRV-Cross's `fast::min/max` may return the NaN) and
+`pkrtz_saturate` (`v_cvt_pkrtz_f16_f32` saturates finite overflow to +-65504).
+Switches: `TLG_METAL_BOUNDS=0`, `TLG_METAL_NAN_MINMAX=0`, `TLG_METAL_PKRTZ=0`.
+
+Debug tools: `TLG_METAL_NAN_SCAN=1` counts NaN/Inf texels in every pass's float targets and
+every dispatch's textures on the frames after a frame dump (`=2`: one pass per draw, names the
+draw); `TLG_METAL_MSL_OVERRIDE=<dir>` loads hand-edited MSL named like the `TLG_METAL_DUMP`
+files; `TLG_METAL_LOG_PS=<hash>` logs the images a shader binds; `TLG_METAL_DUMP_ALL_TEX=1`
+adds every fragment texture to `TLG_METAL_DUMP_TARGETS` dumps; `TLG_LOG_IMAGE_ADDR=<hex>` logs
+an image's uploads (texture_cache.cpp). `tests/play.sh`: `DUMP_EVERY=<s>`, `FULL_FRAMES=1`.
+
+## Loading screen emblem (2026-11-03, fixed)
+
+The crows emblem rendered as vertical bars: the shader permutation key did not include the
+BC-1D-as-2D promotion (which samples the middle row), so a 2D texture reused a permutation
+compiled for a promoted 1D one. `ImageSpecialization::is_block1d` fixes it in both renderers
+(Vulkan `ShaderMetaVersion` 10).
+
+## Frame rate (2026-11-03)
+
+Cannery route (`tests/play.sh explore`, 150 s, mean FPS 40-130 s): Metal 25.4 -> 30.0 (locked,
+p95 33.3 ms), Vulkan 28.2. The game paces itself: its main thread spins (guest 0x1f2700) until
+the previous frame's end-of-pipe label is written, so frame time is the latency through the
+command processor thread and the GPU. Found with `xctrace` Time Profiler (CPU) and Metal System
+Trace (GPU busy only ~24%):
+
+- `StageBindings` held 1056 strong ObjC references per draw (6 stages x buffers, textures,
+  samplers): ARC set/release was ~30% of the command processor thread. Now `__unsafe_unretained`
+  (the caches own the objects; encoders retain what they bind) and not zeroed: 25.4 -> 28.3.
+- `PipelineCache::GetProgram` rebuilt the `StageSpecialization` of every stage of every draw;
+  it now reuses the last permutation when the user data, flattened user data, runtime info,
+  binding start and vertex attribute sharps repeat (`TLG_METAL_NO_FAST_PROGRAM=1` turns it off).
+- GCN's shader barrier (EVENT_WRITE_EOS + WAIT_REG_MEM on its label, ~10 per frame) drained the
+  whole GPU each time (`Scheduler::Finish`, ~40% of the command processor thread blocked).
+  `RunInOrder` now reports the label writes it defers to command buffer completion, so they are
+  pending fences (`DrawPipeHead/Reached` = command buffer ticks) and the wait passes: the Metal
+  queue runs the later work in order anyway. EOS no longer waits for earlier deferred labels
+  (completion handlers run in order). 28.5 -> 30.0 locked. `TLG_METAL_SYNC_STATS=1` counts the
+  remaining GPU waits; `TLG_LOG_WAITS=<n>` logs them and the EOS/EOP label writes.
+
+The 30 FPS ceiling is the 60 Hz vblank (`TLG_VBLANK_HZ=60`; the engine steps time per vblank).
+
+Caution: one run with `vsync=0` and `TLG_VBLANK_HZ=120` exited after ~10 s and left an
+unattributed ("n/a") compute job holding the GPU at 100% after the process was gone (as on
+2026-11-02). Do not repeat that configuration unguarded.
+
+## Shader compile time (2026-11-03)
+
+About 650 shaders compile while the cannery loads (the 10-20 s FPS bucket fell to ~22). The
+"shaders compiled" line (every 5 s) splits the time: recompile + SPIR-V ~0.7 ms, SPIRV-Cross
+~2.4 ms, Metal's MSL compile ~0.05 ms (the system's shader cache is warm after the first run),
+render pipelines ~0.1 ms. SPIRV-Cross output now goes to `work/user/metal-msl-cache.bin`
+(append-only, keyed by a hash of the SPIR-V, so recompiler changes miss automatically; bump
+`kMslCacheVersion` when `TranslateStage`'s options or SPIRV-Cross change;
+`TLG_METAL_NO_MSL_CACHE=1` turns it off). Second run: load-time compile 2094 -> 485 ms, 10-20 s
+bucket 22.9 -> 27.8 FPS; ~16 MB for the cannery.
+
+## GPU hang in the opening (2026-11-03, fixed)
+
+Compute shader 0xfcda0194 (runs when the opening starts a new save, ~143 s into
+`tests/play.sh opening`) does a binary search whose indices the recompiler moved through
+float-typed selects (V_CNDMASK_B32 / V_MOV_B32 read their operands as F32). Small integers as
+floats are denormals; Metal flushed them in the select, `lo` stayed 0 and the loop never ended.
+A stuck shader on Metal keeps the GPU at 100% after the process is gone (only a reboot clears
+it; this was also the "n/a" GPU job of 2026-11-02/03). Fixes (Metal profile only):
+- `Profile::integer_moves`: V_MOV_B32 / V_CNDMASK_B32 without input or output modifiers move
+  U32 (GCN moves bits).
+- `Profile::loop_guard` (1<<20, `TLG_METAL_LOOP_GUARD=<n>`, 0 = off): every loop back-edge
+  counts into a Private counter and the loop exits past the cap, so a future loop bug cannot
+  hang the GPU.
+- Diagnosis without running a suspect: `TLG_METAL_SKIP_SHADERS=<hex>[,...]` refuses those
+  shaders (their draws and dispatches are skipped); with `TLG_METAL_DUMP=<dir>` the MSL is still
+  written first.
+
+## macOS 27 address space (2026-11-03)
+
+From macOS 27, libmalloc reserves a randomized ~12 GiB block inside the PS4 user range
+[0x7000000000, 0xe000000000) during libSystem initialization, before any constructor runs
+("cannot reserve PS4 user range"). `rt/guest_reserve.S` links a zero-fill placeholder segment
+`__TLGUSER` at 0x7000000000 (build.sh `-segaddr`), which the kernel maps with the executable;
+`reserve_guest_ranges()` unmaps it first and reserves as before. The executable slides with
+ASLR (tens of MiB), so the segment can start a little above USER_MIN (that gap is reserved
+normally) and end a little into the guest image; a second tiny segment `__TLGEND` at
+0xfe00000000 keeps `__LINKEDIT` (always after the highest segment) off the guest image. Both
+builds.
+
+## Shader prewarm (2026-11-03)
+
+Metal compiles MSL on the command processor thread, one shader at a time. With a cold system
+cache (after a macOS update; always for the unbundled `ISS_RAW_BINARY=1` binary on macOS 27,
+whose cache does not persist) that is ~60 ms per shader, 33 s while the cannery loads. At
+startup, worker threads (performance cores - 2; `TLG_METAL_PREWARM=<n>`, 0 = off) compile every
+MSL source of `metal-msl-cache.bin`, newest first; `CompileMsl` takes the finished library or
+waits for one in progress. Cold cache: 1852 shaders in 14.9 s before the level loads,
+load-time compile 33 s -> 0.01 s, 10-20 s bucket 6-13 -> 28.6 FPS. Opening route with the
+fixed shader: 30 FPS for 260 s, GPU idle afterwards.
+
+## Known issues
+
+- Intro video, Metal build (2026-11-03, reported by the player): a few stutters and frames shown out of
+  order. Likely the video frame texture is read (CPU-written guest memory, presented or sampled)
+  before the decoder's new frame has landed, or a stale copy is reused: check how video frames
+  reach the GPU (texture cache invalidation of the CPU-written frame buffers vs the now-deeper
+  GPU queue; see "Frame rate": barriers no longer drain the GPU). Low priority.

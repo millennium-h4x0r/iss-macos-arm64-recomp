@@ -1459,6 +1459,23 @@ void TextureCache::RefreshImage(Image& image) {
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
+    // tlg debugging: the uploads of one image (TLG_LOG_IMAGE_ADDR=<hex guest address>).
+    static const VAddr log_addr = [] {
+        const char* v = std::getenv("TLG_LOG_IMAGE_ADDR");
+        return v ? VAddr(std::strtoull(v, nullptr, 16)) : VAddr(0);
+    }();
+    if (log_addr && image.info.guest_address == log_addr) {
+        static std::atomic<u32> logs{0};
+        if (logs.fetch_add(1) < 200) {
+            const u32* px = std::bit_cast<const u32*>(image.info.guest_address);
+            std::printf("Image refresh %#llx: flags %#x tile %u array %u %ux%u pitch %u bits %u "
+                        "px %08x %08x %08x %08x\n",
+                        (unsigned long long)image.info.guest_address, u32(image.flags),
+                        u32(image.info.tile_mode), u32(image.info.array_mode),
+                        image.info.size.width, image.info.size.height, image.info.pitch,
+                        image.info.num_bits, px[0], px[1], px[4096], px[100000]);
+        }
+    }
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 

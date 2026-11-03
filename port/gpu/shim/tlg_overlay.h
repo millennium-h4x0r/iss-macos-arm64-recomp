@@ -38,8 +38,13 @@ void SetBackgroundLoading(u32 done, u32 total);
 /// Whether anything is drawn this frame (menu open or FPS counter on).
 bool Visible();
 
+#ifdef TLG_METAL
+/// Present thread: draws into `texture` (id<MTLTexture>) on `cmdbuf` (id<MTLCommandBuffer>).
+void Render(void* cmdbuf, void* texture, u32 width, u32 height);
+#else
 /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
+#endif
 
 /// A short message at the top of the screen for `seconds` (any thread), e.g. an input mode change.
 void Notice(const std::string& text, float seconds);

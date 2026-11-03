@@ -1,3 +1,5 @@
+#include <vector>
+#include <mutex>
 #include "tlg_perf_trace.h"
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -107,13 +109,89 @@ void Scheduler::RecordFullBarrier(vk::CommandBuffer cmdbuf) {
     });
 }
 
+// tlg: TLG_PASS_STATS=1 prints, every 4000 render passes, how many reopened the previous
+// pass's attachments and which callers ended passes (resolve the addresses with atos).
+namespace {
+struct PassStats {
+    bool enabled = [] {
+        const char* v = std::getenv("TLG_PASS_STATS");
+        return v && v[0] == '1';
+    }();
+    std::mutex mutex;
+    std::unordered_map<void*, u32> enders;
+    u32 begins = 0, same = 0, flags_only = 0, ping_pong = 0, depth_only_change = 0;
+    RenderState prev2{};
+    RenderState last{};
+    bool has_last = false;
+} pass_stats;
+} // namespace
+
 void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
+    if (pass_stats.enabled) {
+        std::scoped_lock lk{pass_stats.mutex};
+        ++pass_stats.begins;
+        const auto views = [](const RenderState& s) {
+            std::array<VkImageView, 10> v{};
+            for (u32 i = 0; i < s.num_color_attachments && i < 8; ++i)
+                v[i] = s.color_attachments[i].image_view;
+            v[8] = s.depth_stencil_attachment.image_view;
+            v[9] = VkImageView(uintptr_t(s.width) << 32 | s.height);
+            return v;
+        };
+        if (pass_stats.has_last && pass_stats.last == new_state) {
+            ++pass_stats.same;
+        } else if (pass_stats.has_last) {
+            const auto nv = views(new_state), lv = views(pass_stats.last);
+            if (nv == lv) {
+                ++pass_stats.flags_only;
+            } else if (nv == views(pass_stats.prev2)) {
+                ++pass_stats.ping_pong;
+            }
+            auto nc = nv, lc = lv;
+            nc[8] = lc[8] = VK_NULL_HANDLE;
+            if (nc == lc && nv != lv) ++pass_stats.depth_only_change;
+        }
+        pass_stats.prev2 = pass_stats.last;
+        pass_stats.last = new_state;
+        pass_stats.has_last = true;
+        if (pass_stats.begins == 4000) {
+            std::vector<std::pair<u32, void*>> top;
+            for (auto& [a, n] : pass_stats.enders) top.emplace_back(n, a);
+            std::sort(top.rbegin(), top.rend());
+            std::fprintf(stderr,
+                         "Pass stats: 4000 passes, %u reopened the previous attachments, %u same "
+                         "views with other clear/layout fields, %u back to the pass before, %u only "
+                         "the depth view changed; enders:",
+                         pass_stats.same, pass_stats.flags_only, pass_stats.ping_pong,
+                         pass_stats.depth_only_change);
+            for (size_t i = 0; i < top.size() && i < 12; ++i)
+            {
+                Dl_info di{};
+                if (dladdr(top[i].second, &di) && di.dli_sname)
+                    std::fprintf(stderr, " %s+0x%lx=%u", di.dli_sname,
+                                 (unsigned long)((char*)top[i].second - (char*)di.dli_saddr),
+                                 top[i].first);
+                else
+                    std::fprintf(stderr, " %p=%u", top[i].second, top[i].first);
+            }
+            std::fprintf(stderr, "\n");
+            pass_stats.begins = pass_stats.same = pass_stats.flags_only = pass_stats.ping_pong =
+                pass_stats.depth_only_change = 0;
+            pass_stats.enders.clear();
+        }
+    }
     EndRendering();
     is_rendering = true;
     render_state = new_state;
+    render_images = next_render_images;
+    render_images_known = next_render_images_known && next_render_state == new_state;
+    next_render_images_known = false;
+    pass_shader_writes = pending_shader_writes;
+    pending_shader_writes = false;
+    hoist_slot.reset();
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -169,6 +247,25 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         }
         return;
     }
+    if (render_images_known && HoistBarriersEnabled() && IsRecordingDeferred()) {
+        // The slot runs on the recording thread before beginRendering: barriers hoisted while
+        // the pass is open land there unless the slot already ran (then the pass ends).
+        hoist_slot = std::make_shared<HoistSlot>();
+        Record([slot = hoist_slot](vk::CommandBuffer cmdbuf) {
+            std::scoped_lock lk{slot->mutex};
+            slot->executed = true;
+            if (!slot->has_memory && slot->images.empty()) {
+                return;
+            }
+            const vk::DependencyInfo info = {
+                .memoryBarrierCount = slot->has_memory ? 1U : 0U,
+                .pMemoryBarriers = slot->has_memory ? &slot->memory : nullptr,
+                .imageMemoryBarrierCount = static_cast<u32>(slot->images.size()),
+                .pImageMemoryBarriers = slot->images.data(),
+            };
+            cmdbuf.pipelineBarrier2(info);
+        });
+    }
     // The attachment infos live on this stack frame: the recorded closure keeps copies.
     Record([info = rendering_info, color_attachments, depth_attachment,
             stencil_attachment](vk::CommandBuffer cmdbuf) mutable {
@@ -189,6 +286,157 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     }
 }
 
+bool Scheduler::HoistBarriersEnabled() {
+    static const bool enabled = [] {
+        // Opt-in: in inFAMOUS SS on KosmicKrisp most in-pass barriers are real data
+        // dependencies (render target sampled next); ~4% hoisted, no frame time change.
+        const char* e = std::getenv("TLG_HOIST_BARRIERS");
+        return e && e[0] == '1';
+    }();
+    return enabled;
+}
+
+namespace {
+// Accesses that only read: a barrier to them orders earlier writes before later reads, which
+// holding it ahead of the open pass keeps (the pass made none of those writes).
+constexpr vk::AccessFlags2 HoistableDstAccess =
+    vk::AccessFlagBits2::eIndirectCommandRead | vk::AccessFlagBits2::eIndexRead |
+    vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eUniformRead |
+    vk::AccessFlagBits2::eInputAttachmentRead | vk::AccessFlagBits2::eShaderRead |
+    vk::AccessFlagBits2::eShaderSampledRead | vk::AccessFlagBits2::eShaderStorageRead |
+    vk::AccessFlagBits2::eMemoryRead;
+bool ReadOnly(vk::AccessFlags2 access) {
+    return access && !(access & ~HoistableDstAccess);
+}
+struct HoistStats {
+    std::atomic<u64> hoisted{0}, refused{0};
+    std::atomic<u64> why[8]{};
+};
+HoistStats& Hoists() {
+    static HoistStats stats;
+    return stats;
+}
+} // namespace
+
+bool Scheduler::TryHoistBarriers(const vk::MemoryBarrier2* memory,
+                                 std::span<const vk::ImageMemoryBarrier2> images) {
+    const auto refuse_why = [](int why) {
+        Hoists().refused.fetch_add(1, std::memory_order_relaxed);
+        Hoists().why[why].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (!is_rendering || !IsRecordingDeferred()) {
+        return refuse_why(0);
+    }
+    if (!render_images_known) {
+        return refuse_why(1);
+    }
+    if (!hoist_slot) {
+        return refuse_why(2);
+    }
+    if (pass_shader_writes) {
+        return refuse_why(3);
+    }
+    // The buffer barrier's destination is always every access; the writes it could order
+    // after it are shader writes, which the pass flag covers (Runtime::AccessBuffer).
+    constexpr vk::AccessFlags2 attachment_access =
+        vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite |
+        vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+        vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+    const auto attached = [this](vk::Image image) {
+        for (const vk::Image a : render_images) {
+            if (a && a == image) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Attachment to attachment of the open pass, layout unchanged: to the pass end. So is a
+    // read-only depth layout going from sampled to attachment access: the layout forbids the
+    // write the barrier guards against, nothing in the pass needs ordering.
+    const auto to_pass_end = [&](const vk::ImageMemoryBarrier2& b) {
+        if (!attached(b.image) || b.oldLayout != b.newLayout || !b.dstAccessMask ||
+            (b.dstAccessMask & ~attachment_access)) {
+            return false;
+        }
+        if (!(b.srcAccessMask & ~attachment_access)) {
+            return true;
+        }
+        const bool read_only_depth = b.newLayout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+                                     b.newLayout == vk::ImageLayout::eDepthReadOnlyOptimal;
+        // Sources: reads only (attachment writes cannot happen in a read-only layout).
+        return read_only_depth && !(b.srcAccessMask & ~(HoistableDstAccess | attachment_access));
+    };
+    for (const auto& b : images) {
+        if (attached(b.image)) {
+            if (to_pass_end(b)) {
+                continue;
+            }
+            // Depth attached read-only and sampled as well: the pass cannot write it, so the
+            // writes this barrier orders came before the pass.
+            if (b.oldLayout == b.newLayout &&
+                (b.newLayout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+                 b.newLayout == vk::ImageLayout::eDepthReadOnlyOptimal) &&
+                b.dstAccessMask &&
+                !(b.dstAccessMask & ~(HoistableDstAccess |
+                                      vk::AccessFlagBits2::eDepthStencilAttachmentRead))) {
+                continue;
+            }
+            if (pass_stats.enabled) {
+                static std::atomic<u32> shown{0};
+                const u32 k = shown.fetch_add(1);
+                if (k % 997 == 0 && k < 997 * 200) {
+                    std::fprintf(stderr, "Hoist refused: attachment %s -> %s, %s -> %s, stages %s -> %s\n",
+                                 vk::to_string(b.oldLayout).c_str(), vk::to_string(b.newLayout).c_str(),
+                                 vk::to_string(b.srcAccessMask).c_str(),
+                                 vk::to_string(b.dstAccessMask).c_str(),
+                                 vk::to_string(b.srcStageMask).c_str(),
+                                 vk::to_string(b.dstStageMask).c_str());
+                }
+            }
+            return refuse_why(5);
+        }
+        if (!ReadOnly(b.dstAccessMask)) {
+            return refuse_why(4);
+        }
+    }
+    {
+        std::scoped_lock lk{hoist_slot->mutex};
+        if (hoist_slot->executed) {
+            return refuse_why(6);
+        }
+        if (memory) {
+            auto& m = hoist_slot->memory;
+            m.srcStageMask |= memory->srcStageMask;
+            m.srcAccessMask |= memory->srcAccessMask;
+            m.dstStageMask |= memory->dstStageMask;
+            m.dstAccessMask |= memory->dstAccessMask;
+            hoist_slot->has_memory = true;
+        }
+        for (const auto& b : images) {
+            if (to_pass_end(b)) {
+                end_barriers.push_back(b);
+            } else {
+                hoist_slot->images.push_back(b);
+            }
+        }
+    }
+    const u64 n = Hoists().hoisted.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (pass_stats.enabled && n % 2000 == 0) {
+        auto& w = Hoists().why;
+        std::fprintf(stderr, "Barrier hoisting: %llu hoisted, %llu refused (not deferred %llu, "
+                     "unknown attachments %llu, no slot %llu, shader writes %llu, write "
+                     "destination %llu, attachment image %llu, slot ran %llu)\n",
+                     (unsigned long long)n,
+                     (unsigned long long)Hoists().refused.load(std::memory_order_relaxed),
+                     (unsigned long long)w[0].load(), (unsigned long long)w[1].load(),
+                     (unsigned long long)w[2].load(), (unsigned long long)w[3].load(),
+                     (unsigned long long)w[4].load(), (unsigned long long)w[5].load(),
+                     (unsigned long long)w[6].load());
+    }
+    return true;
+}
+
 void Scheduler::EndRendering() {
     // tlg: is_rendering belongs to the draw recording thread (stage B) while draw packets are in
     // flight: drain first (owner hook), or a stale "not rendering" lets the next command (a
@@ -198,16 +446,33 @@ void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
+    if (pass_stats.enabled) {
+        std::scoped_lock lk{pass_stats.mutex};
+        ++pass_stats.enders[__builtin_return_address(0)];
+    }
     if (rendering_observer) {
         rendering_observer->OnEndRendering();
     }
     is_rendering = false;
+    hoist_slot.reset();
     Record([](vk::CommandBuffer cmdbuf) {
         cmdbuf.endRendering();
         if (FullBarriers()) {
             RecordFullBarrier(cmdbuf);
         }
     });
+    if (!end_barriers.empty()) {
+        // tlg: attachment barriers held back by TryHoistBarriers, now between the passes.
+        Record([images = RecordData(std::span<const vk::ImageMemoryBarrier2>(
+                    end_barriers.data(), end_barriers.size()))](vk::CommandBuffer cmdbuf) {
+            const vk::DependencyInfo info = {
+                .imageMemoryBarrierCount = static_cast<u32>(images.size()),
+                .pImageMemoryBarriers = images.data(),
+            };
+            cmdbuf.pipelineBarrier2(info);
+        });
+        end_barriers.clear();
+    }
 }
 
 void Scheduler::TraceDirectRecording(void* caller) {

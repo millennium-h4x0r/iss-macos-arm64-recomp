@@ -319,6 +319,10 @@ bool Instance::CreateDevice() {
         return false;
     };
 
+#ifdef __APPLE__
+    // tlg: portability drivers (MoltenVK) must have VK_KHR_portability_subset enabled.
+    add_extension("VK_KHR_portability_subset");
+#endif
     // Required
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);

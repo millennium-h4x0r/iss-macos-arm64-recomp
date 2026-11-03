@@ -74,7 +74,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-if (NOT WIN32)
+if (NOT WIN32 AND NOT APPLE)
     pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
 endif()
 find_package(miniz QUIET)
@@ -185,9 +185,25 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
+# tlg: TLG_METAL=ON (macOS): native Metal renderer (metal/) instead of the Vulkan one. The
+# renderer classes keep their names (Vulkan::Rasterizer, Presenter, Scheduler, Runtime, ...):
+# metal/shadow holds the headers that replace renderer_vulkan's, ahead on the include path, so
+# Liverpool, VideoOut, the caches and the shim build unchanged. The texture/buffer caches keep
+# their headers; Metal objects travel in their vk:: handle fields (metal/src/mtl_objc.h).
+option(TLG_METAL "Native Metal renderer instead of Vulkan (macOS)" OFF)
+if (TLG_METAL)
+    enable_language(OBJCXX)
+    list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_vulkan/")
+    list(FILTER VIDEO_CORE EXCLUDE REGEX "texture_cache/(image|image_view|sampler|tile_manager|blit_helper)\\.cpp$")
+    list(FILTER VIDEO_CORE EXCLUDE REGEX "buffer_cache/(buffer|fault_manager|buffer_cache)\\.cpp$")
+    list(APPEND VIDEO_CORE shadps4/video_core/renderer_vulkan/liverpool_to_vk.cpp
+        shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp)
+    file(GLOB METAL_SOURCES CONFIGURE_DEPENDS metal/src/*.cpp metal/src/*.mm)
+    list(APPEND SHIM_SOURCES ${METAL_SOURCES})
+endif()
 # Windows: a DLL cannot leave the runtime_* symbols for tlg-probe.exe to resolve, so the
 # library is static there and linked into the executable.
-if (WIN32)
+if (WIN32 OR APPLE)
     set(TLGGPU_KIND STATIC)
 else()
     set(TLGGPU_KIND SHARED)
@@ -207,8 +223,20 @@ add_dependencies(tlggpu host_shaders)
 # embedded Cyrillic font (third_party/fonts).
 target_sources(tlggpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
-    third_party/imgui/backends/imgui_impl_vulkan.cpp)
+    $<IF:$<BOOL:${TLG_METAL}>,third_party/imgui/backends/imgui_impl_metal.mm,third_party/imgui/backends/imgui_impl_vulkan.cpp>)
 target_include_directories(tlggpu PRIVATE third_party/imgui third_party/imgui/backends)
+if (TLG_METAL)
+    target_include_directories(tlggpu BEFORE PRIVATE metal/shadow metal/src)
+    target_compile_definitions(tlggpu PUBLIC TLG_METAL=1)
+    set_source_files_properties(${METAL_SOURCES} third_party/imgui/backends/imgui_impl_metal.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-fexceptions")
+    find_path(SPIRV_CROSS_INCLUDE spirv_cross/spirv_msl.hpp REQUIRED)
+    target_include_directories(tlggpu PRIVATE ${SPIRV_CROSS_INCLUDE})
+    foreach(lib spirv-cross-msl spirv-cross-glsl spirv-cross-core)
+        find_library(TLG_${lib} NAMES ${lib} REQUIRED)
+        target_link_libraries(tlggpu PUBLIC ${TLG_${lib}})
+    endforeach()
+endif()
 target_include_directories(tlggpu PRIVATE ../gpu_v2/compat)
 set_property(SOURCE shim/tlg_power_art.cpp APPEND PROPERTY
     COMPILE_DEFINITIONS "TLG_POWER_WHEEL_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/shim/assets/power-wheel.png\"")
@@ -220,10 +248,12 @@ target_include_directories(tlggpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_p
 target_compile_definitions(tlggpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(tlggpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against tlg-probe.
-if (NOT WIN32)
+if (NOT WIN32 AND NOT APPLE)
     target_link_options(tlggpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
-target_link_libraries(tlggpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
+if (NOT TLG_METAL)
+    target_link_libraries(tlggpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
+endif()
 target_link_libraries(tlggpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 # xbyak is header-only: the distribution's copy when there is one (Fedora xbyak-devel), else the
@@ -238,6 +268,13 @@ if (WIN32)
     target_compile_definitions(tlggpu PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_options(tlggpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/tlg_win_compat.h)
     target_link_libraries(tlggpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm pdh)
+elseif (APPLE)
+    # macOS (Apple Silicon, recompiled guest code): Vulkan through the loader + MoltenVK/KosmicKrisp.
+    target_compile_definitions(tlggpu PUBLIC TLG_RECOMP=1 VK_USE_PLATFORM_METAL_EXT _XOPEN_SOURCE=700 _DARWIN_C_SOURCE)
+    target_compile_options(tlggpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/../../recomp/rt/compat_include/darwin_linux_compat.h)
+    target_include_directories(tlggpu BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../recomp/rt/compat_include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../recomp/third_party/simde ${CMAKE_CURRENT_SOURCE_DIR}/../../recomp/rt)
+    target_link_libraries(tlggpu PUBLIC Vulkan::Vulkan "-framework Metal" "-framework QuartzCore" "-framework Foundation")
 else()
     target_link_libraries(tlggpu PUBLIC PkgConfig::X11)
 endif()

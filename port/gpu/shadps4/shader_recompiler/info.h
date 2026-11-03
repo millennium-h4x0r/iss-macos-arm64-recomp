@@ -257,7 +257,11 @@ struct Info : InfoPersistent {
             }
         }
         if (srt_info.walker_func) {
+#ifdef __aarch64__
+            RunSrtWalker(srt_info.walker_func, user_data.data(), flattened_ud_buf.data());
+#else
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+#endif
         }
     }
 

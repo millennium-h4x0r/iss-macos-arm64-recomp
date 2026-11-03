@@ -26,6 +26,7 @@
 #include <string>
 #include <chrono>
 #include <thread>
+#include <functional>
 #include <vector>
 #include <SDL3/SDL.h>
 #include "../tlggpu.h"
@@ -216,6 +217,9 @@ s32 PS4_SYSV_ABI sceKernelUsleep(u32 microseconds) {
 namespace {
 // SDL video must be driven from one thread: the window lives on its own host thread.
 std::thread g_window_thread;
+#ifdef __APPLE__
+std::function<void()> g_main_thread_job;
+#endif
 std::mutex g_window_mutex;
 std::condition_variable g_window_cv;
 bool g_window_ready;
@@ -339,7 +343,7 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "inFAMOUS Second Son";
     const s32 width = config->width, height = config->height;
-    g_window_thread = std::thread([title, width, height] {
+    auto window_loop = [title, width, height] {
         Common::SetCurrentThreadName("tlg:window");
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());
         {
@@ -356,8 +360,19 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
         std::fflush(stdout);
         TlgPerf::Stop(); // _Exit bypasses atexit; finish diagnostics on normal window close.
         std::_Exit(0);
-    });
+    };
+#ifdef __APPLE__
+    // macOS: windows and their events belong to the process main thread, which waits in
+    // tlggpu_main_thread_loop for this loop.
+    {
+        std::scoped_lock lock{g_window_mutex};
+        g_main_thread_job = window_loop;
+    }
+    g_window_cv.notify_all();
+#else
+    g_window_thread = std::thread(window_loop);
     g_window_thread.detach();
+#endif
     {
         std::unique_lock lock{g_window_mutex};
         g_window_cv.wait(lock, [] { return g_window_ready; });
@@ -369,6 +384,18 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
     return 0;
 }
 
+#ifdef __APPLE__
+// Runs on the process main thread: waits for tlggpu_init's window loop and runs it (never returns).
+extern "C" void tlggpu_main_thread_loop(void) {
+    std::function<void()> job;
+    {
+        std::unique_lock lock{g_window_mutex};
+        g_window_cv.wait(lock, [] { return bool(g_main_thread_job); });
+        job = g_main_thread_job;
+    }
+    job();
+}
+#endif
 namespace Libraries::Kernel { void StartKernelService(); }
 extern "C" void tlggpu_register_kernel(void) {
     Libraries::Kernel::StartKernelService();

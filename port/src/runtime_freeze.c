@@ -29,6 +29,10 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #endif
 
 #define MAX_THREADS 1024
@@ -43,6 +47,9 @@ static int safe_read(void *out, uintptr_t address, size_t size) {
 #ifdef _WIN32
     SIZE_T got = 0;
     return ReadProcessMemory(GetCurrentProcess(), (const void *)address, out, size, &got) && got == size;
+#elif defined(__APPLE__)
+    mach_vm_size_t got = 0;
+    return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)address, size, (mach_vm_address_t)out, &got) == KERN_SUCCESS && got == size;
 #else
     struct iovec local = {out, size}, remote = {(void *)address, size};
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)size;
@@ -201,8 +208,14 @@ static void capture_signal(int sig, siginfo_t *info, void *context) {
     int saved = errno;
     if (__atomic_load_n(&capture_tid, __ATOMIC_ACQUIRE) == gettid()) {
         Capture *c = __atomic_load_n(&capture_out, __ATOMIC_ACQUIRE);
+#ifdef __APPLE__
+        const ucontext_t *uc = context;
+        c->rip = (uintptr_t)uc->uc_mcontext->__ss.__pc; c->rsp = (uintptr_t)uc->uc_mcontext->__ss.__sp;
+        c->rbp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+#else
         const greg_t *g = ((ucontext_t *)context)->uc_mcontext.gregs;
         c->rip = (uintptr_t)g[REG_RIP]; c->rsp = (uintptr_t)g[REG_RSP]; c->rbp = (uintptr_t)g[REG_RBP];
+#endif
         c->frames = walk_frames(c->rbp, c->chain, MAX_FRAMES);
         c->captured = 1;
         __atomic_store_n(&capture_done, 1, __ATOMIC_RELEASE);
@@ -234,7 +247,11 @@ static void capture(Capture *c) {
     __atomic_store_n(&capture_done, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&capture_out, c, __ATOMIC_RELEASE);
     __atomic_store_n(&capture_tid, (pid_t)c->tid, __ATOMIC_RELEASE);
+#ifdef __APPLE__
+    if (0) { /* no per-tid signals on macOS: the report lists waits only */
+#else
     if (!syscall(SYS_tgkill, getpid(), (pid_t)c->tid, SIGURG)) {
+#endif
         /* A thread that blocks SIGURG never answers: 30 ms each at most. */
         for (int i = 0; i < 60 && !__atomic_load_n(&capture_done, __ATOMIC_ACQUIRE); ++i) {
             struct timespec nap = {0, 500000};
@@ -378,7 +395,9 @@ static void sleep_ms(unsigned ms) {
 }
 static void *monitor(void *argument) {
     FreezeMonitor *m = argument;
-#ifndef _WIN32
+#if defined(__APPLE__)
+    pthread_setname_np("tlg:freeze");
+#elif !defined(_WIN32)
     pthread_setname_np(pthread_self(), "tlg:freeze");
 #endif
     const unsigned period = m->seconds >= 4 ? 1000 : (unsigned)m->seconds * 250;

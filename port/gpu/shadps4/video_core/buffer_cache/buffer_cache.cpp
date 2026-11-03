@@ -199,6 +199,13 @@ ReadbackStats& Readbacks() {
     static ReadbackStats stats;
     return stats;
 }
+/// Readbacks by 1 MiB guest region (TLG_READBACK_STATS): which memory the game reads back.
+std::mutex readback_region_mutex;
+std::map<u64, u64> readback_regions;
+void NoteReadbackRegion(VAddr addr) {
+    std::scoped_lock lock{readback_region_mutex};
+    ++readback_regions[addr >> 20];
+}
 bool ReadbackStatsEnabled() {
     static const bool enabled = [] { const char* e = std::getenv("TLG_READBACK_STATS"); return e && *e == '1'; }();
     return enabled;
@@ -240,6 +247,18 @@ void ReportReadbacks() {
                 static_cast<unsigned long long>(r.lagged_recorded.exchange(0)),
                 static_cast<unsigned long long>(r.lagged_applied.exchange(0)),
                 static_cast<unsigned long long>(r.nowait_writes.exchange(0)));
+    {
+        std::scoped_lock lock{readback_region_mutex};
+        std::vector<std::pair<u64, u64>> top;
+        for (auto& [region, n] : readback_regions) top.emplace_back(n, region);
+        std::sort(top.rbegin(), top.rend());
+        std::printf("  regions:");
+        for (size_t i = 0; i < top.size() && i < 10; ++i)
+            std::printf(" 0x%llx00000=%llu", (unsigned long long)top[i].second,
+                        (unsigned long long)top[i].first);
+        std::printf("\n");
+        readback_regions.clear();
+    }
     std::printf("  waits for a readback copy: %llu, %.1f ms\n",
                 static_cast<unsigned long long>(r.guest_waits.exchange(0)),
                 r.guest_wait_ns.exchange(0) / 1e6);
@@ -297,6 +316,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         e.object=trace_origin; e.a=size; e.generation=is_write; TlgPerf::Emit(e);
     }
     const s64 queued_at = ReadbackStatsEnabled() ? NowNs() : 0;
+    if (queued_at) {
+        NoteReadbackRegion(device_addr);
+    }
     const auto flush_request = [this, device_addr, size, is_write, queued_at,trace_operation,trace_origin] {
         if (trace_operation) {
             TlgPerf::Event e; e.kind=TlgPerf::Kind::ReadbackApply;e.operation=trace_operation;

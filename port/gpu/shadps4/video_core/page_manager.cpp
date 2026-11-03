@@ -60,8 +60,13 @@ extern std::atomic<uint64_t> size;
 
 namespace VideoCore {
 
+#if defined(__APPLE__) && defined(__aarch64__)
+constexpr size_t PM_PAGE_SIZE = 16_KB; // tlg: host page size on Apple Silicon
+constexpr size_t PM_PAGE_BITS = 14;
+#else
 constexpr size_t PM_PAGE_SIZE = 4_KB;
 constexpr size_t PM_PAGE_BITS = 12;
+#endif
 
 struct PageManager::Impl {
     using PageState = VideoCore::PageState;

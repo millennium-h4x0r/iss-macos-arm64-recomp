@@ -86,6 +86,11 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineBuffers();
     DefineImagesAndSamplers();
     DefineFunctions();
+    if (profile.loop_guard) {
+        loop_guard = AddGlobalVariable(TypePointer(spv::StorageClass::Private, U32[1]),
+                                       spv::StorageClass::Private, ConstU32(0U));
+        Name(loop_guard, "tlg_loop_guard");
+    }
 }
 
 EmitContext::~EmitContext() = default;
@@ -339,14 +344,28 @@ void EmitContext::DefineInputs() {
         for (const auto& attrib : fetch_shader->attributes) {
             ASSERT(attrib.semantic < IR::NumParams);
             const auto sharp = attrib.GetSharp(info);
-            const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
+            const auto nfmt = sharp.GetNumberFmt();
+            const u8 scaled = !profile.vertex_scaled_as_int ? 0
+                              : nfmt == AmdGpu::NumberFormat::Uscaled ? 1
+                              : nfmt == AmdGpu::NumberFormat::Sscaled ? 2
+                                                                      : 0;
+            const Id type{scaled == 1   ? U32[4]
+                          : scaled == 2 ? S32[4]
+                                        : GetAttributeType(*this, nfmt)[4]};
             Id id{DefineInput(type, attrib.semantic)};
             if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {
                 Name(id, fmt::format("vs_instance_attr{}", attrib.semantic));
             } else {
                 Name(id, fmt::format("vs_in_attr{}", attrib.semantic));
             }
-            input_params[attrib.semantic] = GetAttributeInfo(sharp.GetNumberFmt(), id, 4, false);
+            if (scaled) {
+                input_params[attrib.semantic] = GetAttributeInfo(
+                    scaled == 1 ? AmdGpu::NumberFormat::Uint : AmdGpu::NumberFormat::Sint, id, 4,
+                    false);
+                input_params[attrib.semantic].scaled = scaled;
+            } else {
+                input_params[attrib.semantic] = GetAttributeInfo(sharp.GetNumberFmt(), id, 4, false);
+            }
         }
         break;
     }

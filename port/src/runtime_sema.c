@@ -37,8 +37,9 @@ static void host_check(int e) {
 }
 /* Waits use this clock for their deadlines. winpthreads condition variables accept only
  * CLOCK_REALTIME (pthread_condattr_setclock(CLOCK_MONOTONIC) fails with EINVAL). */
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 #define WAIT_CLOCK CLOCK_REALTIME
+#define pthread_condattr_setclock(a, c) ((void)(a), (void)(c), 0) /* realtime is the default */
 #else
 #define WAIT_CLOCK CLOCK_MONOTONIC
 #endif

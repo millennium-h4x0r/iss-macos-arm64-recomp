@@ -38,6 +38,9 @@ extern "C" void runtime_restart(void); // src/probe.c: starts run.py again, ends
 #include "shader_recompiler/recompiler_toggles.h"
 #endif
 #include "imgui.h"
+#ifdef TLG_METAL
+#include "mtl_overlay.h"
+#endif
 #include "tlg_overlay_scale.h"
 #ifdef TLG_RENDERER_V2
 #include "../../src/iss_native_resolution.h"
@@ -64,6 +67,15 @@ asm(".section .rdata,\"dr\"\n"
     ".incbin \"" TLG_FONT_PATH "\"\n"
     ".global tlg_font_ttf_end\n"
     "tlg_font_ttf_end:\n"
+    ".text\n");
+#elif defined(__APPLE__)
+asm(".section __DATA,__const\n"
+    ".p2align 4\n"
+    ".private_extern _tlg_font_ttf\n"
+    "_tlg_font_ttf:\n"
+    ".incbin \"" TLG_FONT_PATH "\"\n"
+    ".private_extern _tlg_font_ttf_end\n"
+    "_tlg_font_ttf_end:\n"
     ".text\n");
 #else
 asm(".section .rodata\n"
@@ -1926,6 +1938,15 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(tlg_font_ttf),
                                    int(tlg_font_ttf_end - tlg_font_ttf), 18.0f, &font_config);
 
+#ifdef TLG_METAL
+    (void)format;
+    (void)image_count;
+    if (!TlgOverlayMetal::Init(instance.MetalDevice())) {
+        std::printf("Overlay: ImGui Metal backend init failed\n");
+        ImGui::DestroyContext();
+        return;
+    }
+#else
     const vk::Instance vk_instance = instance.GetInstance();
     ImGui_ImplVulkan_LoadFunctions(
         instance.ApiVersion(),
@@ -1958,9 +1979,14 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         ImGui::DestroyContext();
         return;
     }
+#endif
     overlay_instance = &instance;
     initialized = true;
+#ifdef __APPLE__
+    std::printf("Overlay: menu ready (F12, the key left of 1, or R3+L2)\n");
+#else
     std::printf("Overlay: menu ready (Insert or R3+L2)\n");
+#endif
 }
 
 void UpdateTextInput(SDL_Window* window) {
@@ -2179,9 +2205,15 @@ bool HandleEvent(const SDL_Event& event) {
             settings.show_fps = !settings.show_fps;
             return true;
         }
-        if (down && !event.key.repeat &&
-            (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
-            SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
+        // tlg: Macs have no Insert key: F12 and the key left of 1 (` or §) open the menu too.
+        const bool menu_key = event.key.key == SDLK_INSERT
+#ifdef __APPLE__
+                              || event.key.key == SDLK_F12 || event.key.scancode == SDL_SCANCODE_GRAVE ||
+                              event.key.scancode == SDL_SCANCODE_NONUSBACKSLASH
+#endif
+            ;
+        if (down && !event.key.repeat && (menu_key || (is_open && event.key.key == SDLK_ESCAPE))) {
+            SetOpen(menu_key ? !is_open : false);
             return true;
         }
         if (!is_open) {
@@ -2450,7 +2482,14 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_text = text;
 }
 
+#ifdef TLG_METAL
+void Render(void* cmdbuf, void* texture, u32 width, u32 height) {
+    const struct {
+        u32 width, height;
+    } extent{width, height};
+#else
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+#endif
     const ContextScope context_scope;
     // Present interval for the FPS readout (measured also while nothing is drawn).
     const auto now = std::chrono::steady_clock::now();
@@ -2484,7 +2523,11 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if(power_open)TlgPowerArt::UpdateTexture();
     if(menu_open && TlgSettings::Get().menu_tab==6)TlgTrophiesUpdateTextures();
 #endif
+#ifdef TLG_METAL
+    TlgOverlayMetal::NewFrame(cmdbuf, texture);
+#else
     ImGui_ImplVulkan_NewFrame();
+#endif
     ImGui::NewFrame();
     if (loading) {
         LoadingScreen();
@@ -2518,6 +2561,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     ImGui::Render();
 
+#ifdef TLG_METAL
+    TlgOverlayMetal::RenderDrawData(cmdbuf, ImGui::GetDrawData());
+#else
     const vk::RenderingAttachmentInfo attachment{
         .imageView = view,
         .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -2536,6 +2582,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmdbuf);
     }
     cmdbuf.endRendering();
+#endif
 }
 
 } // namespace TlgOverlay

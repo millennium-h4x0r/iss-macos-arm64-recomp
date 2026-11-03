@@ -656,6 +656,18 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .block1d_as_2d = AmdGpu::Block1DAs2D(),
         .bc_tiny_decode = AmdGpu::BcTinyDecode(),
     };
+    // tlg: TLG_FAST_FP=1: no NoContraction and no signed zero/inf/nan preserve mode; =2: only no
+    // NoContraction (inf/nan kept: inFAMOUS' character shaders need it, Delsin's vest).
+    if (const char* env = std::getenv("TLG_FAST_FP"); env && (env[0] == '1' || env[0] == '2')) {
+        profile.fast_fp = true;
+        if (env[0] == '1') {
+            profile.support_fp16_signed_zero_inf_nan_preserve = false;
+            profile.support_fp32_signed_zero_inf_nan_preserve = false;
+            profile.support_fp64_signed_zero_inf_nan_preserve = false;
+        }
+        std::printf("GPU: TLG_FAST_FP=%c (no NoContraction%s)\n", env[0],
+                    env[0] == '1' ? ", no inf/nan preserve" : "");
+    }
     // tlg: the recompiler switches (ISS_ names arrive as TLG_), one line each on stdout (the run
     // log keeps it; LOG_INFO is filtered out there), for A/B reports.
     Shader::Toggles::LogStates([](const char* name, bool on, const char* what) {

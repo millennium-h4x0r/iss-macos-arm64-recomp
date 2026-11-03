@@ -1,0 +1,1129 @@
+diff --git a/src/kosmickrisp/bridge/mtl_command_queue.h b/src/kosmickrisp/bridge/mtl_command_queue.h
+index ab0f82b..38ca5b9 100644
+--- a/src/kosmickrisp/bridge/mtl_command_queue.h
++++ b/src/kosmickrisp/bridge/mtl_command_queue.h
+@@ -13,6 +13,8 @@
+ 
+ /* MTL4CommitOptions */
+ mtl_commit_options *mtl_new_commit_options(void);
++void mtl_take_gpu_busy_time(double *busy_s, unsigned *buffers);
++
+ void
+ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
+                                         mtl_feedback_handler_callback callback,
+diff --git a/src/kosmickrisp/bridge/mtl_command_queue.m b/src/kosmickrisp/bridge/mtl_command_queue.m
+index 0e81f9c..d7c5972 100644
+--- a/src/kosmickrisp/bridge/mtl_command_queue.m
++++ b/src/kosmickrisp/bridge/mtl_command_queue.m
+@@ -18,6 +18,37 @@ mtl_new_commit_options(void)
+    }
+ }
+ 
++/* GPU busy time (union of command buffer GPU intervals), for KK_RESIDENCY_STATS. */
++#include <os/lock.h>
++static os_unfair_lock kk_gpu_time_lock = OS_UNFAIR_LOCK_INIT;
++static double kk_gpu_busy, kk_gpu_last_end;
++static unsigned kk_gpu_buffers;
++
++void
++mtl_take_gpu_busy_time(double *busy_s, unsigned *buffers)
++{
++   os_unfair_lock_lock(&kk_gpu_time_lock);
++   *busy_s = kk_gpu_busy;
++   *buffers = kk_gpu_buffers;
++   kk_gpu_busy = 0;
++   kk_gpu_buffers = 0;
++   os_unfair_lock_unlock(&kk_gpu_time_lock);
++}
++
++static void
++kk_note_gpu_interval(double start, double end)
++{
++   if (end <= start)
++      return;
++   os_unfair_lock_lock(&kk_gpu_time_lock);
++   if (end > kk_gpu_last_end) {
++      kk_gpu_busy += end - (start > kk_gpu_last_end ? start : kk_gpu_last_end);
++      kk_gpu_last_end = end;
++   }
++   kk_gpu_buffers++;
++   os_unfair_lock_unlock(&kk_gpu_time_lock);
++}
++
+ void
+ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
+                                         mtl_feedback_handler_callback callback,
+@@ -38,6 +69,7 @@ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
+                            ? (enum mtl_command_queue_error)error.code
+                            : MTL_COMMAND_QUEUE_ERROR_NONE,
+             };
++            kk_note_gpu_interval(feedback.GPUStartTime, feedback.GPUEndTime);
+             callback(&feedback_data);
+          }
+       }];
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_encoder.m
+index 0424743..c068d28 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.m
++++ b/src/kosmickrisp/bridge/mtl_encoder.m
+@@ -4,6 +4,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <string.h>
++#include <stdlib.h>
+ #include "mtl_encoder.h"
+ 
+ #include <Metal/MTL4CommandBuffer.h>
+@@ -22,6 +24,8 @@ mtl_end_encoding(void *encoder)
+    }
+ }
+ 
++
++
+ void
+ mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+                          enum mtl_stages before_queue_stages)
+diff --git a/src/kosmickrisp/bridge/mtl_heap.m b/src/kosmickrisp/bridge/mtl_heap.m
+index 746122f..82f39af 100644
+--- a/src/kosmickrisp/bridge/mtl_heap.m
++++ b/src/kosmickrisp/bridge/mtl_heap.m
+@@ -66,7 +66,7 @@ mtl_new_buffer_with_length(mtl_heap *heap, uint64_t size_B, uint64_t offset_B)
+ {
+    @autoreleasepool {
+       id<MTLHeap> hp = (id<MTLHeap>)heap;
+-      return (mtl_buffer *)[hp newBufferWithLength:size_B options:KK_MTL_RESOURCE_OPTIONS offset:offset_B];
++      return (mtl_buffer *)[hp newBufferWithLength:size_B options:hp.resourceOptions offset:offset_B];
+    }
+ }
+ 
+diff --git a/src/kosmickrisp/bridge/mtl_render_state.m b/src/kosmickrisp/bridge/mtl_render_state.m
+index 13c06c8..38b2aaa 100644
+--- a/src/kosmickrisp/bridge/mtl_render_state.m
++++ b/src/kosmickrisp/bridge/mtl_render_state.m
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <stdlib.h>
+ #include "mtl_render_state.h"
+ 
+ #include "mtl_format.h"
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_command_queue.c b/src/kosmickrisp/bridge/stubs/mtl_command_queue.c
+index 5a1406d..64fe748 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_command_queue.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_command_queue.c
+@@ -73,3 +73,10 @@ mtl_command_queue_update_buffer_mappings(
+     uint32_t count)
+ {
+ }
++
++void
++mtl_take_gpu_busy_time(double *busy_s, unsigned *buffers)
++{
++   *busy_s = 0;
++   *buffers = 0;
++}
+diff --git a/src/kosmickrisp/vulkan/kk_bo.c b/src/kosmickrisp/vulkan/kk_bo.c
+index 5562b61..bc1d6da 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.c
++++ b/src/kosmickrisp/vulkan/kk_bo.c
+@@ -12,6 +12,8 @@
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ 
+ #include "util/u_memory.h"
++#include "util/macros.h"
++#include <string.h>
+ 
+ #if DETECT_OS_APPLE
+ #include <mach/mach_init.h>
+@@ -21,6 +23,18 @@
+ VkResult
+ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+             uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out)
++{
++   return kk_alloc_bo_with_options(dev, log_obj, size_B, align_B,
++                                   KK_MTL_RESOURCE_OPTIONS, bo_out);
++}
++
++/* Private storage (the device-local-only memory type): the GPU may keep
++ * render targets losslessly compressed; no CPU mapping (bo->cpu is NULL). */
++VkResult
++kk_alloc_bo_with_options(struct kk_device *dev, struct vk_object_base *log_obj,
++                         uint64_t size_B, uint64_t align_B,
++                         enum mtl_resource_options options,
++                         struct kk_bo **bo_out)
+ {
+    VkResult result = VK_SUCCESS;
+ 
+@@ -39,8 +53,7 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+ #endif
+ 
+    size_B = align64(size_B, minimum_alignment);
+-   mtl_heap *handle =
+-      mtl_new_heap(dev->mtl_handle, size_B, KK_MTL_RESOURCE_OPTIONS);
++   mtl_heap *handle = mtl_new_heap(dev->mtl_handle, size_B, options);
+    if (handle == NULL) {
+       result = vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
+       goto fail_heap;
+@@ -63,9 +76,19 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+    bo->size_B = size_B;
+    bo->map = map;
+    bo->gpu = mtl_buffer_get_gpu_address(map);
+-   bo->cpu = mtl_get_contents(map);
++   bo->cpu = (options & MTL_RESOURCE_STORAGE_MODE_PRIVATE) ==
++                   MTL_RESOURCE_STORAGE_MODE_PRIVATE
++                ? NULL
++                : mtl_get_contents(map);
+ 
+    kk_device_add_heap_to_residency_set(dev, handle);
++   kk_residency_stats.bo_allocs++;
++   kk_residency_stats.bo_alloc_bytes += size_B;
++   if (log_obj) {
++      unsigned t = log_obj->type < 64 ? log_obj->type : 63;
++      kk_residency_stats.by_type[t]++;
++      kk_residency_stats.by_type_bytes[t] += size_B;
++   }
+ 
+    *bo_out = bo;
+    return result;
+@@ -81,6 +104,7 @@ fail_heap:
+ void
+ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
+ {
++   kk_residency_stats.bo_frees++;
+    /* We may only have a mapped buffer, for example if the memory was imported
+     * from a host pointer */
+    if (bo->mtl_handle)
+@@ -159,3 +183,66 @@ kk_bo_set_label(struct kk_bo *bo, const char *label)
+    if (bo->map)
+       mtl_resource_set_label(bo->map, label);
+ }
++
++#define KK_LARGE_BO_CACHE_BYTES (1024ull * 1024 * 1024)
++
++VkResult
++kk_alloc_cached_bo(struct kk_device *dev, struct vk_object_base *log_obj,
++                   uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out)
++{
++   simple_mtx_lock(&dev->large_bo_cache.mutex);
++   int best = -1;
++   for (uint32_t i = 0; i < dev->large_bo_cache.count; i++) {
++      struct kk_bo *bo = dev->large_bo_cache.bos[i];
++      if (bo->size_B >= size_B && bo->size_B <= 2 * size_B &&
++          (align_B == 0 || (bo->gpu % align_B) == 0) &&
++          (best < 0 || bo->size_B < dev->large_bo_cache.bos[best]->size_B))
++         best = (int)i;
++   }
++   if (best >= 0) {
++      struct kk_bo *bo = dev->large_bo_cache.bos[best];
++      dev->large_bo_cache.bos[best] =
++         dev->large_bo_cache.bos[--dev->large_bo_cache.count];
++      dev->large_bo_cache.bytes -= bo->size_B;
++      simple_mtx_unlock(&dev->large_bo_cache.mutex);
++      *bo_out = bo;
++      return VK_SUCCESS;
++   }
++   simple_mtx_unlock(&dev->large_bo_cache.mutex);
++   return kk_alloc_bo(dev, log_obj, size_B, align_B, bo_out);
++}
++
++void
++kk_release_cached_bo(struct kk_device *dev, struct kk_bo *bo)
++{
++   simple_mtx_lock(&dev->large_bo_cache.mutex);
++   while (dev->large_bo_cache.count &&
++          (dev->large_bo_cache.count == ARRAY_SIZE(dev->large_bo_cache.bos) ||
++           dev->large_bo_cache.bytes + bo->size_B > KK_LARGE_BO_CACHE_BYTES)) {
++      /* Evict the oldest entry. */
++      struct kk_bo *old = dev->large_bo_cache.bos[0];
++      memmove(&dev->large_bo_cache.bos[0], &dev->large_bo_cache.bos[1],
++              (dev->large_bo_cache.count - 1) * sizeof(old));
++      dev->large_bo_cache.count--;
++      dev->large_bo_cache.bytes -= old->size_B;
++      kk_destroy_bo(dev, old);
++   }
++   if (bo->size_B <= KK_LARGE_BO_CACHE_BYTES) {
++      dev->large_bo_cache.bos[dev->large_bo_cache.count++] = bo;
++      dev->large_bo_cache.bytes += bo->size_B;
++      bo = NULL;
++   }
++   simple_mtx_unlock(&dev->large_bo_cache.mutex);
++   if (bo)
++      kk_destroy_bo(dev, bo);
++}
++
++void
++kk_bo_cache_finish(struct kk_device *dev)
++{
++   for (uint32_t i = 0; i < dev->large_bo_cache.count; i++)
++      kk_destroy_bo(dev, dev->large_bo_cache.bos[i]);
++   dev->large_bo_cache.count = 0;
++   dev->large_bo_cache.bytes = 0;
++   simple_mtx_destroy(&dev->large_bo_cache.mutex);
++}
+diff --git a/src/kosmickrisp/vulkan/kk_bo.h b/src/kosmickrisp/vulkan/kk_bo.h
+index d1590b9..0e2120d 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.h
++++ b/src/kosmickrisp/vulkan/kk_bo.h
+@@ -34,11 +34,22 @@ struct kk_ptr {
+    uint32_t offset;
+ };
+ 
++VkResult kk_alloc_bo_with_options(struct kk_device *dev,
++                                  struct vk_object_base *log_obj,
++                                  uint64_t size_B, uint64_t align_B,
++                                  enum mtl_resource_options options,
++                                  struct kk_bo **bo_out);
+ VkResult kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+                      uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out);
+ 
+ void kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo);
+ 
++/* Command-buffer scratch BOs: reuse a cached BO of size_B..2*size_B, else allocate. */
++VkResult kk_alloc_cached_bo(struct kk_device *dev, struct vk_object_base *log_obj,
++                            uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out);
++void kk_release_cached_bo(struct kk_device *dev, struct kk_bo *bo);
++void kk_bo_cache_finish(struct kk_device *dev);
++
+ VkResult kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo, void **addr);
+ VkResult kk_bo_unmap(struct kk_device *dev, struct kk_bo *bo, void *addr,
+                      bool reserved);
+diff --git a/src/kosmickrisp/vulkan/kk_buffer.c b/src/kosmickrisp/vulkan/kk_buffer.c
+index 60bcdf5..7664622 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_buffer.c
+@@ -104,7 +104,7 @@ kk_GetDeviceBufferMemoryRequirements(
+    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
+       .size = align64(pInfo->pCreateInfo->size, alignment),
+       .alignment = alignment,
+-      .memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count),
++      .memoryTypeBits = kk_host_visible_memory_types(pdev),
+    };
+ 
+    vk_foreach_struct(sType, ext, pMemoryRequirements->pNext) {
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index 22f4bf7..16c1fc4 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -50,7 +50,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+ 
+    /* Release all BOs used as descriptor buffers for submissions */
+    util_dynarray_foreach(&cmd->large_bos, struct kk_bo *, bo) {
+-      kk_destroy_bo(dev, *bo);
++      kk_release_cached_bo(dev, *bo);
+    }
+    util_dynarray_clear(&cmd->large_bos);
+    util_dynarray_clear(&cmd->post_render_writes);
+@@ -212,6 +212,9 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    }
+ 
+    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
++   cmd->metal.last_kind = 0;
++   cmd->metal.barrier_pending = true;
++   memset(cmd->metal.last_attachments, 0, sizeof(cmd->metal.last_attachments));
+    cmd->one_time_submit =
+       pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+ 
+@@ -257,6 +260,9 @@ kk_encoder_update_debug(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+       mtl_encoder_push_debug_group(encoder, label->pLabelName);
+ }
+ 
++static void kk_encoder_begin_barrier(struct kk_cmd_buffer *cmd,
++                                     mtl_command_encoder *encoder, uint8_t kind);
++
+ void
+ cs_start_render(struct kk_cmd_buffer *cmd)
+ {
+@@ -269,6 +275,8 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+ 
+    cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
+       cmd->metal.cmd_buf, state->render_pass_descriptor);
++   kk_residency_stats.render_encoders++;
++   kk_encoder_begin_barrier(cmd, cmd->metal.render, 1);
+ 
+    kk_encoder_update_debug(cmd, cmd->metal.render);
+    /* Starting a new render pass means we already flushed and no barrier is
+@@ -315,6 +323,7 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+ {
+    /* If we are inside render, we need to force a restart later */
+    if (cmd->metal.render) {
++      kk_residency_stats.render_breaks_for_compute++;
+       kk_apply_attachment_store_ops(cmd, true);
+       cs_end(cmd);
+       kk_cmd_buffer_dirty_all_gfx(cmd);
+@@ -323,6 +332,8 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+ 
+    if (cmd->metal.compute == NULL) {
+       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
++      kk_residency_stats.compute_encoders++;
++      kk_encoder_begin_barrier(cmd, cmd->metal.compute, 2);
+       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
+       kk_encoder_update_debug(cmd, cmd->metal.compute);
+    }
+@@ -330,11 +341,69 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+    return cmd->metal.compute;
+ }
+ 
++/* Upstream ends every encoder with a full ALL->ALL queue barrier, which serializes the GPU
++ * at every render pass: with a PS4 renderer's ~200 passes per frame most of the GPU sits
++ * idle (low ALU/texture limiters while "busy"). Light barriers drop it and instead put a
++ * consumer queue barrier at the start of an encoder when ordering is needed: the first
++ * encoder of a command buffer, a change between render and compute work (the driver's own
++ * emulation passes depend on that order), or a Vulkan pipeline barrier / event wait since
++ * the last encoder. Consecutive render passes with no barrier between them may overlap,
++ * as Vulkan allows. Opt-in with KK_LIGHT_BARRIERS=1: it measured no gain with shadPS4,
++ * which records a barrier between nearly every pair of passes. */
++bool
++kk_light_barriers(void)
++{
++   static int light = -1;
++   if (light < 0) {
++      const char *e = getenv("KK_LIGHT_BARRIERS");
++      light = e && e[0] == '1';
++   }
++   return light;
++}
++
++static void
++kk_render_attachment_images(struct kk_cmd_buffer *cmd, const void *out[10])
++{
++   const struct kk_rendering_state *render = &cmd->state.gfx.render;
++   memset(out, 0, 10 * sizeof(out[0]));
++   for (uint32_t i = 0; i < render->color_att_count && i < 8; i++)
++      out[i] = render->color_att[i].iview ? render->color_att[i].iview->vk.image : NULL;
++   out[8] = render->depth_att.iview ? render->depth_att.iview->vk.image : NULL;
++   out[9] = render->stencil_att.iview ? render->stencil_att.iview->vk.image : NULL;
++}
++
++static void
++kk_encoder_begin_barrier(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder,
++                         uint8_t kind)
++{
++   if (!kk_light_barriers())
++      return;
++   bool needed = cmd->metal.barrier_pending || cmd->metal.last_kind != kind;
++   if (kind == 1) {
++      const void *now[10];
++      kk_render_attachment_images(cmd, now);
++      for (unsigned i = 0; i < 10 && !needed; i++)
++         for (unsigned j = 0; j < 10 && now[i]; j++)
++            if (now[i] == cmd->metal.last_attachments[j]) {
++               needed = true;
++               break;
++            }
++      memcpy(cmd->metal.last_attachments, now, sizeof(now));
++   }
++   if (needed)
++      mtl_barrier_after_queue_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   if (needed)
++      kk_residency_stats.barriers_kept++;
++   else
++      kk_residency_stats.barriers_skipped++;
++   cmd->metal.barrier_pending = false;
++}
++
+ static void
+ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+ {
+-   /* TODO_KOSMICKRISP This is probably overkill */
+-   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   if (!kk_light_barriers())
++      mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+    mtl_end_encoding(encoder);
+    mtl_release(encoder);
+ 
+@@ -372,6 +441,7 @@ cs_end(struct kk_cmd_buffer *cmd)
+    if (cmd->metal.render) {
+       end_encoder(cmd, cmd->metal.render);
+       cmd->metal.render = NULL;
++      cmd->metal.last_kind = 1;
+ 
+       /* The stage map is only valid for the current render encoder */
+       util_dynarray_clear(&cmd->ts_stage_map);
+@@ -381,6 +451,7 @@ cs_end(struct kk_cmd_buffer *cmd)
+    if (cmd->metal.compute) {
+       end_encoder(cmd, cmd->metal.compute);
+       cmd->metal.compute = NULL;
++      cmd->metal.last_kind = 2;
+    }
+ }
+ 
+@@ -461,6 +532,40 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+ 
++   /* Whatever happens inside the current encoder, the next encoder waits for all earlier
++    * work (light barriers). */
++   cmd->metal.barrier_pending = true;
++   kk_residency_stats.pipeline_barriers++;
++   {
++      uint64_t src = 0, dst = 0;
++      for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; i++) {
++         src |= pDependencyInfo->pMemoryBarriers[i].srcStageMask;
++         dst |= pDependencyInfo->pMemoryBarriers[i].dstStageMask;
++      }
++      for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; i++) {
++         src |= pDependencyInfo->pBufferMemoryBarriers[i].srcStageMask;
++         dst |= pDependencyInfo->pBufferMemoryBarriers[i].dstStageMask;
++      }
++      for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++) {
++         src |= pDependencyInfo->pImageMemoryBarriers[i].srcStageMask;
++         dst |= pDependencyInfo->pImageMemoryBarriers[i].dstStageMask;
++      }
++      for (unsigned i = 0; i < 16; i++) {
++         if (kk_residency_stats.barrier_kinds[i].n == 0) {
++            kk_residency_stats.barrier_kinds[i].src = src;
++            kk_residency_stats.barrier_kinds[i].dst = dst;
++         }
++         if (kk_residency_stats.barrier_kinds[i].src == src &&
++             kk_residency_stats.barrier_kinds[i].dst == dst) {
++            kk_residency_stats.barrier_kinds[i].n++;
++            kk_residency_stats.barrier_kinds[i].imgs += pDependencyInfo->imageMemoryBarrierCount;
++            kk_residency_stats.barrier_kinds[i].bufs += pDependencyInfo->bufferMemoryBarrierCount;
++            kk_residency_stats.barrier_kinds[i].mems += pDependencyInfo->memoryBarrierCount;
++            break;
++         }
++      }
++   }
++
+    /* TODO_KOSMICKRISP Lighten barriers according to the actual requested
+     * barrier. To take advantage of this we need to remove the chaining of
+     * encoders. */
+@@ -471,6 +576,7 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+        */
+       if (cmd->state.gfx.render.samples > 1 ||
+           kk_barrier_requires_encoder_split(cmd, pDependencyInfo)) {
++         kk_residency_stats.barrier_splits++;
+          kk_apply_attachment_store_ops(cmd, true);
+          cs_end(cmd);
+          cs_start_render(cmd);
+@@ -688,7 +794,7 @@ kk_pool_alloc(struct kk_cmd_buffer *cmd, uint32_t size_B, uint32_t alignment_B)
+    if (size_B > KK_CMD_BO_SIZE) {
+       struct kk_bo *buffer = NULL;
+       const VkResult result =
+-         kk_alloc_bo(dev, &cmd->vk.base, size_B, alignment_B, &buffer);
++         kk_alloc_cached_bo(dev, &cmd->vk.base, size_B, alignment_B, &buffer);
+       if (result != VK_SUCCESS) {
+          vk_command_buffer_set_error(&cmd->vk, result);
+          return (struct kk_ptr){0};
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 20e5854..705e86f 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -234,6 +234,8 @@ struct kk_ts_stage_entry {
+    uint32_t index;
+ };
+ 
++bool kk_light_barriers(void);
++
+ struct kk_cmd_buffer {
+    struct vk_command_buffer vk;
+ 
+@@ -242,6 +244,14 @@ struct kk_cmd_buffer {
+       mtl_command_buffer *cmd_buf;
+       mtl_render_encoder *render;
+       mtl_compute_encoder *compute;
++      /* Light barriers (kk_light_barriers): the kind of the last ended encoder (0 none,
++       * 1 render, 2 compute) and whether a Vulkan barrier or event wait was recorded
++       * since, which the next encoder must honor with a queue barrier. */
++      uint8_t last_kind;
++      bool barrier_pending;
++      /* Images attached to the last render encoder (light barriers: a pass that touches
++       * one of them again waits for the previous one). */
++      const void *last_attachments[10];
+    } metal;
+    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
+    struct util_dynarray ts_resolves;
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 85a2433..a49a711 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -12,6 +12,7 @@
+ #include "kk_buffer.h"
+ #include "kk_cmd_buffer.h"
+ #include "kk_format.h"
++#include "vk_format.h"
+ #include "kk_image_view.h"
+ #include "kk_physical_device.h"
+ #include "kk_query_pool.h"
+@@ -252,6 +253,7 @@ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                      const VkRenderingInfo *pRenderingInfo)
+ {
++   kk_residency_stats.begin_rendering++;
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+@@ -291,6 +293,29 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+ 
+    kk_attachment_init(&render->depth_att, pRenderingInfo->pDepthAttachment);
+    kk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
++   {
++      /* Estimated tile memory traffic of this pass (KK_RESIDENCY_STATS). */
++      const uint64_t px = (uint64_t)pRenderingInfo->renderArea.extent.width *
++                          pRenderingInfo->renderArea.extent.height;
++      const VkRenderingAttachmentInfo *atts[10];
++      unsigned n = 0;
++      for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount && n < 8; i++)
++         atts[n++] = &pRenderingInfo->pColorAttachments[i];
++      if (pRenderingInfo->pDepthAttachment) atts[n++] = pRenderingInfo->pDepthAttachment;
++      if (pRenderingInfo->pStencilAttachment) atts[n++] = pRenderingInfo->pStencilAttachment;
++      for (unsigned i = 0; i < n; i++) {
++         if (atts[i]->imageView == VK_NULL_HANDLE)
++            continue;
++         VK_FROM_HANDLE(kk_image_view, iv, atts[i]->imageView);
++         const uint64_t bytes = px * vk_format_get_blocksize(iv->vk.format);
++         if (atts[i]->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
++            kk_residency_stats.load_bytes += bytes;
++         if (atts[i]->storeOp == VK_ATTACHMENT_STORE_OP_STORE)
++            kk_residency_stats.store_bytes += bytes;
++      }
++      if (does_any_attachment_clear)
++         kk_residency_stats.clear_passes++;
++   }
+    kk_merge_render_iview(&framebuffer_extent,
+                          render->depth_att.iview ?: render->stencil_att.iview);
+ 
+@@ -962,6 +987,7 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
+     * current encoder and prepare to restart it */
+    bool active_render = cmd->metal.render != NULL;
+    if (needs_restart && active_render) {
++      kk_residency_stats.attachment_map_restarts++;
+       if (!color_attachment_map_changed) {
+          /* Sample locations changed and color attachment map didn't. */
+          kk_apply_attachment_store_ops(cmd, true);
+@@ -2076,6 +2102,7 @@ kk_dispatch_compute(mtl_compute_encoder *enc, struct kk_grid grid,
+ static struct kk_draw_data
+ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+ {
++   kk_residency_stats.tess_draws++;
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+    struct kk_grid grid_vs, grid_tcs, grid_tess;
+ 
+@@ -2199,6 +2226,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+                      const struct kk_draw_command *data,
+                      struct kk_draw_data draw, bool restart)
+ {
++   kk_residency_stats.gs_draws++;
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+    struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+    struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_pool.h b/src/kosmickrisp/vulkan/kk_cmd_pool.h
+index 479e70e..9123f20 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_pool.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_pool.h
+@@ -15,7 +15,10 @@
+ #include "util/u_dynarray.h"
+ 
+ #define KK_CMD_BO_SIZE     (1024 * 128)
+-#define KK_CMD_POOL_BO_MAX 32
++/* Upload BOs kept per pool for reuse. Each new BO is a new MTLHeap and a residency-set
++ * commit, which can hold the kernel GPU lock for seconds; games that record more than
++ * 32 BOs (4 MB) of uploads per command buffer churned them every frame. */
++#define KK_CMD_POOL_BO_MAX 1024
+ 
+ /* Recyclable command buffer BO, used for both push buffers and upload */
+ struct kk_cmd_bo {
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index 5f56abc..43220b0 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -521,7 +521,7 @@ kk_CreateDescriptorPool(VkDevice _device,
+    mem_size += kk_min_cbuf_alignment() * pCreateInfo->maxSets;
+ 
+    if (mem_size) {
+-      result = kk_alloc_bo(dev, &dev->vk.base, mem_size, 0u, &pool->bo);
++      result = kk_alloc_bo(dev, &pool->base, mem_size, 0u, &pool->bo);
+       if (result != VK_SUCCESS) {
+          kk_destroy_descriptor_pool(dev, pAllocator, pool);
+          return result;
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 9950b19..b767722 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -6,6 +6,8 @@
+  */
+ 
+ #include "kk_device.h"
++#include "util/os_time.h"
++#include "util/u_atomic.h"
+ 
+ #include "kk_buffer.h"
+ #include "kk_buffer_view.h"
+@@ -302,6 +304,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    /* We need to initialize the device residency set before any bo is created. */
+    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
++   simple_mtx_init(&dev->large_bo_cache.mutex, mtx_plain);
+    dev->residency_set.handle = mtl_new_residency_set(dev->mtl_handle);
+    if (dev->residency_set.handle == NULL)
+       goto fail_compiler;
+@@ -388,6 +391,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    /* Geometry heap */
+    if (dev->heap)
+       kk_destroy_bo(dev, dev->heap);
++   kk_bo_cache_finish(dev);
+ 
+    if (dev->has_queue) {
+       kk_queue_finish(dev, &dev->queue);
+@@ -431,6 +435,8 @@ kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+    mtl_residency_set_add_allocation(dev->residency_set.handle, heap);
++   dev->residency_set.dirty = true;
++   kk_residency_stats.adds++;
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
+@@ -439,6 +445,8 @@ kk_device_remove_heap_from_residency_set(struct kk_device *dev, mtl_heap *heap)
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+    mtl_residency_set_remove_allocation(dev->residency_set.handle, heap);
++   dev->residency_set.dirty = true;
++   kk_residency_stats.removes++;
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
+@@ -447,6 +455,8 @@ kk_device_add_buffer_to_residency_set(struct kk_device *dev, mtl_buffer *buffer)
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+    mtl_residency_set_add_allocation(dev->residency_set.handle, buffer);
++   dev->residency_set.dirty = true;
++   kk_residency_stats.adds++;
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
+@@ -456,15 +466,143 @@ kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+    mtl_residency_set_remove_allocation(dev->residency_set.handle, buffer);
++   dev->residency_set.dirty = true;
++   kk_residency_stats.removes++;
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
++/* KK_RESIDENCY_STATS=1: every 2 s, print residency commits per submit and their cost. */
++struct kk_residency_stats kk_residency_stats;
++
++static void
++kk_residency_stats_tick(uint64_t now)
++{
++   static int enabled = -1;
++   if (enabled < 0)
++      enabled = getenv("KK_RESIDENCY_STATS") != NULL;
++   struct kk_residency_stats *st = &kk_residency_stats;
++   if (!enabled)
++      return;
++   if (!st->window_start)
++      st->window_start = now;
++   if (now - st->window_start < 2000000000ull)
++      return;
++   fprintf(stderr,
++           "KK residency: %u submits, %u commits (%.2f ms avg, %.2f ms max commit; "
++           "%.2f ms avg request), +%u/-%u allocations, %u bo allocs (%.1f MB), "
++           "%u bo frees\n",
++           st->submits, st->commits,
++           st->commits ? st->commit_ns / 1e6 / st->commits : 0.0, st->commit_max_ns / 1e6,
++           st->commits ? st->request_ns / 1e6 / st->commits : 0.0, st->adds, st->removes,
++           st->bo_allocs, st->bo_alloc_bytes / 1048576.0, st->bo_frees);
++   fprintf(stderr,
++           "KK encoders: %u render, %u compute, %u render passes split for compute; "
++           "%u geometry-shader draws, %u tessellation draws; %u vkCmdBeginRendering, "
++           "%u barrier splits, %u attachment-map restarts\n",
++           st->render_encoders, st->compute_encoders, st->render_breaks_for_compute,
++           st->gs_draws, st->tess_draws, st->begin_rendering, st->barrier_splits,
++           st->attachment_map_restarts);
++   {
++      double busy;
++      unsigned buffers;
++      mtl_take_gpu_busy_time(&busy, &buffers);
++      fprintf(stderr, "KK GPU: busy %.0f ms of %.0f ms (%u command buffers)\n", busy * 1e3,
++              (now - st->window_start) / 1e6, buffers);
++   }
++   fprintf(stderr, "KK submit: %.0f ms CPU in vkQueueSubmit (max %.1f ms)\n",
++           st->submit_ns / 1e6, st->submit_max_ns / 1e6);
++   fprintf(stderr, "KK barriers: %u encoder-start barriers kept, %u skipped; %u vkCmdPipelineBarrier2\n",
++           st->barriers_kept, st->barriers_skipped, st->pipeline_barriers);
++   for (unsigned i = 0; i < 16 && st->barrier_kinds[i].n; i++)
++      fprintf(stderr, "KK barriers:   src 0x%llx dst 0x%llx: %u (%u image, %u buffer, %u memory)\n",
++              (unsigned long long)st->barrier_kinds[i].src,
++              (unsigned long long)st->barrier_kinds[i].dst, st->barrier_kinds[i].n,
++              st->barrier_kinds[i].imgs, st->barrier_kinds[i].bufs, st->barrier_kinds[i].mems);
++   fprintf(stderr, "KK passes: %.0f MB loaded, %.0f MB stored by vkCmdBeginRendering passes, %llu with clears; %.0f MB device memory in private heaps\n",
++           st->load_bytes / 1048576.0, st->store_bytes / 1048576.0,
++           (unsigned long long)st->clear_passes, st->private_bytes_live / 1048576.0);
++   for (unsigned i = 0; i < 64; i++)
++      if (st->by_type[i])
++         fprintf(stderr, "KK residency:   object type %u: %u bo allocs, %.1f MB\n", i,
++                 st->by_type[i], st->by_type_bytes[i] / 1048576.0);
++   uint64_t start = now;
++   const int64_t private_live = st->private_bytes_live;
++   memset(st, 0, sizeof(*st));
++   st->window_start = start;
++   st->private_bytes_live = private_live;
++}
++
++/* GPU watchdog. Residency commits and queue submits take the kernel's GPU lock, which
++ * WindowServer needs to draw. Under load a single one can take seconds, and a game that
++ * keeps submitting then starves WindowServer until its 40 s watchdog kills it, taking the
++ * desktop session along. When a commit or submit is slow, this throttles submissions for a
++ * while so other GPU clients get the lock. KK_GPU_WATCHDOG=0 disables it. */
++static uint64_t kk_watchdog_cooldown_until;
++static uint64_t kk_watchdog_last_log;
++
++static bool
++kk_watchdog_enabled(void)
++{
++   static int enabled = -1;
++   if (enabled < 0) {
++      const char *e = getenv("KK_GPU_WATCHDOG");
++      enabled = !(e && e[0] == '0');
++   }
++   return enabled;
++}
++
++void
++kk_gpu_watchdog_record(const char *what, uint64_t duration_ns)
++{
++   const uint64_t slow_ns = 100000000ull; /* 100 ms */
++   if (!kk_watchdog_enabled() || duration_ns < slow_ns)
++      return;
++   uint64_t now = os_time_get_nano();
++   uint64_t cooldown = MIN2(duration_ns * 20, 15000000000ull);
++   uint64_t until = now + cooldown;
++   if (until > p_atomic_read(&kk_watchdog_cooldown_until))
++      p_atomic_set(&kk_watchdog_cooldown_until, until);
++   if (now - kk_watchdog_last_log > 1000000000ull) {
++      kk_watchdog_last_log = now;
++      fprintf(stderr,
++              "KK GPU watchdog: %s held the GPU for %.0f ms; throttling submissions for "
++              "%.1f s so WindowServer can draw\n",
++              what, duration_ns / 1e6, cooldown / 1e9);
++   }
++}
++
++void
++kk_gpu_watchdog_before_submit(void)
++{
++   if (!kk_watchdog_enabled())
++      return;
++   uint64_t until = p_atomic_read(&kk_watchdog_cooldown_until);
++   if (until && os_time_get_nano() < until)
++      os_time_sleep(20000); /* 20 ms between submissions while cooling down */
++}
++
+ void
+ kk_device_make_resources_resident(struct kk_device *dev)
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+-   mtl_residency_set_commit(dev->residency_set.handle);
+-   mtl_residency_set_request_residency(dev->residency_set.handle);
++   kk_residency_stats.submits++;
++   /* The set is attached to every queue (kk_queue.c), so Metal keeps it resident for each
++    * command buffer; only changes need a commit. */
++   if (dev->residency_set.dirty) {
++      uint64_t t0 = os_time_get_nano();
++      mtl_residency_set_commit(dev->residency_set.handle);
++      uint64_t t1 = os_time_get_nano();
++      mtl_residency_set_request_residency(dev->residency_set.handle);
++      uint64_t t2 = os_time_get_nano();
++      dev->residency_set.dirty = false;
++      kk_residency_stats.commits++;
++      kk_residency_stats.commit_ns += t1 - t0;
++      kk_residency_stats.request_ns += t2 - t1;
++      if (t2 - t0 > kk_residency_stats.commit_max_ns)
++         kk_residency_stats.commit_max_ns = t2 - t0;
++      kk_gpu_watchdog_record("residency commit", t2 - t0);
++   }
++   kk_residency_stats_tick(os_time_get_nano());
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index e3795ba..3aa96d0 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -31,8 +31,31 @@ struct vk_pipeline_cache;
+ struct kk_residency_set {
+    simple_mtx_t mutex;
+    mtl_residency_set *handle;
++   /* Allocations added or removed since the last commit. Committing and requesting
++    * residency of the whole set on every submit holds the kernel GPU lock long enough,
++    * with thousands of allocations, to starve WindowServer (its watchdog then kills it). */
++   bool dirty;
+ };
+ 
++struct kk_residency_stats {
++   uint64_t window_start, commit_ns, request_ns, commit_max_ns, bo_alloc_bytes;
++   uint32_t submits, commits, adds, removes, bo_allocs, bo_frees;
++   uint32_t render_encoders, compute_encoders, render_breaks_for_compute, gs_draws, tess_draws,
++      begin_rendering, barrier_splits, attachment_map_restarts;
++   uint64_t load_bytes, store_bytes, clear_passes;
++   /* Live device memory in private heaps (not reset per window). */
++   int64_t private_bytes_live;
++   uint32_t barriers_kept, barriers_skipped, draws, pipeline_barriers;
++   uint64_t submit_ns, submit_max_ns;
++   struct { uint64_t src, dst; uint32_t n, imgs, bufs, mems; } barrier_kinds[16];
++   uint32_t by_type[64];
++   uint64_t by_type_bytes[64];
++};
++extern struct kk_residency_stats kk_residency_stats;
++
++void kk_gpu_watchdog_record(const char *what, uint64_t duration_ns);
++void kk_gpu_watchdog_before_submit(void);
++
+ struct mtl_sampler_packed {
+    enum mtl_sampler_address_mode mode_u;
+    enum mtl_sampler_address_mode mode_v;
+@@ -100,6 +123,15 @@ struct kk_device {
+ 
+    struct vk_meta_device meta;
+ 
++   /* Recycled command-buffer BOs above KK_CMD_BO_SIZE (kk_pool_alloc), so recording does
++    * not create and destroy MTLHeaps (and residency-set entries) every frame. */
++   struct {
++      simple_mtx_t mutex;
++      struct kk_bo *bos[64];
++      uint32_t count;
++      uint64_t bytes;
++   } large_bo_cache;
++
+    /* Geomtry heap */
+    struct kk_bo *heap;
+    util_once_flag heap_init_once;
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
+index e658bd7..347306c 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -57,7 +57,7 @@ kk_GetMemoryMetalHandlePropertiesEXT(
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    }
+    pMemoryMetalHandleProperties->memoryTypeBits =
+-      BITFIELD_MASK(pdev->mem_type_count);
++      kk_host_visible_memory_types(pdev);
+ 
+    return VK_SUCCESS;
+ }
+@@ -80,7 +80,7 @@ kk_GetMemoryHostPointerPropertiesEXT(
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    }
+    pMemoryHostPointerProperties->memoryTypeBits =
+-      BITFIELD_MASK(pdev->mem_type_count);
++      kk_host_visible_memory_types(pdev);
+ 
+    return VK_SUCCESS;
+ }
+@@ -141,8 +141,18 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+       mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
+       mem->bo->cpu = mtl_get_contents(mem->bo->map);
+    } else {
+-      result =
+-         kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);
++      const struct kk_physical_device *mpdev = kk_device_physical(dev);
++      const bool private_storage =
++         !(mpdev->mem_types[pAllocateInfo->memoryTypeIndex].propertyFlags &
++           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
++      result = kk_alloc_bo_with_options(
++         dev, &mem->vk.base, aligned_size, alignment,
++         private_storage ? (MTL_RESOURCE_STORAGE_MODE_PRIVATE |
++                            MTL_RESOURCE_TRACKING_MODE_UNTRACKED)
++                         : KK_MTL_RESOURCE_OPTIONS,
++         &mem->bo);
++      if (result == VK_SUCCESS && private_storage)
++         p_atomic_add(&kk_residency_stats.private_bytes_live, (int64_t)mem->bo->size_B);
+       if (result != VK_SUCCESS)
+          goto fail_alloc;
+    }
+@@ -170,6 +180,8 @@ kk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
+    if (mem->map)
+       kk_bo_unmap(dev, mem->bo, mem->map, false);
+ 
++   if (mem->bo->mtl_handle && mem->bo->cpu == NULL)
++      p_atomic_add(&kk_residency_stats.private_bytes_live, -(int64_t)mem->bo->size_B);
+    kk_destroy_bo(dev, mem->bo);
+ 
+    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+@@ -188,6 +200,10 @@ kk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
+       return VK_SUCCESS;
+    }
+ 
++   if (mem->bo->cpu == NULL)
++      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
++                       "memory type is not host visible");
++
+    const VkDeviceSize offset = pMemoryMapInfo->offset;
+    const VkDeviceSize size = vk_device_memory_range(
+       &mem->vk, pMemoryMapInfo->offset, pMemoryMapInfo->size);
+diff --git a/src/kosmickrisp/vulkan/kk_event.c b/src/kosmickrisp/vulkan/kk_event.c
+index 3e6db31..252244f 100644
+--- a/src/kosmickrisp/vulkan/kk_event.c
++++ b/src/kosmickrisp/vulkan/kk_event.c
+@@ -112,5 +112,8 @@ kk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
+                   const VkEvent *pEvents,
+                   const VkDependencyInfo *pDependencyInfos)
+ {
+-   /* We do nothing, event should already be set by the time we are here. */
++   /* The event should already be set by the time we are here; the dependency still
++    * orders the work before and after (light barriers). */
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   cmd->metal.barrier_pending = true;
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index de27a6d..487053b 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -665,6 +665,20 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
+ {
+    struct kk_physical_device *pdev = kk_device_physical(dev);
+    uint32_t memory_types = (1 << pdev->mem_type_count) - 1;
++   const bool sparse =
++      image->vk.create_flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
++                                VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
++                                VK_IMAGE_CREATE_SPARSE_ALIASED_BIT);
++   const uint32_t private_types = memory_types & ~kk_host_visible_memory_types(pdev);
++   if (sparse) {
++      memory_types &= kk_host_visible_memory_types(pdev);
++   } else if (private_types && image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
++              !(image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT)) {
++      /* Optimal images are GPU-only: on a unified memory device allocators
++       * see no reason to leave the host visible type, so steer them to
++       * private heaps (lossless compression). */
++      memory_types = private_types;
++   }
+ 
+    /* Remove non host visible heaps from the types for host image copy in case
+     * of potential issues. This should be removed when we get ReBAR.
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 7f82a2a..681186b 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -975,6 +975,9 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
+ 
+    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
+                        sizeof(instance->driver_build_sha));
++   /* The workarounds change the generated MSL (MESA_KK_DISABLE_WORKAROUNDS) */
++   _mesa_blake3_update(&blake3_ctx, &pdev->settings.disabled_workarounds,
++                       sizeof(pdev->settings.disabled_workarounds));
+ 
+    unsigned char blake3[BLAKE3_KEY_LEN];
+    _mesa_blake3_final(&blake3_ctx, blake3);
+@@ -1198,6 +1201,20 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+       .heapIndex = sysmem_heap_idx,
+    };
++   /* GPU-only memory in private Metal heaps: images there can use Apple's
++    * lossless framebuffer compression, which shared storage rules out.
++    * Images only (kk_get_image_memory_requirements). Opt-in with
++    * KK_PRIVATE_MEMORY=1: no frame time gain measured in inFAMOUS SS
++    * (2026-11-02), the GPU time there is not attachment bandwidth. */
++   {
++      const char *e = getenv("KK_PRIVATE_MEMORY");
++      if (e && e[0] == '1') {
++         pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
++            .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++            .heapIndex = sysmem_heap_idx,
++         };
++      }
++   }
+ 
+    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
+    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.h b/src/kosmickrisp/vulkan/kk_physical_device.h
+index 283dc9f..285850b 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.h
++++ b/src/kosmickrisp/vulkan/kk_physical_device.h
+@@ -104,4 +104,14 @@ void kk_physical_device_destroy(struct vk_physical_device *vk_device);
+ #define KK_USE_WSI_PLATFORM
+ #endif
+ 
++static inline uint32_t
++kk_host_visible_memory_types(const struct kk_physical_device *pdev)
++{
++   uint32_t types = 0;
++   for (uint32_t i = 0; i < pdev->mem_type_count; i++)
++      if (pdev->mem_types[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
++         types |= 1u << i;
++   return types;
++}
++
+ #endif // KK_PHYSICAL_DEVICE_H
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index 5194492..ce0d8b6 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "kk_queue.h"
++#include "util/os_time.h"
+ #include "kk_buffer.h"
+ #include "kk_cmd_buffer.h"
+ #include "kk_device.h"
+@@ -251,8 +252,25 @@ kk_queue_submit_bind_sparse_memory(struct kk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++kk_queue_submit_locked_impl(struct vk_queue *vk_queue, struct vk_queue_submit *submit);
++
+ static VkResult
+ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
++{
++   kk_gpu_watchdog_before_submit();
++   uint64_t t0 = os_time_get_nano();
++   VkResult result = kk_queue_submit_locked_impl(vk_queue, submit);
++   uint64_t dt = os_time_get_nano() - t0;
++   kk_gpu_watchdog_record("queue submit", dt);
++   kk_residency_stats.submit_ns += dt;
++   if (dt > kk_residency_stats.submit_max_ns)
++      kk_residency_stats.submit_max_ns = dt;
++   return result;
++}
++
++static VkResult
++kk_queue_submit_locked_impl(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+ {
+    struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
+    struct kk_device *dev = kk_queue_device(queue);
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index e9e0c07..7abc39e 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -6,6 +6,9 @@
+  */
+ 
+ #include "kk_shader.h"
++#include "util/simple_mtx.h"
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "kk_cmd_buffer.h"
+ #include "kk_debug.h"
+@@ -1032,6 +1035,27 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+    if (KK_DEBUG(MSL))
+       mesa_logi("%s\n", data->code);
+ 
++   /* KK_MSL_DUMP=<dir>: writes each translated shader to
++    * <dir>/<SPIR-V blake3>_<stage>_<n>.metal (MESA_SPIRV_DUMP_PATH names the SPIR-V the same way) */
++   const char *dump_dir = getenv("KK_MSL_DUMP");
++   if (dump_dir) {
++      static simple_mtx_t dump_lock = SIMPLE_MTX_INITIALIZER;
++      static unsigned dump_n;
++      char hash[BLAKE3_HEX_LEN];
++      _mesa_blake3_format(hash, nir->info.source_blake3);
++      simple_mtx_lock(&dump_lock);
++      unsigned n = dump_n++;
++      simple_mtx_unlock(&dump_lock);
++      char path[1024];
++      snprintf(path, sizeof(path), "%s/%s_%s_%u.metal", dump_dir, hash,
++               _mesa_shader_stage_to_abbrev(nir->info.stage), n);
++      FILE *f = fopen(path, "w");
++      if (f) {
++         fprintf(f, "// entry %s\n%s", entrypoint_name, data->code);
++         fclose(f);
++      }
++   }
++
+    ralloc_free(nir);
+ }
+ 

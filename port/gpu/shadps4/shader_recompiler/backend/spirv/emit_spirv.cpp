@@ -199,6 +199,15 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
+            if (ctx.profile.loop_guard) {
+                // tlg: leave the loop after Profile::loop_guard back-edges in all.
+                const Id count{ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.loop_guard),
+                                          ctx.ConstU32(1U))};
+                ctx.OpStore(ctx.loop_guard, count);
+                cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
+                                        ctx.OpULessThan(ctx.U1[1], count,
+                                                        ctx.ConstU32(ctx.profile.loop_guard)));
+            }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);

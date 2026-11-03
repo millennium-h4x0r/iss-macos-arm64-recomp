@@ -252,6 +252,7 @@ public:
     Id vertex_index{};
     Id instance_id{};
     Id push_data_block{};
+    Id loop_guard{}; // tlg: Private u32 back-edge counter (Profile::loop_guard)
     // tlg: object motion vectors (runtime_info.h, MotionVectors).
     Id motion_out_cur{};
     Id motion_out_prev{};
@@ -388,6 +389,7 @@ public:
         bool is_integer{};
         bool is_loaded{};
         bool is_array{};
+        u8 scaled{}; ///< tlg: 1 = USCALED, 2 = SSCALED read as integers (profile.vertex_scaled_as_int)
     };
     Id input_attr_array;
     Id output_attr_array;

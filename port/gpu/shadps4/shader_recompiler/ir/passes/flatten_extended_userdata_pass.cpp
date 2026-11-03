@@ -5,8 +5,12 @@
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
+#include "common/arch.h"
+#ifdef ARCH_X86_64
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
+#endif
+#include <csetjmp>
 #include "common/arch.h"
 #include "common/decoder.h"
 #include "common/io_file.h"
@@ -126,6 +130,138 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     return true;
 }
 
+#else
+// tlg (Apple Silicon): the walker is a small stack bytecode run by RunSrtWalker instead of x86
+// code. walker_func points at the bytecode; the pipeline cache stores and reloads its bytes.
+#include <memory>
+#include <vector>
+#include <cstring>
+#include "tlg_toggles.h" // runtime_fault_recover
+namespace {
+enum SrtOp : u8 {
+    OpPushPtrImm = 1, // u32 off: push ptr; ptr = load64(ptr + off*4) & 48 bits
+    OpPushPtrExpr,    // value: push ptr; ptr = load64(ptr + v*4) & 48 bits
+    OpPopPtr,
+    OpCopyImm,        // u32 src, u32 dst: flat[dst] = load32(ptr + src*4)
+    OpCopyExpr,       // u32 dst; value: flat[dst] = load32(ptr + v*4)
+    OpFlat,           // u32 off: push flat[off]
+    OpImm,            // u32 v
+    OpAdd, OpSub, OpMul, OpShl, OpShr, OpAnd, OpOr, OpXor, OpNot, OpUMin, OpUMax, OpBfe,
+    OpEnd,
+    OpZeroFlag = 0x80, // set on a load that faulted once: it then reads zero (x86: patched mov)
+};
+std::mutex g_srt_codegen_mutex;
+std::vector<std::unique_ptr<u8[]>> g_srt_programs;
+} // namespace
+
+namespace Shader {
+PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+    std::scoped_lock lock{g_srt_codegen_mutex};
+    auto copy = std::make_unique<u8[]>(size);
+    std::memcpy(copy.get(), ptr, size);
+    const auto func = reinterpret_cast<PFN_SrtWalker>(copy.get());
+    g_srt_programs.push_back(std::move(copy));
+    return func;
+}
+
+static u32 Rd32(const u8*& p) { u32 v; std::memcpy(&v, p, 4); p += 4; return v; }
+
+void RunSrtWalker(PFN_SrtWalker walker, const u32* user_data, u32* flat) {
+    u8* code = reinterpret_cast<u8*>(walker);
+    for (;;) {
+        sigjmp_buf recover;
+        sigjmp_buf* outer = runtime_fault_recover;
+        static thread_local u8* faulting;
+        if (sigsetjmp(recover, 0)) {
+            runtime_fault_recover = outer;
+            if (faulting) *faulting |= OpZeroFlag;
+            LOG_WARNING(Render_Recompiler, "Patched SRT walker load at {}", fmt::ptr(faulting));
+            continue; // rerun with the faulting load reading zero
+        }
+        runtime_fault_recover = &recover;
+        u64 ptr_stack[64]; u32 psp = 0;
+        u32 vstack[64]; u32 vsp = 0;
+        u64 ptr = reinterpret_cast<u64>(user_data); // x86: rdi
+        const u8* p = code;
+        for (bool done = false; !done;) {
+            u8* at = const_cast<u8*>(p);
+            const u8 raw = *p++;
+            const bool zero = raw & OpZeroFlag;
+            switch (raw & 0x7f) {
+            case OpPushPtrImm: {
+                const u32 off = Rd32(p);
+                ptr_stack[psp++] = ptr;
+                faulting = at;
+                u64 v = 0;
+                if (!zero) std::memcpy(&v, reinterpret_cast<const void*>(ptr + u64(off) * 4), 8);
+                ptr = v & 0xFFFFFFFFFFFFULL;
+                break;
+            }
+            case OpPushPtrExpr: {
+                const u32 off = vstack[--vsp];
+                ptr_stack[psp++] = ptr;
+                faulting = at;
+                u64 v = 0;
+                if (!zero) std::memcpy(&v, reinterpret_cast<const void*>(ptr + u64(off) * 4), 8);
+                ptr = v & 0xFFFFFFFFFFFFULL;
+                break;
+            }
+            case OpPopPtr: ptr = ptr_stack[--psp]; break;
+            case OpCopyImm: {
+                const u32 src = Rd32(p), dst = Rd32(p);
+                faulting = at;
+                u32 v = 0;
+                if (!zero) std::memcpy(&v, reinterpret_cast<const void*>(ptr + u64(src) * 4), 4);
+                flat[dst] = v;
+                break;
+            }
+            case OpCopyExpr: {
+                const u32 dst = Rd32(p), src = vstack[--vsp];
+                faulting = at;
+                u32 v = 0;
+                if (!zero) std::memcpy(&v, reinterpret_cast<const void*>(ptr + u64(src) * 4), 4);
+                flat[dst] = v;
+                break;
+            }
+            case OpFlat: vstack[vsp++] = flat[Rd32(p)]; break;
+            case OpImm: vstack[vsp++] = Rd32(p); break;
+            case OpNot: vstack[vsp - 1] = ~vstack[vsp - 1]; break;
+            case OpBfe: {
+                const u32 count = vstack[--vsp], offset = vstack[--vsp], base = vstack[--vsp];
+                const u32 shifted = offset >= 32 ? 0 : base >> offset;
+                vstack[vsp++] = count >= 32 ? shifted : shifted & ((1u << count) - 1);
+                break;
+            }
+            case OpEnd: done = true; break;
+            default: {
+                const u32 b = vstack[--vsp], a = vstack[--vsp];
+                u32 r = 0;
+                switch (raw & 0x7f) {
+                case OpAdd: r = a + b; break;
+                case OpSub: r = a - b; break;
+                case OpMul: r = a * b; break;
+                case OpShl: r = a << (b & 31); break;
+                case OpShr: r = a >> (b & 31); break;
+                case OpAnd: r = a & b; break;
+                case OpOr: r = a | b; break;
+                case OpXor: r = a ^ b; break;
+                case OpUMin: r = a < b ? a : b; break;
+                case OpUMax: r = a > b ? a : b; break;
+                default: UNREACHABLE_MSG("bad SRT walker op {}", raw);
+                }
+                vstack[vsp++] = r;
+                break;
+            }
+            }
+        }
+        runtime_fault_recover = outer;
+        return;
+    }
+}
+} // namespace Shader
+
+namespace {
+#endif
 using namespace Shader;
 
 struct PassInfo {
@@ -223,6 +359,13 @@ static inline void SetFlatbufOffset(IR::Inst* inst, u16 offset) {
     UNREACHABLE_MSG("Instruction not supported");
 }
 
+#ifndef ABORT_ON_FAILURE
+#define ABORT_ON_FAILURE(expr)                                                                     \
+    if (!(expr)) {                                                                                 \
+        return false;                                                                              \
+    }
+#endif
+#ifdef ARCH_X86_64
 static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& pass_info,
                           const IR::Value& off_dw);
 
@@ -491,6 +634,7 @@ static bool EmitComputeOffsetBitFieldUExtract(Xbyak::CodeGenerator& c, Xbyak::Re
     return true;
 }
 
+#endif
 static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
     switch (inst->GetOpcode()) {
     case IR::Opcode::GetUserData:
@@ -514,6 +658,7 @@ static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
     }
 }
 
+#ifdef ARCH_X86_64
 static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& pass_info,
                           const IR::Value& off_dw) {
     ASSERT(reg != ecx && reg != edx);
@@ -678,6 +823,122 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
 }
 
+#else
+struct SrtCode {
+    std::vector<u8> bytes;
+    void Op(u8 op) { bytes.push_back(op); }
+    void U32(u32 v) { const u8* p = reinterpret_cast<const u8*>(&v); bytes.insert(bytes.end(), p, p + 4); }
+};
+
+static bool ComputeOffset(SrtCode& c, PassInfo& pass_info, const IR::Value& v);
+static bool PushArg(SrtCode& c, PassInfo& pass_info, const IR::Value& v) {
+    if (v.IsImmediate()) { c.Op(OpImm); c.U32(v.U32()); return true; }
+    return ComputeOffset(c, pass_info, v);
+}
+static bool Binary(SrtCode& c, PassInfo& pass_info, IR::Inst* inst, u8 op) {
+    ABORT_ON_FAILURE(PushArg(c, pass_info, inst->Arg(0)));
+    ABORT_ON_FAILURE(PushArg(c, pass_info, inst->Arg(1)));
+    c.Op(op);
+    return true;
+}
+static bool ComputeOffset(SrtCode& c, PassInfo& pass_info, const IR::Value& off_dw) {
+    auto inst = off_dw.Inst();
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::GetUserData:
+        c.Op(OpFlat); c.U32(static_cast<u32>(inst->Arg(0).ScalarReg()));
+        return true;
+    case IR::Opcode::ReadConst:
+    case IR::Opcode::ReadConstBuffer:
+        if (u16 offset = GetFlatbufOffset(pass_info.DeduplicateInstruction(inst)); offset != 0) {
+            c.Op(OpFlat); c.U32(offset);
+            return true;
+        }
+        return false;
+    case IR::Opcode::IAdd32: return Binary(c, pass_info, inst, OpAdd);
+    case IR::Opcode::ISub32: return Binary(c, pass_info, inst, OpSub);
+    case IR::Opcode::IMul32: return Binary(c, pass_info, inst, OpMul);
+    case IR::Opcode::ShiftLeftLogical32: return Binary(c, pass_info, inst, OpShl);
+    case IR::Opcode::ShiftRightLogical32: return Binary(c, pass_info, inst, OpShr);
+    case IR::Opcode::BitwiseAnd32: return Binary(c, pass_info, inst, OpAnd);
+    case IR::Opcode::BitwiseOr32: return Binary(c, pass_info, inst, OpOr);
+    case IR::Opcode::BitwiseXor32: return Binary(c, pass_info, inst, OpXor);
+    case IR::Opcode::UMin32: return Binary(c, pass_info, inst, OpUMin);
+    case IR::Opcode::UMax32: return Binary(c, pass_info, inst, OpUMax);
+    case IR::Opcode::BitwiseNot32:
+        ABORT_ON_FAILURE(PushArg(c, pass_info, inst->Arg(0)));
+        c.Op(OpNot);
+        return true;
+    case IR::Opcode::BitFieldUExtract:
+        ABORT_ON_FAILURE(PushArg(c, pass_info, inst->Arg(0)));
+        ABORT_ON_FAILURE(PushArg(c, pass_info, inst->Arg(1)));
+        ABORT_ON_FAILURE(PushArg(c, pass_info, inst->Arg(2)));
+        c.Op(OpBfe);
+        return true;
+    default:
+        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
+                  magic_enum::enum_name(inst->GetOpcode()));
+        return false;
+    }
+}
+
+static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info, SrtCode& c) {
+    if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
+        subtree->GetOpcode() == IR::Opcode::ReadConstBuffer &&
+            subtree->Flags<IR::BufferInstInfo>().flatbuf_off_dw == 0) {
+        return;
+    }
+    if (off_dw.IsImmediate()) {
+        c.Op(OpPushPtrImm); c.U32(off_dw.U32());
+    } else {
+        const size_t mark = c.bytes.size();
+        if (!ComputeOffset(c, pass_info, off_dw)) {
+            c.bytes.resize(mark);
+            LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+            return;
+        }
+        c.Op(OpPushPtrExpr);
+    }
+    PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
+    ASSERT(use_list);
+    for (auto [src_off_dw, use] : *use_list) {
+        if (src_off_dw.IsImmediate()) {
+            c.Op(OpCopyImm); c.U32(src_off_dw.U32()); c.U32(pass_info.dst_off_dw);
+        } else {
+            const size_t mark = c.bytes.size();
+            if (!ComputeOffset(c, pass_info, src_off_dw)) {
+                c.bytes.resize(mark);
+                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+                continue;
+            }
+            c.Op(OpCopyExpr); c.U32(pass_info.dst_off_dw);
+        }
+        SetFlatbufOffset(use, pass_info.dst_off_dw);
+        pass_info.dst_off_dw++;
+    }
+    for (const auto [src_off_dw, use] : *use_list) {
+        if (pass_info.GetUsesAsPointer(use)) {
+            VisitPointer(src_off_dw, use, pass_info, c);
+        }
+    }
+    c.Op(OpPopPtr);
+}
+
+static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
+    if (pass_info.srt_roots.empty()) {
+        return;
+    }
+    SrtCode c;
+    pass_info.dst_off_dw = NUM_USER_DATA_REGS;
+    ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
+    for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
+        VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
+    }
+    c.Op(OpEnd);
+    info.srt_info.walker_func = RegisterWalkerCode(c.bytes.data(), c.bytes.size());
+    info.srt_info.walker_func_size = c.bytes.size();
+    info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
+}
+#endif
 static bool IsReadConstSource(const IR::Value base) {
     auto* inst = base.TryInst();
     if (!inst) {
@@ -875,23 +1136,3 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
 }
 
 } // namespace Shader::Optimization
-
-#else
-
-namespace Shader {
-
-PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
-    UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");
-}
-
-namespace Optimization {
-
-void FlattenExtendedUserdataPass(IR::Program& program) {
-    UNREACHABLE_MSG("FlattenExtendedUserdataPass unimplemented for target architecture.");
-}
-
-} // namespace Optimization
-
-} // namespace Shader
-
-#endif

@@ -49,6 +49,9 @@ struct ImageSpecialization {
     bool is_storage = false;
     bool is_cube = false;
     bool is_srgb = false;
+    /// tlg: a block-compressed 1D image promoted to 2D (AmdGpu::Image::IsBlock1D): its samples
+    /// read the middle row (resource_patching_pass), so a 2D image must not share the permutation.
+    bool is_block1d = false;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
     // FIXME any pipeline cache changes needed?
@@ -136,6 +139,7 @@ struct StageSpecialization {
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                          spec.is_storage = desc.is_written;
                          spec.is_cube = sharp.IsCube();
+                         spec.is_block1d = sharp.IsBlock1D();
                          if (spec.is_storage) {
                              spec.dst_select = sharp.DstSelect();
                          } else {

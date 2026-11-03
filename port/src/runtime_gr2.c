@@ -63,6 +63,9 @@ static ABI int32_t kernel_is_stack(void *address,void **start,void **end) {
     ULONG_PTR low=0, high=0;
     GetCurrentThreadStackLimits(&low,&high);
     base=(void *)low; size=(size_t)(high-low);
+#elif defined(__APPLE__)
+    size=pthread_get_stacksize_np(pthread_self());
+    base=(char *)pthread_get_stackaddr_np(pthread_self())-size;
 #else
     pthread_attr_t attr;
     if (!pthread_getattr_np(pthread_self(),&attr)) {

@@ -17,6 +17,11 @@
 #include <sched.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <pthread.h>
+#include <sys/qos.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 namespace TlgThreads {
@@ -64,6 +69,16 @@ inline unsigned PhysicalCores() {
 inline void MakeBackground() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
 }
+#elif defined(__APPLE__)
+
+inline unsigned Available() { return std::max(1u, std::thread::hardware_concurrency()); }
+/// Performance cores on Apple Silicon (hw.perflevel0), else all cores.
+inline unsigned PhysicalCores() {
+    int n = 0; size_t len = sizeof(n);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &len, nullptr, 0) == 0 && n > 0) return unsigned(n);
+    return Available();
+}
+inline void MakeBackground() { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0); }
 #else
 
 /// Hardware threads available to the process.

@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -141,7 +143,14 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
-    driver->GetPort(handle)->flip_rate = rate;
+    // tlg: TLG_FLIP_RATE=<0|1|2> overrides the game's choice (0: every vblank, 1: every 2nd, ...)
+    s32 used = rate;
+    if (const char* env = std::getenv("TLG_FLIP_RATE"); env && *env) {
+        used = std::atoi(env);
+    }
+    std::printf("VideoOut: sceVideoOutSetFlipRate(%d)%s\n", rate,
+                used != rate ? fmt::format(" -> {} (TLG_FLIP_RATE)", used).c_str() : "");
+    driver->GetPort(handle)->flip_rate = used;
     return ORBIS_OK;
 }
 

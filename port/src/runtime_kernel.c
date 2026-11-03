@@ -12,7 +12,12 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/time.h>
+#ifdef TLG_RECOMP
+uint64_t recomp_rdtsc(void);
+#define __rdtsc() recomp_rdtsc()
+#else
 #include <x86intrin.h>
+#endif
 #ifndef _WIN32
 #include <sys/random.h>
 #include <sys/resource.h>
@@ -293,7 +298,7 @@ static ABI int32_t thread_once(int32_t *once,void (ABI *routine)(void)) {
         int32_t state=__atomic_load_n(once,__ATOMIC_ACQUIRE);
         if (state==1) return 0;
         if (state==0 && __atomic_compare_exchange_n(once,&state,2,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
-            routine();
+            GUEST_CALL0(routine);
             __atomic_store_n(once,1,__ATOMIC_RELEASE);
             return 0;
         }
@@ -344,7 +349,7 @@ void runtime_thread_keys_cleanup(void) {
             void *value=key_values[i];
             if (!value || !keys[i].used || !keys[i].destructor) continue;
             key_values[i]=NULL; any=1;
-            keys[i].destructor(value);
+            GUEST_CALL1(keys[i].destructor, value);
         }
         if (!any) break;
     }

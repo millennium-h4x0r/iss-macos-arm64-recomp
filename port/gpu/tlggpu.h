@@ -16,6 +16,8 @@ typedef struct {
 } TlgGpuConfig;
 /* Registers kernel event queues (needed with or without graphics). */
 void tlggpu_register_kernel(void);
+/* macOS: the process main thread runs the window loop here (never returns). */
+void tlggpu_main_thread_loop(void);
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int tlggpu_init(const TlgGpuConfig *config);
 /* The settings and game identity of tlggpu_init, without a window (shader precompiler). */

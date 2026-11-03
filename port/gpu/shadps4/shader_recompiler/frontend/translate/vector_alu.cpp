@@ -592,6 +592,16 @@ void Translator::V_CNDMASK_B32(const GcnInst& inst) {
     } else {
         mask = GetSrc64(inst.src[2]);
     }
+    const auto plain = [](const InstOperand& op) {
+        return !op.input_modifier.abs && !op.input_modifier.neg;
+    };
+    const bool no_omod =
+        inst.dst[0].output_modifier.multiplier == 0.f && !inst.dst[0].output_modifier.clamp;
+    if (profile.integer_moves && no_omod && plain(inst.src[0]) && plain(inst.src[1])) {
+        SetDst(inst.dst[0], IR::U32{ir.Select(ir.InverseBallot(mask), GetSrc(inst.src[1]),
+                                              GetSrc(inst.src[0]))});
+        return;
+    }
     const IR::Value result = ir.Select(ir.InverseBallot(mask), GetSrc<IR::F32>(inst.src[1]),
                                        GetSrc<IR::F32>(inst.src[0]));
     SetDst(inst.dst[0], IR::U32F32{result});
@@ -862,8 +872,19 @@ void Translator::V_CVT_PKNORM_I16_F32(const GcnInst& inst) {
 }
 
 void Translator::V_CVT_PKRTZ_F16_F32(const GcnInst& inst) {
-    const IR::Value vec_f32 =
-        ir.CompositeConstruct(GetSrc<IR::F32>(inst.src[0]), GetSrc<IR::F32>(inst.src[1]));
+    IR::F32 src0 = GetSrc<IR::F32>(inst.src[0]);
+    IR::F32 src1 = GetSrc<IR::F32>(inst.src[1]);
+    if (profile.pkrtz_saturate) {
+        // tlg: round toward zero: finite values past the half range become +-65504, not Inf
+        // (PackHalf2x16 rounds to nearest). Inf and NaN stay what they are.
+        const auto saturate = [&](IR::F32 v) {
+            const IR::F32 clamped = ir.FPClamp(v, ir.Imm32(-65504.f), ir.Imm32(65504.f));
+            return IR::F32{ir.Select(ir.LogicalOr(ir.FPIsNan(v), ir.FPIsInf(v)), v, clamped)};
+        };
+        src0 = saturate(src0);
+        src1 = saturate(src1);
+    }
+    const IR::Value vec_f32 = ir.CompositeConstruct(src0, src1);
     SetDst(inst.dst[0], ir.Pack2x16(AmdGpu::NumberFormat::Float, vec_f32));
 }
 
@@ -915,6 +936,12 @@ void Translator::V_MIN_F16(const GcnInst& inst) {
 // VOP1
 
 void Translator::V_MOV(const GcnInst& inst) {
+    if (profile.integer_moves && !inst.src[0].input_modifier.abs &&
+        !inst.src[0].input_modifier.neg && inst.dst[0].output_modifier.multiplier == 0.f &&
+        !inst.dst[0].output_modifier.clamp) {
+        SetDst(inst.dst[0], GetSrc(inst.src[0]));
+        return;
+    }
     SetDst(inst.dst[0], GetSrc<IR::F32>(inst.src[0]));
 }
 

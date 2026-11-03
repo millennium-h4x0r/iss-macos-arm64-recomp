@@ -879,7 +879,11 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
                 continue;
             }
             runtime_fault_recover = &recover;
+#ifdef __aarch64__
+            Shader::RunSrtWalker(srt.walker_func, snapshot.user_data, flat.data());
+#else
             srt.walker_func(snapshot.user_data, flat.data());
+#endif
             runtime_fault_recover = nullptr;
             if (std::memcmp(flat.data(), snapshot.flat, snapshot.flat_size * sizeof(u32)) != 0) {
                 u32 first = 0, count = 0;
@@ -3428,6 +3432,10 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     bool color_redirected = false, depth_redirected = false;
     std::pair<u32, u32> guest_extent{1, 1};
     std::pair<vk::ImageView, vk::ImageLayout> original_color{};
+    // tlg: the images behind the attachments, for barrier hoisting (Scheduler::
+    // TryHoistBarriers); a redirected attachment uses another image: unknown.
+    std::array<vk::Image, 9> pass_images{};
+    bool pass_images_known = true;
     const auto& regs = Regs();
     const auto& key = pipeline->GetGraphicsKey();
     if (std::popcount(key.mrt_mask & 0x7f) >= 5 && db_desc.first &&
@@ -3553,6 +3561,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         auto& attachment = state.color_attachments[cb];
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image->backing->state.layout;
+        pass_images[cb] = image->GetImage();
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
 
@@ -3560,11 +3569,13 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             const auto target = scene_targets->Attachment(image_id, desc.view_info);
             attachment.image_view = target.view;
             attachment.image_layout = target.layout;
+            pass_images_known = false;
         }
         image->usage.render_target = 1u;
         if (cb == 0 && upscaler->Enabled()) {
             color_redirected = upscaler->RedirectColor(image_id, desc.view_info, redirect);
             if (color_redirected) {
+                pass_images_known = false;
                 guest_extent = {image->info.size.width, image->info.size.height};
                 original_color = {attachment.image_view, attachment.image_layout};
                 attachment.image_view = redirect.view;
@@ -3628,6 +3639,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         auto& attachment = state.depth_stencil_attachment;
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image.backing->state.layout;
+        pass_images[8] = image.GetImage();
         attachment.clear_value = {};
         attachment.is_clear = 0;
 
@@ -3646,12 +3658,14 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             const auto target = scene_targets->Attachment(image_id, desc.view_info);
             attachment.image_view = target.view;
             attachment.image_layout = target.layout;
+            pass_images_known = false;
         }
         image.usage.depth_target = true;
         if (upscaler->Enabled()) {
             VulkanUpscalerTarget depth_redirect;
             depth_redirected = upscaler->RedirectDepth(image_id, depth_redirect);
             if (depth_redirected) {
+                pass_images_known = false;
                 guest_extent = {image.info.size.width, image.info.size.height};
                 attachment.image_view = depth_redirect.view;
                 attachment.image_layout = depth_redirect.layout;
@@ -3759,7 +3773,12 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     // tlg: object motion vector attachment of G-buffer pipelines.
     if (key.motion_vectors) {
         object_motion->Attach(state, state.width, state.height);
+        pass_images_known = false;
     }
+    if (reduced || color_redirected || depth_redirected) {
+        pass_images_known = false;
+    }
+    scheduler.SetNextRenderImages(state, pass_images, pass_images_known);
     return state;
 }
 

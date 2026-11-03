@@ -106,6 +106,12 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
                 }
             }
         }();
+        if (param.scaled == 1) {
+            return ctx.OpConvertUToF(ctx.F32[1], value);
+        }
+        if (param.scaled == 2) {
+            return ctx.OpConvertSToF(ctx.F32[1], value);
+        }
         return param.is_integer ? ctx.OpBitcast(ctx.F32[1], value) : value;
     }
     if (IR::IsBarycentricCoord(attr) && attr != IR::Attribute::BaryCoordPullModel &&
@@ -397,6 +403,44 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
     ctx.OpStore(pointer, value);
 }
 
+/// tlg (Metal, Profile::buffer_bounds_check): GCN returns 0 for loads past a guest buffer's
+/// num_records and drops such stores; Metal has no robust buffer access, so the shader checks the
+/// element index against the bound range (OpArrayLength, from the buffer size table). Returns
+/// the in-bounds condition (or an invalid Id when no check applies) and clamps `index` to 0
+/// when it is out of bounds, so the access itself stays inside the buffer.
+static Id BoundsCheck(EmitContext& ctx, const EmitContext::BufferDefinition& buffer, Id var,
+                      Id& index) {
+    if (!ctx.profile.buffer_bounds_check || buffer.buffer_type != BufferType::Guest) {
+        return Id{};
+    }
+    const Id length = ctx.OpArrayLength(ctx.U32[1], var, 0u);
+    const Id in_bounds = ctx.OpULessThan(ctx.U1[1], index, length);
+    index = ctx.OpSelect(ctx.U32[1], in_bounds, index, ctx.u32_zero_value);
+    return in_bounds;
+}
+
+/// The loaded value, or zero when the access was out of bounds.
+static Id ZeroIfOutOfBounds(EmitContext& ctx, Id in_bounds, Id type, Id zero, Id value) {
+    return Sirit::ValidId(in_bounds) ? ctx.OpSelect(type, in_bounds, value, zero) : value;
+}
+
+/// Runs `store` only when `in_bounds` holds (always without a check).
+template <typename F>
+static void GuardedStore(EmitContext& ctx, Id in_bounds, F&& store) {
+    if (!Sirit::ValidId(in_bounds)) {
+        store();
+        return;
+    }
+    const Id store_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(in_bounds, store_label, merge_label);
+    ctx.AddLabel(store_label);
+    store();
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 template <u32 N, PointerType alias>
 static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
@@ -407,11 +451,13 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     const auto [id, pointer_type] = spv_buffer.Alias(alias);
 
     boost::container::static_vector<Id, N> ids;
+    const Id zero = alias == PointerType::U32 ? ctx.u32_zero_value : ctx.f32_zero_value;
     for (u32 i = 0; i < N; i++) {
-        const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+        Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+        const Id in_bounds = BoundsCheck(ctx, spv_buffer, id, index_i);
         const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
         const Id result_i = ctx.OpLoad(data_types[1], ptr_i);
-        ids.push_back(result_i);
+        ids.push_back(ZeroIfOutOfBounds(ctx, in_bounds, data_types[1], zero, result_i));
     }
 
     const Id result = N == 1 ? ids[0] : ctx.OpCompositeConstruct(data_types[N], ids);
@@ -424,9 +470,12 @@ Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
+    const Id in_bounds = BoundsCheck(ctx, spv_buffer, id, address);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
     const Id result{ctx.OpLoad(ctx.U8, ptr)};
-    return result;
+    return Sirit::ValidId(in_bounds)
+               ? ctx.OpSelect(ctx.U8, in_bounds, result, ctx.Constant(ctx.U8, 0))
+               : result;
 }
 
 Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
@@ -435,9 +484,12 @@ Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
+    const Id in_bounds = BoundsCheck(ctx, spv_buffer, id, address);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
     const Id result{ctx.OpLoad(ctx.U16, ptr)};
-    return result;
+    return Sirit::ValidId(in_bounds)
+               ? ctx.OpSelect(ctx.U16, in_bounds, result, ctx.Constant(ctx.U16, 0))
+               : result;
 }
 
 Id EmitLoadBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
@@ -498,10 +550,11 @@ static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, I
     const auto [id, pointer_type] = spv_buffer.Alias(alias);
 
     for (u32 i = 0; i < N; i++) {
-        const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+        Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+        const Id in_bounds = BoundsCheck(ctx, spv_buffer, id, index_i);
         const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
         const Id value_i = N == 1 ? value : ctx.OpCompositeExtract(data_types[1], value, i);
-        ctx.OpStore(ptr_i, value_i);
+        GuardedStore(ctx, in_bounds, [&] { ctx.OpStore(ptr_i, value_i); });
     }
 }
 
@@ -511,8 +564,9 @@ void EmitStoreBufferU8(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id v
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
+    const Id in_bounds = BoundsCheck(ctx, spv_buffer, id, address);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-    ctx.OpStore(ptr, value);
+    GuardedStore(ctx, in_bounds, [&] { ctx.OpStore(ptr, value); });
 }
 
 void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id value) {
@@ -521,8 +575,9 @@ void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
+    const Id in_bounds = BoundsCheck(ctx, spv_buffer, id, address);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-    ctx.OpStore(ptr, value);
+    GuardedStore(ctx, in_bounds, [&] { ctx.OpStore(ptr, value); });
 }
 
 void EmitStoreBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {

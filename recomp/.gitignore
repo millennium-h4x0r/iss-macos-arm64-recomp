@@ -1,0 +1,6 @@
+work/
+*.o
+.DS_Store
+# Vendored headers, not committed (repo convention is submodules): simde (github.com/simd-everywhere/simde) and VulkanMemoryAllocator headers (github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) go here.
+third_party/simde/
+third_party/vma/

@@ -8,9 +8,20 @@
 namespace Shader::Backend::SPIRV {
 
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
-    ctx.Decorate(op, spv::Decoration::NoContraction);
+    if (!ctx.profile.fast_fp) {
+        ctx.Decorate(op, spv::Decoration::NoContraction);
+    }
     return op;
 }
+
+namespace {
+Id Max(EmitContext& ctx, Id type, Id a, Id b) {
+    return ctx.profile.nan_min_max ? ctx.OpNMax(type, a, b) : ctx.OpFMax(type, a, b);
+}
+Id Min(EmitContext& ctx, Id type, Id a, Id b) {
+    return ctx.profile.nan_min_max ? ctx.OpNMin(type, a, b) : ctx.OpFMin(type, a, b);
+}
+} // namespace
 
 Id EmitFPAbs32(EmitContext& ctx, Id value) {
     return ctx.OpFAbs(ctx.F32[1], value);
@@ -41,41 +52,41 @@ Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
 }
 
 Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMax(ctx.F32[1], a, b);
+    return Max(ctx, ctx.F32[1], a, b);
 }
 
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMax(ctx.F64[1], a, b);
+    return Max(ctx, ctx.F64[1], a, b);
 }
 
 Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMin(ctx.F32[1], a, b);
+    return Min(ctx, ctx.F32[1], a, b);
 }
 
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMin(ctx.F64[1], a, b);
+    return Min(ctx, ctx.F64[1], a, b);
 }
 
 Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c) {
     if (ctx.profile.supports_trinary_minmax) {
         return ctx.OpFMin3AMD(ctx.F32[1], a, b, c);
     }
-    return ctx.OpFMin(ctx.F32[1], a, ctx.OpFMin(ctx.F32[1], b, c));
+    return Min(ctx, ctx.F32[1], a, Min(ctx, ctx.F32[1], b, c));
 }
 
 Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
     if (ctx.profile.supports_trinary_minmax) {
         return ctx.OpFMax3AMD(ctx.F32[1], a, b, c);
     }
-    return ctx.OpFMax(ctx.F32[1], a, ctx.OpFMax(ctx.F32[1], b, c));
+    return Max(ctx, ctx.F32[1], a, Max(ctx, ctx.F32[1], b, c));
 }
 
 Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
     if (ctx.profile.supports_trinary_minmax) {
         return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
     }
-    const Id mmx{ctx.OpFMin(ctx.F32[1], ctx.OpFMax(ctx.F32[1], a, b), c)};
-    return ctx.OpFMax(ctx.F32[1], ctx.OpFMin(ctx.F32[1], a, b), mmx);
+    const Id mmx{Min(ctx, ctx.F32[1], Max(ctx, ctx.F32[1], a, b), c)};
+    return Max(ctx, ctx.F32[1], Min(ctx, ctx.F32[1], a, b), mmx);
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -149,6 +160,9 @@ Id EmitFPSqrt(EmitContext& ctx, Id value) {
 Id EmitFPSaturate32(EmitContext& ctx, Id value) {
     const Id zero{ctx.ConstF32(f32{0.0})};
     const Id one{ctx.ConstF32(f32{1.0})};
+    if (ctx.profile.nan_min_max) {
+        return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, zero), one);
+    }
     if (Common::Backports::On(Common::Backports::Id::SaturateNan)) {
         // tlg: BP05 (shadPS4 #5257): NaN saturates to 0 like HLSL/DX10_CLAMP (FClamp is
         // undefined for NaN). NClamp(x, lo, hi) == NMin(NMax(x, lo), hi).
@@ -161,6 +175,9 @@ Id EmitFPSaturate32(EmitContext& ctx, Id value) {
 Id EmitFPSaturate64(EmitContext& ctx, Id value) {
     const Id zero{ctx.Constant(ctx.F64[1], f64{0.0})};
     const Id one{ctx.Constant(ctx.F64[1], f64{1.0})};
+    if (ctx.profile.nan_min_max) {
+        return ctx.OpNMin(ctx.F64[1], ctx.OpNMax(ctx.F64[1], value, zero), one);
+    }
     if (Common::Backports::On(Common::Backports::Id::SaturateNan)) {
         Common::Backports::Hit(Common::Backports::Id::SaturateNan);
         return ctx.OpNMin(ctx.F64[1], ctx.OpNMax(ctx.F64[1], value, zero), one);
@@ -169,10 +186,16 @@ Id EmitFPSaturate64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPClamp32(EmitContext& ctx, Id value, Id min_value, Id max_value) {
+    if (ctx.profile.nan_min_max) {
+        return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, min_value), max_value);
+    }
     return ctx.OpFClamp(ctx.F32[1], value, min_value, max_value);
 }
 
 Id EmitFPClamp64(EmitContext& ctx, Id value, Id min_value, Id max_value) {
+    if (ctx.profile.nan_min_max) {
+        return ctx.OpNMin(ctx.F64[1], ctx.OpNMax(ctx.F64[1], value, min_value), max_value);
+    }
     return ctx.OpFClamp(ctx.F64[1], value, min_value, max_value);
 }
 

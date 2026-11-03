@@ -38,8 +38,15 @@ static uint64_t pool_size_bytes(void) {
 #define POOL_SIZE pool_size_bytes()
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
 #define PAGE UINT64_C(16384)
+#ifdef __APPLE__
+/* Apple Silicon: [0xfc0000000, 0x7000000000) holds the commpage and the GPU carveout (as
+ * shadPS4's macOS address space notes), so the PS4 user range starts above it. */
+#define USER_MIN UINT64_C(0x7000000000)
+#define USER_MAX UINT64_C(0xe000000000) /* the recompiled image follows at 0xe000000000 */
+#else
 #define USER_MIN UINT64_C(0x1000000000)
 #define USER_MAX UINT64_C(0xfc00000000)
+#endif
 /* System-reserved window (shim AddressSpace::SystemReservedVirtualBase/Size). Gnm places fixed
  * objects there, e.g. the tessellation factor ring at 0x7f0000000 that The Last Guardian maps by
  * hint and then verifies; an exact free hint in this window is honoured. */
@@ -71,7 +78,7 @@ _Static_assert(sizeof(BatchEntry)==32,"PS4 batch map entry layout");
  * (glibc's default rwlock; rwlock_rp.h on Windows); a thread holding it exclusively skips relocking. */
 /* Windows: winpthreads' rwlock blocks new readers behind a waiting writer, so a nested reader
  * deadlocks with it; rwlock_rp.h has glibc's reader preference. */
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 static RpLock lock=RP_LOCK_INITIALIZER;
 #define table_rdlock() rp_read_lock(&lock)
 #define table_wrlock() rp_write_lock(&lock)
@@ -288,7 +295,15 @@ static int pool(void) {
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (pool_fd>=0) return 0;
+#ifdef __APPLE__
+    {   /* POSIX shared memory plays the memfd's part (unlinked at once: anonymous). */
+        char name[64]; snprintf(name,sizeof(name),"/iss-recomp-%d",(int)getpid());
+        pool_fd=shm_open(name,O_RDWR|O_CREAT|O_EXCL,0600);
+        if (pool_fd>=0) shm_unlink(name);
+    }
+#else
     pool_fd=memfd_create("tlg-guest-memory", MFD_CLOEXEC);
+#endif
     if (pool_fd<0 || ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) return -1;
     void *view=mmap(NULL,POOL_SIZE+FLEX_SPAN,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_NORESERVE,pool_fd,0);
     if (view==MAP_FAILED) return -1;
@@ -306,7 +321,11 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
 static int host_unmap(uintptr_t address, uint64_t size) { return munmap((void *)address,size); }
 static int host_protect(uintptr_t address, uint64_t size, int prot) { return mprotect((void *)address,size,prot); }
 static void host_discard(uint64_t phys, uint64_t size) {
+#ifdef __APPLE__
+    (void)phys; (void)size; /* shared memory pages stay committed until reused */
+#else
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size);
+#endif
 }
 #endif
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
@@ -715,7 +734,14 @@ uintptr_t runtime_memory_resolve(const char *name) {
 }
 /* Host-owned memory the guest can see (image, stacks, trampolines) lives in
  * [LOW_MIN, USER_MIN): PS4 code packs pointers into 40-bit fields. */
+#ifdef __APPLE__
+/* Apple Silicon: above the image (recomp/rt/main.c reserves the window at start). */
+#define LOW_MIN UINT64_C(0xe100000000)
+#define LOW_MAX UINT64_C(0xfc00000000)
+#else
 #define LOW_MIN UINT64_C(0x0800000000)
+#define LOW_MAX USER_MIN
+#endif
 static uintptr_t low_next=LOW_MIN;
 void *runtime_low_map(size_t size, int prot) {
     size=align_up(size,PAGE);
@@ -730,8 +756,13 @@ void *runtime_low_map(size_t size, int prot) {
     return p;
 #else
     void *p=MAP_FAILED;
-    while (low_next+size<=USER_MIN) {
+    while (low_next+size<=LOW_MAX) {
+#ifdef __APPLE__
+        /* the window is reserved PROT_NONE at start (recomp main.c): carve from it */
+        p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+#else
         p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+#endif
         low_next+=size+PAGE; /* unmapped gap catches overruns */
         if (p!=MAP_FAILED) break;
     }

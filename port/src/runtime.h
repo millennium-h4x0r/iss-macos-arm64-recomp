@@ -24,7 +24,18 @@ typedef tlg_jmp_buf sigjmp_buf;
 extern __thread sigjmp_buf *runtime_fault_recover;
 /* Restarts the game (in-game settings menu, render resolution change). */
 void runtime_restart(void);
+#ifdef TLG_RECOMP
+/* Apple Silicon: guest code is recompiled and reaches the runtime through recomp_hostcall, which
+ * passes the System V arguments in the native convention. Guest callbacks go through GUEST_CALLn. */
+#define ABI
+#include "recomp_host.h"
+#else
 #define ABI __attribute__((sysv_abi))
+#define GUEST_CALL0(f) ((f)())
+#define GUEST_CALL1(f, a) ((f)(a))
+#define GUEST_CALL2(f, a, b) ((f)(a, b))
+#define GUEST_CALL3(f, a, b, d) ((f)(a, b, d))
+#endif
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
 uintptr_t runtime_resolve(const char *name, int is_data);

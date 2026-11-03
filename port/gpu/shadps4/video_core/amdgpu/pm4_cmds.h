@@ -808,7 +808,7 @@ struct PM4CmdWriteData {
 
     template <typename T>
     T Address() const {
-        return reinterpret_cast<T>(addr64);
+        return (T)(addr64);
     }
 };
 
