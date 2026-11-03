@@ -242,3 +242,30 @@ stays synchronous. With no MSL cache and a cold system cache (first visit): no c
 The "30 FPS locked" numbers above were windowed: a covered window is composited at 30 Hz.
 Fullscreen (`work/tlg-metal-fs.ini`), cannery route 40-130 s: Metal 49.7 FPS (median 16.7 ms,
 p95 33.3 ms), Vulkan (bundled app, player's fullscreen tlg.ini) 27.5 FPS (median 33.3 ms).
+
+## Mid-frame commits (2026-11-03)
+
+Fullscreen, nothing is saturated (Time Profiler, 20 s of gameplay: game main thread ~25% busy,
+of it ~15% spinning on the previous frame's end-of-pipe label; command processor thread ~21%;
+GPU ~30% above this machine's idle load): the frame time is the chain game -> recording ->
+GPU, and a frame that misses a vblank shows for two. Command buffers were committed only at
+labels; now also at a render pass boundary once 400 draws were recorded
+(`TLG_METAL_COMMIT_DRAWS`, 0 = off), so the GPU starts while the rest of the frame is
+recorded. Cannery route, fullscreen, two rounds each (background GPU load varied between
+rounds): off 51.7 / 45.6 FPS, 400 draws 57.8 / 51.7 (p95 33.3 -> 16.7 ms in the first round,
+frames over 17 ms 16% -> 4%), 1000 draws 39.7 / 48.3, 150 draws 57.2, 250 draws 55.6.
+A small per-program cache of recent lookups did not help (the user data changes on almost
+every draw, so the specialization is rebuilt: ~6% of the command processor thread).
+
+## MSL cache size (2026-11-03)
+
+`metal-msl-cache.bin` is append-only; past 4096 records it is rewritten with the newest 3072 at
+startup (a dropped shader still in use is translated once more and appended again).
+
+## Coverage (2026-11-03)
+
+Cannery, intro, opening up to the mural (7 minutes): no skipped draws or dispatches, no
+tessellation, geometry shader, rect list or MSAA copy. The mural needs its stencil filled:
+the pad file now takes `aim=<yaw>,<pitch>` (degrees) and `tests/play.sh opening` sweeps a grid
+while spraying; it covers most of the stencil but the scene does not advance (gaps remain and
+a second, offset pass paints nothing new), so later areas are not reached by the tests yet.

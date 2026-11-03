@@ -102,6 +102,7 @@ struct Rasterizer::DrawState::Impl {
     std::array<AttachmentKey, 9> pass{}; ///< attachments of the open render pass
     u32 pass_width = 0, pass_height = 0;
     bool pass_open = false;
+    u32 since_commit = 0; ///< draws recorded since the command buffer was last committed
 };
 
 namespace {
@@ -1060,6 +1061,19 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
     id<MTLRenderCommandEncoder> enc = MetalScheduler::Render(scheduler);
     const bool same_pass = enc && d.pass_open && !any_clear &&
                            std::memcmp(pass.data(), d.pass.data(), sizeof(pass)) == 0;
+    // tlg: commit at a pass boundary once enough draws were recorded, so the GPU starts on
+    // them while the command processor records the rest of the frame (the game waits for each
+    // frame's end-of-pipe label: GPU and recording time used to add up). Only between passes:
+    // splitting one would store and reload its tiles. TLG_METAL_COMMIT_DRAWS (0 = off).
+    static const u32 commit_draws = [] {
+        const char* env = std::getenv("TLG_METAL_COMMIT_DRAWS");
+        return env ? u32(std::strtoul(env, nullptr, 0)) : 400u;
+    }();
+    if (!same_pass && commit_draws && d.since_commit >= commit_draws) {
+        scheduler.Flush();
+        d.since_commit = 0;
+    }
+    ++d.since_commit;
     if (!same_pass) {
         if (NanScan::Active()) {
             std::array<id<MTLTexture>, 8> nan_targets{};

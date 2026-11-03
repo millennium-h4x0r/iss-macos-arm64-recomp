@@ -365,6 +365,7 @@ static void load_button_maps(void) {
  *   A notice on screen tells the mode; leaving it puts the controller upright again.
  * TLG_MOTION=off disables real sensors (simulation still works). */
 static int injected_motion; /* TLG_PAD_FILE tokens: 1 tilt_right (T), 2 tilt_left (G), 4 shake (Y) */
+static int injected_aim; static float injected_yaw, injected_pitch; /* TLG_PAD_FILE aim=<yaw>,<pitch> (degrees) */
 static int mouse_shaking;   /* sample_mouse: the mouse is wiggled while the can is held (mouse_shake.h) */
 typedef struct { float w, x, y, z; } Quat;
 /* ref: the real sensors' reference orientation, set by scePadResetOrientation (reset). */
@@ -441,8 +442,12 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
     if ((k && k[SDL_SCANCODE_Y]) || (injected_motion & 4) || mouse_shaking) { shake=1; simulated=1; }
     /* Keyboard: while T or G holds the can on its side, the arrow keys point it (they leave the
      * camera alone meanwhile, see read_pad). */
-    const int key_can=k && (k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G]);
-    if (key_can) {
+    const int key_can=(k && (k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G])) || injected_aim;
+    if (injected_aim) { /* scripted aim (TLG_PAD_FILE): where the can points, as the arrow keys would */
+        motion.yaw=fminf(fmaxf(-injected_yaw*0.0174533f,-1.4f),1.4f);
+        motion.aim_pitch=fminf(fmaxf(injected_pitch*0.0174533f,-1.2f),1.2f);
+    }
+    if (key_can && !injected_aim) {
         const float speed=0.6f*tlggpu_sensor_aim_scale();
         motion.yaw-=(float)(k[SDL_SCANCODE_RIGHT]-k[SDL_SCANCODE_LEFT])*speed*dt;
         motion.aim_pitch+=(float)(k[SDL_SCANCODE_UP]-k[SDL_SCANCODE_DOWN])*speed*dt;
@@ -892,7 +897,8 @@ static void sample_host(PadData *d) {
  * tokens, re-read when it changes: button names (cross circle square triangle l1 r1 l2 r2 l3 r3
  * options touchpad touchpad_left touchpad_right up down left right) are held while listed;
  * touchpad is the left side; lx= ly= rx= ry= (0..255) override the sticks; tilt_right, tilt_left
- * and shake drive the simulated motion sensor (see sample_motion). An empty file
+ * and shake drive the simulated motion sensor (see sample_motion); aim=<yaw>,<pitch> (degrees,
+ * right and up positive) points it, as the arrow keys do while T is held. An empty file
  * releases everything. */
 static struct { uint32_t buttons; int stick[4]; } injected={0,{-1,-1,-1,-1}};
 static int replay_armed;      /* 1 while a TLG_PAD_REPLAY recording plays, 2 once it ended */
@@ -919,6 +925,7 @@ static void read_inject(void) {
     static const char *sticks[]={"lx=","ly=","rx=","ry="};
     injected.buttons=0;
     injected_motion=0;
+    injected_aim=0;
     for (int i=0;i<4;++i) injected.stick[i]=-1;
     char token[64];
     while (fscanf(f,"%63s",token)==1) {
@@ -927,6 +934,7 @@ static void read_inject(void) {
         if (!strcmp(token,"tilt_right")) injected_motion|=1;
         if (!strcmp(token,"tilt_left")) injected_motion|=2;
         if (!strcmp(token,"shake")) injected_motion|=4;
+        if (!strncmp(token,"aim=",4) && sscanf(token+4,"%f,%f",&injected_yaw,&injected_pitch)==2) injected_aim=1;
         for (int i=0;i<4;++i) if (!strncmp(token,sticks[i],3)) { int v=atoi(token+3); injected.stick[i]=v<0 ? 0 : v>255 ? 255 : v; }
     }
     fclose(f);

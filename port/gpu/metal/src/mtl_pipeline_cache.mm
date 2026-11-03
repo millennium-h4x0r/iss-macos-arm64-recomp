@@ -540,7 +540,42 @@ private:
             }
             std::fclose(in);
         }
-        if (valid >= 16) {
+        // Bounded: past kMaxRecords, keep the newest kKeepRecords (records are appended in the
+        // order the shaders were first translated; an older one still in use is translated
+        // again once and appended anew).
+        constexpr size_t kMaxRecords = 4096, kKeepRecords = 3072;
+        if (valid >= 16 && order.size() > kMaxRecords) {
+            const std::string tmp = path + ".tmp";
+            if (FILE* out = std::fopen(tmp.c_str(), "wb")) {
+                const u64 head[2] = {kMagic, kMslCacheVersion};
+                std::fwrite(head, sizeof(head), 1, out);
+                std::vector<u64> kept(order.end() - kKeepRecords, order.end());
+                for (const u64 key : kept) {
+                    const MslResult& r = entries[key];
+                    const u32 rec[6] = {u32(r.msl.size()), u32(r.entry.size()), r.num_buffers,
+                                        r.num_textures, r.num_samplers, r.uses_buffer_sizes ? 1u : 0u};
+                    std::fwrite(&key, sizeof(key), 1, out);
+                    std::fwrite(rec, sizeof(rec), 1, out);
+                    std::fwrite(r.msl.data(), 1, r.msl.size(), out);
+                    std::fwrite(r.entry.data(), 1, r.entry.size(), out);
+                }
+                std::fclose(out);
+                if (std::rename(tmp.c_str(), path.c_str()) == 0) {
+                    std::printf("GPU (Metal): MSL cache compacted: %zu -> %zu shaders\n",
+                                order.size(), kept.size());
+                    std::unordered_map<u64, MslResult> keep_entries;
+                    for (const u64 key : kept) {
+                        keep_entries.emplace(key, std::move(entries[key]));
+                    }
+                    entries = std::move(keep_entries);
+                    order = std::move(kept);
+                    valid = 0; // reopen for appending below
+                    file = std::fopen(path.c_str(), "ab");
+                }
+            }
+        }
+        if (file) {
+        } else if (valid >= 16) {
             truncate(path.c_str(), off_t(valid));
             file = std::fopen(path.c_str(), "ab");
         } else {

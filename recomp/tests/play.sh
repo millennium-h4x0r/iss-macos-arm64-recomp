@@ -55,7 +55,15 @@ step_opening() {
     if (( t >= 40 && t < 70 )); then tap cross
     elif (( t >= 70 && t < 100 )); then pad tilt_right
     elif (( t >= 100 && t < 160 )); then pad tilt_right shake
-    elif (( t >= 160 )); then pad l2 rx=$(( 64 + (t * 37) % 128 )) ry=$(( 64 + (t * 23) % 128 ))
+    elif (( t >= 160 )); then
+        # the mural: spray (L2) with the can on its side, the aim sweeping rows across the
+        # stencil (aim=<yaw>,<pitch> degrees, a 4-degree grid), shaking for a second every 15 s
+        local k=$(( t - 160 )) row yaw off
+        off=$(( (k / 117) % 2 * 2 ))   # every other pass half a step over: fills the gaps
+        row=$(( (k / 13) % 9 )); yaw=$(( (k % 13) * 4 - 24 ))
+        (( (k / 13) % 2 )) && yaw=$(( -yaw ))
+        if (( k % 15 == 14 )); then pad tilt_right shake aim=$(( yaw + off )),$(( 16 - row * 4 - off ))
+        else pad l2 tilt_right aim=$(( yaw + off )),$(( 16 - row * 4 - off )); fi
     fi
 }
 step_intro() {   # press Continue once at the title, then watch the intro movie untouched
