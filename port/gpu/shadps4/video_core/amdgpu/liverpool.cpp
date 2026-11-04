@@ -371,6 +371,22 @@ void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
 void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* header = reinterpret_cast<const PM4Header*>(data);
     const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(data);
+#ifdef TLG_METAL
+    // tlg: after a DMA_DATA the GPU has not run yet: written when it has (in order).
+    {
+        const u32 bytes = (header->type3.count.Value() - 2) * sizeof(u32);
+        std::vector<u32> payload(write_data->data, write_data->data + bytes / sizeof(u32));
+        const u64 address = write_data->Address<u64>();
+        if (rasterizer.DeferWriteAfterCopy([address, payload = std::move(payload)] {
+                TlgWriteLog::Note(address, payload.data(), payload.size() * sizeof(u32),
+                                  TlgWriteLog::WriteData);
+                std::memcpy(reinterpret_cast<void*>(address), payload.data(),
+                            payload.size() * sizeof(u32));
+            })) {
+            return;
+        }
+    }
+#endif
     // Copies deferred to the recording thread, and fences deferred to it (RecorderFences),
     // precede writes the guest sees.
     rasterizer.WaitHostCopies();
@@ -412,6 +428,40 @@ struct ComputeReleaseMem {
 // tlg: a compute queue's end-of-pipe fence, after the draws and dispatches handed over before it.
 void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto& task = *reinterpret_cast<const ComputeReleaseMem*>(data);
+#ifdef TLG_METAL
+    // tlg: the label (and its interrupt) when the GPU has run the dispatches before it, as the
+    // graphics end-of-pipe fences (DeferUnifiedFence). Written when recorded, the game saw its
+    // compute work done before it ran and read a stale GPU particle count (inFAMOUS: GDS 0x404,
+    // copied by the GDS store before the label), so its fires died every few seconds. A GDS
+    // store records its GPU copy now. TLG_METAL_COMPUTE_FENCE_NOW=1: the old way.
+    static const bool fence_now = [] {
+        const char* v = std::getenv("TLG_METAL_COMPUTE_FENCE_NOW");
+        return v && v[0] == '1';
+    }();
+    if (!fence_now) {
+        rasterizer.WaitHostCopies();
+        rasterizer.ProcessDownloadImages();
+        const auto* packet = reinterpret_cast<const PM4CmdReleaseMem*>(task.packet);
+        const u32 pipe_id = task.pipe_id;
+        const auto irq = [pipe_id] {
+            Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+        };
+        if (packet->data_sel.Value() == DataSelect::GdsMemStore) {
+            packet->SignalFence(
+                [&rasterizer, irq] { rasterizer.DeferUnifiedFence([irq] { irq(); }); },
+                [&rasterizer](VAddr dst, u16 gds_index, u16 num_dwords) {
+                    rasterizer.CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+                });
+            return;
+        }
+        ComputeReleaseMem copy = task;
+        rasterizer.DeferUnifiedFence([copy, irq] {
+            reinterpret_cast<const PM4CmdReleaseMem*>(copy.packet)->SignalFence(
+                irq, [](VAddr, u16, u16) {});
+        });
+        return;
+    }
+#endif
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();
     rasterizer.ProcessDownloadImages();
@@ -1391,6 +1441,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                     break;
                 }
+                if (static const u64 watch = [] {
+                        const char* v = std::getenv("TLG_METAL_WATCH_ADDR");
+                        return v ? std::strtoull(v, nullptr, 16) : 0ull;
+                    }();
+                    watch && (dma_data->dst_sel == DmaDataDst::Memory ||
+                              dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    const u64 a = dma_data->DstAddress<VAddr>();
+                    if (watch >= a && watch < a + dma_data->NumBytes()) {
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 200) {
+                            std::printf("watch %#llx: gfx DMA_DATA to %#llx %u bytes src_sel %u src %#llx\n",
+                                        (unsigned long long)watch, (unsigned long long)a, dma_data->NumBytes(),
+                                        u32(dma_data->src_sel), (unsigned long long)dma_data->SrcAddress<VAddr>());
+                        }
+                    }
+                }
                 if (rasterizer->RunInOrder(&RunDmaData, dma_data, sizeof(PM4DmaData),
                                            TlgToggle::PipelinedMemoryWrites) &&
                     (dma_data->dst_sel == DmaDataDst::Memory ||
@@ -1404,6 +1470,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 ASSERT(!write_data->wr_one_addr.Value());
+                // tlg diagnosis: TLG_METAL_WATCH_ADDR=<hex>: WRITE_DATA packets covering it.
+                if (static const u64 watch = [] {
+                        const char* v = std::getenv("TLG_METAL_WATCH_ADDR");
+                        return v ? std::strtoull(v, nullptr, 16) : 0ull;
+                    }();
+                    watch) {
+                    const u64 a = write_data->Address<u64>();
+                    const u64 n = (count - 2) * sizeof(u32);
+                    if (watch >= a && watch < a + n) {
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 200) {
+                            std::printf("watch %#llx: gfx WRITE_DATA at %#llx %llu bytes, dword there %u\n",
+                                        (unsigned long long)watch, (unsigned long long)a,
+                                        (unsigned long long)n, write_data->data[(watch - a) / 4]);
+                        }
+                    }
+                }
                 if (rasterizer) {
                     // In order with the draws (on the draw recording thread when in use).
                     TlgWriteLog::NoteIntent(write_data->Address<u64>(), write_data->data,

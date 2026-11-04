@@ -49,6 +49,8 @@ struct Rasterizer::DrawState {
     u64 dispatches = 0;
     u64 skipped_dispatches = 0;
     u64 passes = 0;
+    u64 draw_barriers = 0;
+    u64 noop_draws = 0; ///< no attachments, no memory writes: nothing to see (not recorded)
     u64 indirect_draws = 0;
     u64 unaligned_vertex_buffers = 0;
     u64 indirect_dispatches = 0;

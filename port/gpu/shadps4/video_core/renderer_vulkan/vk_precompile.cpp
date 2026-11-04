@@ -602,6 +602,7 @@ Precompile::Result PipelineCache::Precompile(
         caches.push_back(std::move(cache));
     }
     const auto build = [this, &caches](BuildJob& job, unsigned index) {
+        Shader::Info::replay_flats_used.store(true, std::memory_order_relaxed);
         Shader::Info::replay_flats = &job.flats;
         try {
             const Common::ScopedAssertThrows recoverable;
@@ -688,6 +689,7 @@ Precompile::Result PipelineCache::Precompile(
         for (const auto& stage : record.stages) {
             flats[stage.hash] = stage.flat;
         }
+        Shader::Info::replay_flats_used.store(true, std::memory_order_relaxed);
         Shader::Info::replay_flats = &flats;
         PipelineSelection selection{};
         selection.sync_compile = true;

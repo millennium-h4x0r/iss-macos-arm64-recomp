@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <vector>
 #include <optional>
 #include <string>
 #include "common/backports.h"
@@ -289,6 +291,27 @@ static LaneOpCensus CountLaneOps(IR::Program& program) {
     return census;
 }
 
+// tlg: TLG_RFL_SHADERS=<hex>[,<hex>...]: lower wave64 ReadFirstLane in these compute shaders
+// only (as TLG_RFL_ALL does for all); for finding the shaders that need it.
+static bool RflListed(u64 hash) {
+    static const std::vector<u64> list = [] {
+        std::vector<u64> out;
+        if (const char* env = std::getenv("TLG_RFL_SHADERS")) {
+            for (const char* p = env; *p;) {
+                char* end = nullptr;
+                const u64 v = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                out.push_back(v);
+                p = *end == ',' ? end + 1 : end;
+            }
+        }
+        return out;
+    }();
+    return std::ranges::contains(list, hash);
+}
+
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute) {
@@ -383,7 +406,8 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
                 push_worklist(inst);
             } else if (inst.GetOpcode() == IR::Opcode::ReadFirstLane && is_uniform &&
                        (lane_math ||
-                        (Toggles::ReadFirstLaneAll() && !IsProvablyWaveUniform(inst.Arg(0))))) {
+                        ((Toggles::ReadFirstLaneAll() || RflListed(program.info.pgm_hash)) &&
+                         !IsProvablyWaveUniform(inst.Arg(0))))) {
                 // tlg: append pattern: the wave counts its items (ballot / prefix mask), one
                 // lane reserves space with an atomic and ReadFirstLane broadcasts the base.
                 // On 32-wide hardware the second half read its own first lane, which never

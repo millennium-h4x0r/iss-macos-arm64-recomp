@@ -944,8 +944,15 @@ static void read_inject(void) {
 /* TLG_PAD_RECORD=<file>: F9 starts and stops recording the pad state (gamepad or keyboard) with
  * the time since F9; TLG_PAD_REPLAY=<file> plays such a recording back, started by the token
  * "replay" in TLG_PAD_FILE (scripted tests repeat a route the player ran once). Lines: ms buttons
- * lx ly rx ry l2 r2, written when the state changes. */
-typedef struct { uint32_t ms, buttons; uint8_t axes[4], l2, r2; } PadSample;
+ * lx ly rx ry l2 r2, then (tlg: since motion scenes such as the spray can were recorded) the
+ * motion the game saw: orientation x y z w, acceleration x y z, angular velocity x y z, and the
+ * touches: count, x y id of each. Written when the state changes (motion: at most every 10 ms).
+ * Lines with the first 8 fields only (older recordings) replay without motion. */
+typedef struct {
+    uint32_t ms, buttons; uint8_t axes[4], l2, r2;
+    int has_motion; float motion[10];
+    uint8_t touch_count; PadTouch touches[2];
+} PadSample;
 static FILE *record_file;
 static uint64_t record_start;
 static PadSample record_last;
@@ -1008,12 +1015,30 @@ static void record_sample(const PadData *d) {
     f9_was_down=f9;
     if (!record_file) return;
     PadSample s={(uint32_t)((now_us()-record_start)/1000),d->buttons,
-                 {d->left_x,d->left_y,d->right_x,d->right_y},d->l2,d->r2};
-    if (s.buttons==record_last.buttons && !memcmp(s.axes,record_last.axes,4) &&
-        s.l2==record_last.l2 && s.r2==record_last.r2) return;
+                 {d->left_x,d->left_y,d->right_x,d->right_y},d->l2,d->r2,1,{0},0,{{0}}};
+    memcpy(s.motion,d->orientation,sizeof(d->orientation));
+    memcpy(s.motion+4,d->acceleration,sizeof(d->acceleration));
+    memcpy(s.motion+7,d->angular_velocity,sizeof(d->angular_velocity));
+    s.touch_count=d->touch_count>2 ? 2 : d->touch_count;
+    for (int i=0;i<s.touch_count;++i) s.touches[i]=d->touches[i];
+    const int same_keys=s.buttons==record_last.buttons && !memcmp(s.axes,record_last.axes,4) &&
+                        s.l2==record_last.l2 && s.r2==record_last.r2;
+    int same_touch=s.touch_count==record_last.touch_count;
+    for (int i=0;same_touch && i<s.touch_count;++i)
+        same_touch=s.touches[i].x==record_last.touches[i].x && s.touches[i].y==record_last.touches[i].y &&
+                   s.touches[i].id==record_last.touches[i].id;
+    float moved=0;
+    for (int i=0;i<10;++i) moved=fmaxf(moved,fabsf(s.motion[i]-record_last.motion[i]));
+    const int same_motion=moved<1e-3f || s.ms-record_last.ms<10;
+    if (same_keys && same_touch && same_motion) return;
     record_last=s;
-    fprintf(record_file,"%u %u %u %u %u %u %u %u\n",s.ms,s.buttons,s.axes[0],s.axes[1],s.axes[2],
+    fprintf(record_file,"%u %u %u %u %u %u %u %u",s.ms,s.buttons,s.axes[0],s.axes[1],s.axes[2],
             s.axes[3],s.l2,s.r2);
+    for (int i=0;i<10;++i) fprintf(record_file," %.5g",s.motion[i]);
+    fprintf(record_file," %u",s.touch_count);
+    for (int i=0;i<s.touch_count;++i)
+        fprintf(record_file," %u %u %u",s.touches[i].x,s.touches[i].y,s.touches[i].id);
+    fputc('\n',record_file);
     fflush(record_file);
 }
 static PadSample *replay; static size_t replay_count, replay_next;
@@ -1041,9 +1066,27 @@ static void replay_sample(PadData *d) {
             loaded=1;
             const char *path=getenv("TLG_PAD_REPLAY");
             FILE *f=path ? fopen(path,"r") : NULL;
-            PadSample s; unsigned v[8]; size_t cap=0;
-            while (f && fscanf(f,"%u %u %u %u %u %u %u %u",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7])==8) {
-                s=(PadSample){v[0],v[1],{(uint8_t)v[2],(uint8_t)v[3],(uint8_t)v[4],(uint8_t)v[5]},(uint8_t)v[6],(uint8_t)v[7]};
+            PadSample s; unsigned v[8]; size_t cap=0; char line[512];
+            while (f && fgets(line,sizeof(line),f)) {
+                int used=0;
+                if (sscanf(line,"%u %u %u %u %u %u %u %u%n",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7],&used)!=8) continue;
+                memset(&s,0,sizeof(s));
+                s.ms=v[0]; s.buttons=v[1];
+                for (int i=0;i<4;++i) s.axes[i]=(uint8_t)v[2+i];
+                s.l2=(uint8_t)v[6]; s.r2=(uint8_t)v[7];
+                const char *p=line+used; int n=0, got=0;
+                for (int i=0;i<10 && sscanf(p,"%f%n",&s.motion[i],&n)==1;++i,p+=n) ++got;
+                if (got==10) {
+                    unsigned count=0, tx, ty, tid;
+                    s.has_motion=1;
+                    if (sscanf(p,"%u%n",&count,&n)==1) {
+                        p+=n;
+                        for (unsigned i=0;i<count && i<2 && sscanf(p,"%u %u %u%n",&tx,&ty,&tid,&n)==3;++i,p+=n) {
+                            s.touches[i]=(PadTouch){(uint16_t)tx,(uint16_t)ty,(uint8_t)tid,{0}};
+                            s.touch_count=(uint8_t)(i+1);
+                        }
+                    }
+                }
                 if (replay_count==cap && !(replay=realloc(replay,(cap=cap ? cap*2 : 1024)*sizeof(*replay)))) break;
                 replay[replay_count++]=s;
             }
@@ -1064,6 +1107,13 @@ static void replay_sample(PadData *d) {
     d->buttons=s->buttons;
     d->left_x=s->axes[0]; d->left_y=s->axes[1]; d->right_x=s->axes[2]; d->right_y=s->axes[3];
     d->l2=s->l2; d->r2=s->r2;
+    if (s->has_motion) {
+        memcpy(d->orientation,s->motion,sizeof(d->orientation));
+        memcpy(d->acceleration,s->motion+4,sizeof(d->acceleration));
+        memcpy(d->angular_velocity,s->motion+7,sizeof(d->angular_velocity));
+        d->touch_count=s->touch_count;
+        for (int i=0;i<s->touch_count;++i) d->touches[i]=s->touches[i];
+    }
 }
 /* After the menu or the text dialog closes, buttons still held (the Cross that accepted a
  * name) stay hidden until released: the game would take them as a new press. */

@@ -11,6 +11,8 @@
 #include <string>
 #include <cstdlib>
 #include <unordered_map>
+#include <chrono>
+#include <atomic>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -363,7 +365,16 @@ void FlushPass(Scheduler& scheduler) {
 bool Enabled() {
     static const bool on = [] {
         const char* v = std::getenv("TLG_METAL_NAN_SCAN");
-        return v && (*v == '1' || *v == '2');
+        return v && (*v == '1' || *v == '2' || *v == '3');
+    }();
+    return on;
+}
+
+/// TLG_METAL_NAN_SCAN=3: every frame (no dump needed), only the frames with hits are printed.
+static bool EveryFrame() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_NAN_SCAN");
+        return v && *v == '3';
     }();
     return on;
 }
@@ -427,15 +438,20 @@ void EndFrame(Scheduler& scheduler, bool next_active) {
                                     c[i * 4 + 3] & 0xFFFF, c[i * 4 + 3] >> 16);
                     }
                 }
-                std::printf("NaN scan frame %llu: %zu scans, %u with NaN/Inf\n",
-                            (unsigned long long)frame, labels->size(), hits);
+                if (hits || !EveryFrame() || frame % 600 == 0) {
+                    static const auto t0 = std::chrono::steady_clock::now();
+                    std::printf("NaN scan frame %llu (t=%.2f): %zu scans, %u with NaN/Inf\n",
+                                (unsigned long long)frame,
+                                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                                labels->size(), hits);
+                }
             });
         }
         g.counts = nil;
         g.labels.clear();
     }
     ++g.frame;
-    g.active = next_active;
+    g.active = next_active || EveryFrame();
 }
 } // namespace NanScan
 
@@ -494,6 +510,10 @@ void Rasterizer::DrawState::OnSubmit() {
                 (unsigned long long)no_pipeline, (unsigned long long)unsupported_primitive,
                 (unsigned long long)dispatches, (unsigned long long)skipped_dispatches,
                 (unsigned long long)passes);
+    if (MetalScheduler::PassStatsEnabled()) {
+        std::printf("GPU (Metal): render passes ended by%s; %llu draws without effect skipped\n",
+                    MetalScheduler::TakeRenderBreaks().c_str(), (unsigned long long)noop_draws);
+    }
     std::string prims;
     for (u32 i = 0; i < 32; ++i) {
         if (prim_counts[i]) {
@@ -507,14 +527,14 @@ void Rasterizer::DrawState::OnSubmit() {
     }
     if (!prims.empty() || indirect_draws) {
         std::printf("GPU (Metal): skipped primitives (type:count)%s; indirect draws %llu, "
-                    "indirect dispatches %llu\n",
+                    "indirect dispatches %llu, draw barriers %llu\n",
                     prims.c_str(), (unsigned long long)indirect_draws,
-                    (unsigned long long)indirect_dispatches);
+                    (unsigned long long)indirect_dispatches, (unsigned long long)draw_barriers);
     }
     prim_counts = {};
-    indirect_draws = indirect_dispatches = 0;
+    indirect_draws = indirect_dispatches = draw_barriers = 0;
     draws = skipped_draws = dispatches = skipped_dispatches = 0;
-    no_pipeline = unsupported_primitive = passes = 0;
+    no_pipeline = unsupported_primitive = passes = noop_draws = 0;
 }
 
 /// Resources of one stage, ready to bind. Unretained: the caches own every object for the
@@ -530,6 +550,7 @@ struct StageBindings {
     std::array<__unsafe_unretained id<MTLSamplerState>, 16> samplers;
     u32 num_buffers = 0, num_textures = 0, num_samplers = 0;
     bool writes_memory = false;
+    bool writes_images = false; ///< binds a storage image
 };
 
 /// Collects the resources of `stage` (texture cache and buffer cache work happens here, before
@@ -543,18 +564,31 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
     u32 slot = 0;
     for (u32 i = 0; i < info.buffers.size() && slot < 28; ++i, ++slot) {
         const auto& desc = info.buffers[i];
-        id<MTLBuffer> buffer = d.dummy_buffer;
+        // Unretained (as StageBindings): the caches own them; ARC traffic was ~3% of the
+        // command processor thread.
+        __unsafe_unretained id<MTLBuffer> buffer = d.dummy_buffer;
         u64 offset = 0;
         u32 size = 64 * 1024;
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
-                buffer = Metal::Buffer(draw_state->gds->Handle());
+                // Diagnosis: TLG_METAL_LOG_GDS=1: the shaders that bind GDS (each once).
+                if (static const bool log_gds = std::getenv("TLG_METAL_LOG_GDS") != nullptr; log_gds) {
+                    static std::mutex m;
+                    static std::vector<u64> seen;
+                    std::scoped_lock lk{m};
+                    if (std::find(seen.begin(), seen.end(), info.pgm_hash) == seen.end()) {
+                        seen.push_back(info.pgm_hash);
+                        std::printf("GDS user: shader %016llx stage %u\n", (unsigned long long)info.pgm_hash,
+                                    u32(info.hw_stage));
+                    }
+                }
+                buffer = (__bridge id<MTLBuffer>)Metal::Raw(draw_state->gds->Handle());
                 size = u32(draw_state->gds->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& stream = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = u32(info.FlatUserData().size() * sizeof(u32));
                 offset = stream.Copy(info.FlatUserData().data(), std::max<u32>(ubo_size, 4), 16);
-                buffer = Metal::Buffer(stream.Handle());
+                buffer = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
                 size = ubo_size;
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 auto& stream = buffer_cache.GetStreamBuffer();
@@ -567,7 +601,7 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
                     planes[p * 4 + 3] = std::bit_cast<float>(plane.data_w);
                 }
                 offset = stream.Copy(planes.data(), sizeof(planes), 16);
-                buffer = Metal::Buffer(stream.Handle());
+                buffer = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
                 size = sizeof(planes);
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& stream = buffer_cache.GetStreamBuffer();
@@ -576,7 +610,7 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
                 const auto [data, off] = stream.Map(std::max<u32>(lds_size, 16), 16);
                 std::memset(data, 0, lds_size);
                 stream.Commit();
-                buffer = Metal::Buffer(stream.Handle());
+                buffer = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
                 offset = off;
                 size = lds_size;
             }
@@ -587,6 +621,22 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
                 const u64 bytes = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 const auto [vb, voff] =
                     buffer_cache.ObtainBuffer(vsharp.base_address, bytes, desc.is_written);
+                // Diagnosis: TLG_METAL_WATCH_ADDR=<hex guest address>: the shaders that bind a
+                // written buffer covering it (first 400).
+                static const u64 watch = [] {
+                    const char* v = std::getenv("TLG_METAL_WATCH_ADDR");
+                    return v ? std::strtoull(v, nullptr, 16) : 0ull;
+                }();
+                if (watch && desc.is_written && watch >= vsharp.base_address &&
+                    watch < vsharp.base_address + bytes) {
+                    static std::atomic<u32> watched{0};
+                    if (watched.fetch_add(1) < 400) {
+                        std::printf("watch %#llx: shader %016llx stage %u buffer %u base %#llx size %llu (+%llu)\n",
+                                    (unsigned long long)watch, (unsigned long long)info.pgm_hash, u32(info.hw_stage), i,
+                                    (unsigned long long)vsharp.base_address, (unsigned long long)bytes,
+                                    (unsigned long long)(watch - vsharp.base_address));
+                    }
+                }
                 static int buffer_logs = 0;
                 static const int max_buffer_logs = [] {
                     const char* v = std::getenv("TLG_METAL_LOG_BUFFERS");
@@ -595,7 +645,7 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
                 if (buffer_logs < max_buffer_logs) {
                     ++buffer_logs;
                     const float* f = reinterpret_cast<const float*>(vsharp.base_address);
-                    id<MTLBuffer> mb = Metal::Buffer(vb->Handle());
+                    id<MTLBuffer> mb = (__bridge id<MTLBuffer>)Metal::Raw(vb->Handle());
                     const float* g = reinterpret_cast<const float*>(static_cast<const u8*>(mb.contents) + voff);
                     std::printf("  buffer %u: %#llx size %llu -> mtl %p (cpu %#llx len %llu) off %llu: "
                                 "guest %g %g %g %g mtl %g %g %g %g\n",
@@ -606,7 +656,7 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
                 }
                 const u64 aligned = voff & ~u64(3);
                 push_data.AddOffset(binding.buffer, u32(voff - aligned));
-                buffer = Metal::Buffer(vb->Handle());
+                buffer = (__bridge id<MTLBuffer>)Metal::Raw(vb->Handle());
                 offset = aligned;
                 size = u32(bytes + (voff - aligned));
                 if (desc.is_written) {
@@ -628,7 +678,7 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
         const auto tsharp = image_desc.GetSharp(info);
         const u32 num_bindings = image_desc.NumBindings(info);
         for (u32 n = 0; n < num_bindings && tslot < out.textures.size(); ++n, ++tslot) {
-            id<MTLTexture> texture = nil;
+            __unsafe_unretained id<MTLTexture> texture = nil;
             if (tsharp.Address() != 0 &&
                 tsharp.GetDataFmt() != AmdGpu::DataFormat::FormatInvalid &&
                 memory->IsValidGpuMapping(tsharp.Address(), 0)) {
@@ -688,9 +738,10 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
                     }
                 }
                 const bool storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+                out.writes_images |= storage;
                 image->usage.storage |= storage;
                 image->usage.texture |= !storage;
-                texture = Metal::Texture(*view.image_view);
+                texture = (__bridge id<MTLTexture>)Metal::Raw(*view.image_view);
             }
             if (!texture) {
                 static std::atomic<u32> dummy_logs{0};
@@ -720,7 +771,7 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
         vk::Sampler vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base,
                                                           sampler.is_depth, 0.0f);
         if (sslot < out.samplers.size()) {
-            id<MTLSamplerState> s = Metal::SamplerState(vk_sampler);
+            __unsafe_unretained id<MTLSamplerState> s = (__bridge id<MTLSamplerState>)Metal::Raw(vk_sampler);
             out.samplers[sslot++] = s ? s : d.dummy_sampler;
         }
         ++binding.unified;
@@ -811,7 +862,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
 
     // Render targets (before resources: both may record transfers).
     struct Target {
-        id<MTLTexture> texture = nil;
+        __unsafe_unretained id<MTLTexture> texture = nil; ///< unretained: the caches own it
         u32 level = 0, slice = 0;
         bool clear = false;
         vk::ClearValue clear_value{};
@@ -843,7 +894,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             t.clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
         }
         // The view (its format is the color buffer's); a real view starts at its level/slice.
-        t.texture = Metal::Texture(*view.image_view);
+        t.texture = (__bridge id<MTLTexture>)Metal::Raw(*view.image_view);
         const bool is_view = t.texture.parentTexture != nil;
         t.level = is_view ? 0 : mip;
         t.slice = is_view ? 0 : slice;
@@ -870,7 +921,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
                       texture_cache.IsMetaCleared(htile, slice);
         stencil_clear = regs.depth_render_control.stencil_clear_enable;
         texture_cache.TouchMeta(htile, slice, false);
-        depth.texture = Metal::Texture(*view.image_view);
+        depth.texture = (__bridge id<MTLTexture>)Metal::Raw(*view.image_view);
         depth.slice = depth.texture.parentTexture != nil ? 0 : slice;
         image.usage.depth_target = true;
         image.flags |= VideoCore::ImageFlagBits::GpuModified;
@@ -887,10 +938,12 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
     Shader::Backend::Bindings binding{};
     std::array<StageBindings, MaxShaderStages> stage_bindings;
     bool writes_memory = false;
+    bool writes_images = false;
     for (u32 i = 0; i < MaxShaderStages; ++i) {
         if (pipeline->stages[i].info) {
             BindStage(pipeline->stages[i], binding, push_data, stage_bindings[i]);
             writes_memory |= stage_bindings[i].writes_memory;
+            writes_images |= stage_bindings[i].writes_images;
         }
     }
 
@@ -912,7 +965,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             if (sharp.base_address != 0 && sharp.GetSize() != 0) {
                 const u64 bytes = memory->ClampRangeSize(sharp.base_address, sharp.GetSize());
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(sharp.base_address, bytes, false);
-                vb.buffer = Metal::Buffer(buffer->Handle());
+                vb.buffer = (__bridge id<MTLBuffer>)Metal::Raw(buffer->Handle());
                 vb.offset = offset;
                 // The skinned characters use 2-byte aligned vertex buffer offsets. Metal's
                 // validation wants 4, but Apple GPUs fetch vertices in shader code and read them
@@ -927,7 +980,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
                     auto& stream = buffer_cache.GetStreamBuffer();
                     const auto [data, copy_offset] = stream.Map(Common::AlignUp(bytes, 4) + 4, 16);
                     stream.Commit();
-                    id<MTLBuffer> copy = Metal::Buffer(stream.Handle());
+                    id<MTLBuffer> copy = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
                     draw_state->CopyBytes(scheduler, vb.buffer, offset, copy, copy_offset, bytes);
                     vb.buffer = copy;
                     vb.offset = copy_offset;
@@ -949,7 +1002,8 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             }
         }
         static const bool all_textures = DebugFlag("TLG_METAL_DUMP_ALL_TEX");
-        if ((skinned || (collect_targets && all_textures)) && frame_targets.size() < 200) {
+        static const bool no_textures = DebugFlag("TLG_METAL_DUMP_NO_TEX"); // pass snapshots only
+        if (!no_textures && (skinned || (collect_targets && all_textures)) && frame_targets.size() < 200) {
             const auto& fs = stage_bindings[u32(SwStage::Fragment)];
             for (u32 t = 0; t < fs.num_textures; ++t) {
                 id<MTLTexture> tex = fs.textures[t];
@@ -971,7 +1025,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
     }
 
     // Index buffer.
-    id<MTLBuffer> index_buffer = nil;
+    __unsafe_unretained id<MTLBuffer> index_buffer = nil;
     u64 index_buffer_offset = 0;
     MTLIndexType index_type = MTLIndexTypeUInt16;
     if (is_indexed) {
@@ -981,7 +1035,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         const VAddr address = regs.index_base_address.Address<VAddr>() + index_offset * index_size;
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(address, u64(regs.num_indices) * index_size, false);
-        index_buffer = Metal::Buffer(buffer->Handle());
+        index_buffer = (__bridge id<MTLBuffer>)Metal::Raw(buffer->Handle());
         index_buffer_offset = offset;
         static const bool copy_indices = [] {
             const char* env = std::getenv("TLG_METAL_COPY_INDICES");
@@ -993,26 +1047,26 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             const u64 bytes = u64(regs.num_indices) * index_size;
             index_buffer_offset =
                 stream.Copy(reinterpret_cast<const void*>(address), std::max<u64>(bytes, 4), 4);
-            index_buffer = Metal::Buffer(stream.Handle());
+            index_buffer = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
         }
     }
 
     // Indirect arguments (guest memory); a draw count clamps them into a copy first.
-    id<MTLBuffer> args_buffer = nil;
+    __unsafe_unretained id<MTLBuffer> args_buffer = nil;
     u64 args_offset = 0;
     if (indirect) {
         const u64 bytes = u64(indirect->stride) * indirect->max_count;
         const auto [buffer, offset] = buffer_cache.ObtainBuffer(indirect->args, bytes, false);
-        args_buffer = Metal::Buffer(buffer->Handle());
+        args_buffer = (__bridge id<MTLBuffer>)Metal::Raw(buffer->Handle());
         args_offset = offset;
         if (indirect->count) {
             const auto [count_buffer, count_offset] = buffer_cache.ObtainBuffer(indirect->count, 4, false);
             auto& stream = buffer_cache.GetStreamBuffer();
             const auto [data, copy_offset] = stream.Map(bytes, 16);
             stream.Commit();
-            id<MTLBuffer> copy = Metal::Buffer(stream.Handle());
+            id<MTLBuffer> copy = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
             draw_state->ClampIndirect(scheduler, args_buffer, args_offset,
-                                      Metal::Buffer(count_buffer->Handle()), count_offset, copy,
+                                      (__bridge id<MTLBuffer>)Metal::Raw(count_buffer->Handle()), count_offset, copy,
                                       copy_offset, indirect->stride, indirect->max_count);
             args_buffer = copy;
             args_offset = copy_offset;
@@ -1027,13 +1081,13 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         auto& stream = buffer_cache.GetStreamBuffer();
         const auto [args_data, new_args_offset] = stream.Map(max_count * 20, 16);
         stream.Commit();
-        id<MTLBuffer> new_args = Metal::Buffer(stream.Handle());
-        id<MTLBuffer> new_indices = nil;
+        __unsafe_unretained id<MTLBuffer> new_args = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
+        __unsafe_unretained id<MTLBuffer> new_indices = nil;
         u64 new_indices_offset = 0;
         if (is_indexed) {
             const auto [idx_data, idx_offset] = stream.Map(u64(max_quads) * 6 * 4 * max_count, 16);
             stream.Commit();
-            new_indices = Metal::Buffer(stream.Handle());
+            new_indices = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
             new_indices_offset = idx_offset;
         } else {
             new_indices = draw_state->QuadIndices(max_quads);
@@ -1042,6 +1096,37 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
                                         max_count, is_indexed, index_buffer, index_buffer_offset,
                                         index_type == MTLIndexTypeUInt16, max_quads, new_args,
                                         new_args_offset, new_indices, new_indices_offset);
+        // Diagnosis: TLG_METAL_LOG_INDIRECT=<ps hash>: the guest and converted arguments of that
+        // shader's indirect quad draws, read back when the GPU is done (200 at most).
+        static const u64 log_ind = [] {
+            const char* v = std::getenv("TLG_METAL_LOG_INDIRECT");
+            return v ? std::strtoull(v, nullptr, 16) : 0ull;
+        }();
+        if (log_ind && pipeline->Stage(SwStage::Fragment) &&
+            u32(pipeline->Stage(SwStage::Fragment)->pgm_hash) == u32(log_ind)) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1) < 5000) {
+                id<MTLBuffer> src = args_buffer, dst = new_args;
+                const u64 so = args_offset, dof = new_args_offset;
+                const u32 stride = indirect->stride, n = max_count;
+                const u32 vsgpr = indirect->vertex_sgpr_offset, isgpr = indirect->instance_sgpr_offset;
+                const bool idx = is_indexed;
+                const u64 guest_args = indirect->args;
+                scheduler.SignalOnCompletion([src, dst, so, dof, stride, n, vsgpr, isgpr, idx, guest_args] {
+                    for (u32 i = 0; i < n && i < 4; ++i) {
+                        const u32* a = reinterpret_cast<const u32*>(static_cast<const u8*>(src.contents) + so + u64(i) * stride);
+                        const u32* d = reinterpret_cast<const u32*>(static_cast<const u8*>(dst.contents) + dof + u64(i) * 20);
+                        static std::atomic<u32> printed{0};
+                        if (a[1] == 0 && printed.fetch_add(1) >= 20) {
+                            continue;
+                        }
+                        std::printf("indirect quad @%#llx %u/%u idx %d stride %u sgpr v%u i%u: guest %u %u %u %u %u -> %u %u %u %u %u\n",
+                                    (unsigned long long)guest_args, i, n, idx, stride, vsgpr, isgpr, a[0], a[1], a[2], a[3], stride >= 20 ? a[4] : 0,
+                                    d[0], d[1], d[2], d[3], d[4]);
+                    }
+                });
+            }
+        }
         args_buffer = new_args;
         args_offset = new_args_offset;
         index_buffer = new_indices;
@@ -1058,6 +1143,17 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         any_clear |= colors[cb].clear;
     }
     pass[8] = {(__bridge void*)depth.texture, 0, depth.slice};
+    // tlg: a draw with no attachments that writes no memory and no storage image has no
+    // visible effect (occlusion queries are not counted on Metal): not recorded. Each was a render pass of its own and
+    // ended the pass around it (~9 a frame in the cannery, ~2 encoders each).
+    // TLG_METAL_KEEP_NOOP_DRAWS=1 records them.
+    static const bool keep_noop = DebugFlag("TLG_METAL_KEEP_NOOP_DRAWS");
+    if (!keep_noop && !writes_memory && !writes_images && !any_clear &&
+        std::all_of(pass.begin(), pass.end(), [](const AttachmentKey& a) { return !a.texture; })) {
+        ++draw_state->noop_draws;
+        ResetBindings();
+        return;
+    }
     id<MTLRenderCommandEncoder> enc = MetalScheduler::Render(scheduler);
     const bool same_pass = enc && d.pass_open && !any_clear &&
                            std::memcmp(pass.data(), d.pass.data(), sizeof(pass)) == 0;
@@ -1074,6 +1170,41 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         d.since_commit = 0;
     }
     ++d.since_commit;
+    if (!same_pass && enc && MetalScheduler::PassStatsEnabled()) {
+        if (any_clear) {
+            MetalScheduler::NoteRenderBreak(scheduler, "draw_clear");
+        } else {
+            // Which attachments changed: colour, depth, both; a subset (the new draw binds
+            // fewer of the open pass's attachments) or a superset; only a level/slice.
+            bool color_diff = false, depth_diff = false, subset = true, superset = true,
+                 same_textures = true;
+            for (u32 i = 0; i < 9; ++i) {
+                const auto& a = d.pass[i];
+                const auto& b = pass[i];
+                const bool diff = a.texture != b.texture || a.level != b.level || a.slice != b.slice;
+                (i == 8 ? depth_diff : color_diff) |= diff;
+                same_textures &= a.texture == b.texture;
+                if (diff && b.texture) {
+                    subset = false;
+                }
+                if (diff && a.texture) {
+                    superset = false;
+                }
+            }
+            bool none = true;
+            for (u32 i = 0; i < 9; ++i) {
+                none &= pass[i].texture == nullptr;
+            }
+            const char* why = none ? (writes_memory ? "draw_no_targets_writes" : "draw_no_targets")
+                              : same_textures ? "draw_targets_levelslice"
+                              : subset      ? "draw_targets_subset"
+                              : superset    ? "draw_targets_superset"
+                              : color_diff && depth_diff ? "draw_targets_both"
+                              : color_diff               ? "draw_targets_color"
+                                                         : "draw_targets_depth";
+            MetalScheduler::NoteRenderBreak(scheduler, why);
+        }
+    }
     if (!same_pass) {
         if (NanScan::Active()) {
             std::array<id<MTLTexture>, 8> nan_targets{};
@@ -1082,7 +1213,23 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             }
             NanScan::BeginPass(scheduler, draw_state->draws, nan_targets.data(), 8);
         }
-        if (collect_targets && frame_targets.size() < 96) {
+        // TLG_METAL_DUMP_PASS_FROM=<n>: skip the first n passes of the frame (late passes:
+        // particles, transparency); 96 snapshots at most.
+        static const u32 pass_from = [] {
+            const char* v = std::getenv("TLG_METAL_DUMP_PASS_FROM");
+            return v ? u32(std::strtoul(v, nullptr, 0)) : 0u;
+        }();
+        static u32 frame_pass = 0;
+        if (!collect_targets) {
+            frame_pass = 0;
+        } else {
+            ++frame_pass;
+        }
+        static const size_t pass_max = [] {
+            const char* v = std::getenv("TLG_METAL_DUMP_PASS_MAX");
+            return v ? size_t(std::strtoul(v, nullptr, 0)) : size_t(96);
+        }();
+        if (collect_targets && frame_pass > pass_from && frame_targets.size() < pass_max) {
             // Debugging: copies of the targets of each pass (taken before this pass).
             scheduler.EndEncoding();
             for (u32 cb = 0; cb < colors.size(); ++cb) {
@@ -1474,6 +1621,40 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         }
     }
 
+    // Diagnosis: TLG_METAL_DRAW_HIST=1 prints, once a second, the draws of each vs/ps pair in that
+    // second (i: indirect), to find the effects drawn at a given moment at full speed.
+    if (static const bool hist = std::getenv("TLG_METAL_DRAW_HIST") != nullptr; hist) {
+        static std::unordered_map<u64, std::pair<u32, u32>> counts;
+        static auto t0 = std::chrono::steady_clock::now();
+        static int last_sec = 0;
+        const u64 vsh = pipeline->Stage(SwStage::Vertex) ? u32(pipeline->Stage(SwStage::Vertex)->pgm_hash) : 0;
+        const u64 psh = pipeline->Stage(SwStage::Fragment) ? u32(pipeline->Stage(SwStage::Fragment)->pgm_hash) : 0;
+        auto& c = counts[(vsh << 32) | psh];
+        ++c.first;
+        c.second |= indirect ? 1u : 0u;
+        // Characters: vertex streams at 2-byte offsets (skinned meshes), tagged "s".
+        if (pipeline->fetch_shader && vs_info) {
+            for (const auto& attrib : pipeline->fetch_shader->attributes) {
+                if ((attrib.GetSharp(*vs_info).base_address & 3) != 0) {
+                    c.second |= 2u;
+                    break;
+                }
+            }
+        }
+        const int sec = int(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (sec != last_sec) {
+            std::string line;
+            for (const auto& [k, v] : counts) {
+                char b[64];
+                std::snprintf(b, sizeof(b), " %08x/%08x:%u%s%s", u32(k >> 32), u32(k), v.first,
+                              (v.second & 1) ? "i" : "", (v.second & 2) ? "s" : "");
+                line += b;
+            }
+            std::printf("draw hist t=%d:%s\n", last_sec, line.c_str());
+            counts.clear();
+            last_sec = sec;
+        }
+    }
     if (NanScan::Active() && pipeline->Stage(SwStage::Fragment)) {
         const u64 vs_hash = pipeline->Stage(SwStage::Vertex) ? pipeline->Stage(SwStage::Vertex)->pgm_hash : 0;
         NanScan::NoteDraw(NanScan::PerDraw() ? (vs_hash << 32) | u32(pipeline->Stage(SwStage::Fragment)->pgm_hash)
@@ -1533,7 +1714,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             }
         }
         stream.Commit();
-        index_buffer = Metal::Buffer(stream.Handle());
+        index_buffer = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
         index_buffer_offset = offset;
         index_type = MTLIndexTypeUInt32;
         num_indices = quads * 6;
@@ -1586,6 +1767,19 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
     }
     if (writes_memory) {
         MetalScheduler::NoteUntrackedWrite(scheduler);
+        // tlg: guest memory is untracked: a later draw of this pass that reads what this one
+        // wrote (vertex or fragment stage) is otherwise not ordered after it.
+        // TLG_METAL_DRAW_BARRIER=0 leaves it out.
+        static const bool draw_barrier = [] {
+            const char* env = std::getenv("TLG_METAL_DRAW_BARRIER");
+            return !(env && env[0] == '0');
+        }();
+        if (draw_barrier) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers
+                            afterStages:MTLRenderStageVertex | MTLRenderStageFragment
+                           beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+            ++draw_state->draw_barriers;
+        }
     }
     if (NanScan::Active() && NanScan::PerDraw()) {
         // Every draw its own pass, so the scan names the draw that wrote the first NaN.
@@ -1621,7 +1815,7 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
                       (unsigned long long)pipeline->hash, cs.dim_x, cs.dim_y, cs.dim_z,
                       indirect_args ? " indirect" : "");
     }
-    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, label);
+    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, label[0] ? label : "dispatch");
     draw_state->impl->pass_open = false;
     [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)pipeline->pso];
     for (u32 i = 0; i < b.num_buffers; ++i) {

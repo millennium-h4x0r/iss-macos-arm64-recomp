@@ -793,6 +793,18 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         return coord;
     };
 
+    // tlg: the layer of an array sample, rounded and clamped to the image's layers as Vulkan's
+    // sampler does (Metal: Shader::clamp_array_layers).
+    const auto clamp_layer = [&](IR::Value slice, u32 dim_idx) -> IR::Value {
+        if (!clamp_array_layers.load(std::memory_order_relaxed) || image.IsCube()) {
+            return slice;
+        }
+        const auto dims = ir.ImageQueryDimension(handle, ir.Imm32(0u), ir.Imm1(false), inst_info);
+        const IR::U32 layers = IR::U32{ir.CompositeExtract(dims, dim_idx)};
+        const IR::F32 last =
+            ir.ConvertUToF(32, 32, ir.ISub(ir.IMax(layers, ir.Imm32(1u), false), ir.Imm32(1u)));
+        return ir.FPClamp(ir.FPRoundEven(IR::F32{slice}), ir.Imm32(0.0f), last);
+    };
     // Now we can load body components as noted in Table 8.9 Image Opcodes with Sampler
     const IR::Value coords = [&] -> IR::Value {
         switch (view_type) {
@@ -800,6 +812,9 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
             addr_reg = addr_reg + 1;
             return get_coord(addr_reg - 1, 0);
         case AmdGpu::ImageType::Color1DArray: // x, slice
+            addr_reg = addr_reg + 2;
+            return ir.CompositeConstruct(get_coord(addr_reg - 2, 0),
+                                         clamp_layer(get_addr_reg(addr_reg - 1), 1));
         case AmdGpu::ImageType::Color2D:      // x, y
         case AmdGpu::ImageType::Color2DMsaa:  // x, y
             addr_reg = addr_reg + 2;
@@ -808,7 +823,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
             addr_reg = addr_reg + 3;
             // Note we can use FixCubeCoords with fallthrough cases since it checks for image type.
             return FixCubeCoords(ir, image, get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
-                                 get_addr_reg(addr_reg - 1));
+                                 clamp_layer(get_addr_reg(addr_reg - 1), 2));
         case AmdGpu::ImageType::Color3D: // x, y, z
             addr_reg = addr_reg + 3;
             return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),

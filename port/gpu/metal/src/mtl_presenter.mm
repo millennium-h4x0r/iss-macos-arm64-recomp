@@ -537,6 +537,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool) {
             ready_ms += r; drawable_ms += d;
             ready_max = std::max(ready_max, r); drawable_max = std::max(drawable_max, d);
             gap_max = std::max(gap_max, ms(last_present, t_enter));
+            // Hitches: a gap over 100 ms between presents, split into the wait for this frame's
+            // GPU work and the rest (the game and the command processor).
+            if (const double gap = ms(last_present, t_enter); gap > 100.0 && presents > 0) {
+                static const auto t0 = t_enter;
+                std::printf("Present hitch t=%.2f: gap %.0f ms, then GPU-ready wait %.0f ms, drawable %.0f ms\n",
+                            ms(t0, t_enter) / 1000.0, gap, r, d);
+            }
             last_present = t_enter;
             ++presents;
             if (ms(window_start, t_drawable) >= 5000.0) {
@@ -592,7 +599,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool) {
         }
         scheduler.EndEncoding();
         TlgOverlay::Render((__bridge void*)cb, (__bridge void*)target, dw, dh);
-        [cb presentDrawable:drawable];
+        // tlg: on a ProMotion (120 Hz) display a frame presented "now" lands on whichever 8.3 ms
+        // refresh comes next, so the game's 60 FPS showed as a mix of 8, 17 and 25 ms frames
+        // (judder, and frames shown for one refresh look like hitches). Holding each drawable on
+        // screen for at least the game's frame period paces them evenly.
+        // TLG_METAL_PRESENT_MIN_MS: minimum time on screen (e.g. 16.6; default 0 = present at once).
+        static const double min_s = [] {
+            const char* v = std::getenv("TLG_METAL_PRESENT_MIN_MS");
+            return (v && *v ? std::atof(v) : 0.0) / 1000.0;
+        }();
+        if (vsync && min_s > 0 && !is_reusing_frame) {
+            [cb presentDrawable:drawable afterMinimumDuration:min_s];
+        } else {
+            [cb presentDrawable:drawable];
+        }
     }
     if (is_reusing_frame) {
         present_scheduler.Flush();

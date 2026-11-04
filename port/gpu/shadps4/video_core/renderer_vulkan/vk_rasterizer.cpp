@@ -835,6 +835,9 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         in += AmdGpu::RegDirty::BlockWords * sizeof(u32);
     }
     ASSERT(packet.num_stages <= Shader::Info::MaxUdSnapshots);
+    if (packet.num_stages && !Shader::Info::ud_snapshots_used.load(std::memory_order_relaxed)) {
+        Shader::Info::ud_snapshots_used.store(true, std::memory_order_relaxed);
+    }
     for (u32 i = 0; i < packet.num_stages; ++i) {
         const auto& stage = *reinterpret_cast<const PacketStage*>(in);
         in += sizeof(PacketStage);

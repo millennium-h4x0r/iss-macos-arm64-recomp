@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/types.h"
 
 namespace Shader {
@@ -90,5 +91,9 @@ struct Profile {
 
     bool operator==(const Profile&) const = default;
 };
+
+/// tlg (Metal): samples of array images clamp the layer to the image's layers, as Vulkan's
+/// sampler does (Metal reads nothing for a layer past the end: flipbook fire sprites blinked).
+inline std::atomic<bool> clamp_array_layers{false};
 
 } // namespace Shader

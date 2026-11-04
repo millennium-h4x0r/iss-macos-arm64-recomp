@@ -8,6 +8,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 
 #include "common/assert.h"
 #include "core/memory.h"
@@ -90,6 +93,79 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     }();
     const vk::BufferCopy copy{.srcOffset = src_offset, .dstOffset = dst_offset, .size = num_bytes};
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
+    // tlg: the console's command processor runs DMA_DATA before the packets after it; here the
+    // copy runs on the GPU later. A WRITE_DATA after it (inFAMOUS: the flag beside its GPU
+    // particle count, GDS 0x404) must not land first, or the game reads a stale count and drops
+    // its fires every few seconds. TLG_METAL_ORDERED_WRITES=1: on (DeferWriteAfterCopy).
+    if (!dst_gds) {
+        pending_guest_copy = true; // a WRITE_DATA after it waits for it (DeferWriteAfterCopy)
+    }
+    // Diagnosis: TLG_GDS_LOG=1: the GDS counters copied to memory (the values the game reads
+    // back), once a second per GDS offset: copies, min / max / last value.
+    // TLG_GDS_LOG=3: no completion hook (it stalls the command processor and slows the game):
+    // the value of the previous copy to the same place, read when the next one is recorded.
+    if (static const bool gds_log3 = [] {
+            const char* v = std::getenv("TLG_GDS_LOG");
+            return v && v[0] == '3';
+        }();
+        gds_log3 && src_gds && !dst_gds) {
+        static std::map<u32, VAddr> last_dst;
+        static auto t0 = std::chrono::steady_clock::now();
+        static int last_sec = 0;
+        static std::map<u32, std::pair<u32, u32>> range;
+        const u32 off = u32(src);
+        if (auto it = last_dst.find(off); it != last_dst.end()) {
+            const u32 v = *reinterpret_cast<const u32*>(it->second);
+            auto [r, fresh] = range.try_emplace(off, v, v);
+            r->second.first = std::min(r->second.first, v);
+            r->second.second = std::max(r->second.second, v);
+        }
+        last_dst[off] = dst;
+        const int sec = int(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (sec != last_sec) {
+            std::string line;
+            for (const auto& [o, r] : range) {
+                char b[64];
+                std::snprintf(b, sizeof(b), " %#x[%u..%u]", o, r.first, r.second);
+                line += b;
+            }
+            std::printf("GDS readback t=%d:%s\n", last_sec, line.c_str());
+            range.clear();
+            last_sec = sec;
+        }
+    }
+    if (static const bool gds_log = [] {
+            const char* v = std::getenv("TLG_GDS_LOG");
+            return v && (v[0] == '1' || v[0] == '2');
+        }();
+        gds_log && src_gds && !dst_gds) {
+        const u32 gds_off = u32(src);
+        const VAddr at = dst;
+        scheduler.SignalOnCompletion([gds_off, at] {
+            struct Stat { u32 n = 0, lo = ~0u, hi = 0, last = 0; };
+            static std::mutex m;
+            static std::map<u32, Stat> stats;
+            static auto t0 = std::chrono::steady_clock::now();
+            static int last_sec = 0;
+            static const bool no_read = std::getenv("TLG_GDS_LOG")[0] == '2';
+            const u32 v = no_read ? 0u : *reinterpret_cast<const u32*>(at);
+            std::scoped_lock lk{m};
+            auto& st = stats[gds_off];
+            ++st.n; st.lo = std::min(st.lo, v); st.hi = std::max(st.hi, v); st.last = v;
+            const int sec = int(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            if (sec != last_sec) {
+                std::string line;
+                for (const auto& [off, x] : stats) {
+                    char b[80];
+                    std::snprintf(b, sizeof(b), " %#x:%u[%u..%u]", off, x.n, x.lo, x.hi);
+                    line += b;
+                }
+                std::printf("GDS readback t=%d:%s\n", last_sec, line.c_str());
+                stats.clear();
+                last_sec = sec;
+            }
+        });
+    }
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
@@ -189,6 +265,15 @@ void Rasterizer::OnSubmit() {
     texture_cache.RunGarbageCollector();
     scheduler.PopPendingOperations();
     draw_state->OnSubmit();
+    // Debugging: TLG_METAL_SYNC_SUBMIT=1 waits for the GPU at every guest submit, so the GPU
+    // never runs behind the command processor (tells timing races from translation bugs).
+    static const bool sync_submit = [] {
+        const char* env = std::getenv("TLG_METAL_SYNC_SUBMIT");
+        return env && env[0] == '1';
+    }();
+    if (sync_submit) {
+        scheduler.Finish();
+    }
 }
 
 bool Rasterizer::DeferUnifiedFence(Common::UniqueFunction<void>&& write) {
@@ -197,6 +282,22 @@ bool Rasterizer::DeferUnifiedFence(Common::UniqueFunction<void>&& write) {
     auto shared = std::make_shared<Common::UniqueFunction<void>>(std::move(write));
     scheduler.SignalOnCompletion([shared] { (*shared)(); });
     VideoCore::Unified::Add(VideoCore::Unified::FencesDeferred);
+    return true;
+}
+
+bool Rasterizer::DeferWriteAfterCopy(Common::UniqueFunction<void>&& write) {
+    // Off by default: the compute fence fix made it unnecessary for inFAMOUS's fires, and a
+    // deferred write may land after later GPU work that reads it. TLG_METAL_ORDERED_WRITES=1: on.
+    static const bool enabled = [] {
+        const char* v = std::getenv("TLG_METAL_ORDERED_WRITES");
+        return v && v[0] == '1';
+    }();
+    if (!enabled || !pending_guest_copy) {
+        return false;
+    }
+    pending_guest_copy = false;
+    auto shared = std::make_shared<Common::UniqueFunction<void>>(std::move(write));
+    scheduler.SignalOnCompletion([shared] { (*shared)(); }); // commits the copy and the write
     return true;
 }
 

@@ -8,7 +8,12 @@
 
 #include <condition_variable>
 #include <cstdio>
+#include <algorithm>
+#include <atomic>
 #include <deque>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "mtl_objc.h"
@@ -48,6 +53,45 @@ namespace MetalScheduler {
 
 void NoteUntrackedWrite(Scheduler& scheduler) {
     scheduler.impl_()->encoder_wrote_untracked = true;
+}
+
+namespace {
+std::atomic<u64> g_gpu_busy_ns{0}; ///< GPU time of completed command buffers (TLG_METAL_PASS_STATS)
+std::mutex g_break_mutex;
+std::unordered_map<std::string, u64> g_breaks;
+} // namespace
+
+bool PassStatsEnabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("TLG_METAL_PASS_STATS");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+void NoteRenderBreak(Scheduler& scheduler, const char* why) {
+    if (scheduler.impl_()->kind != EncoderKind::Render) {
+        return;
+    }
+    std::scoped_lock lock{g_break_mutex};
+    ++g_breaks[why];
+}
+
+std::string TakeRenderBreaks() {
+    std::vector<std::pair<std::string, u64>> v;
+    {
+        std::scoped_lock lock{g_break_mutex};
+        v.assign(g_breaks.begin(), g_breaks.end());
+        g_breaks.clear();
+    }
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string out;
+    char gpu[64];
+    std::snprintf(gpu, sizeof(gpu), " | GPU busy %.0f ms", g_gpu_busy_ns.exchange(0) / 1e6);
+    for (const auto& [why, n] : v) {
+        out += " " + why + ":" + std::to_string(n);
+    }
+    return out + gpu;
 }
 
 } // namespace MetalScheduler
@@ -149,6 +193,9 @@ void Scheduler::SetRenderEncoder(void* encoder, u64 pass_key) {
 }
 
 void Scheduler::Flush() {
+    if (MetalScheduler::PassStatsEnabled()) {
+        MetalScheduler::NoteRenderBreak(*this, "flush");
+    }
     EndEncoding();
     id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)CommandBuffer();
     const u64 tick = current_tick.load(std::memory_order_relaxed);
@@ -167,6 +214,17 @@ void Scheduler::Flush() {
                              (unsigned long long)tick, queue_name,
                              done.error.localizedDescription.UTF8String);
             }
+        }
+        if (MetalScheduler::PassStatsEnabled() && done.GPUEndTime > done.GPUStartTime) {
+            // The union of the command buffers' GPU intervals (they overlap; one queue
+            // completes in order).
+            static double last_end = 0;
+            const double start = std::max(done.GPUStartTime, last_end);
+            if (done.GPUEndTime > start) {
+                MetalScheduler::g_gpu_busy_ns.fetch_add(u64((done.GPUEndTime - start) * 1e9),
+                                                        std::memory_order_relaxed);
+            }
+            last_end = std::max(last_end, done.GPUEndTime);
         }
         for (auto& signal : signals) {
             signal();
@@ -188,7 +246,12 @@ void Scheduler::Flush() {
     }];
     [cb commit];
     impl->cmdbuf = nil;
-    impl->fence_pending = false; // a new command buffer: the queue orders command buffers
+    // tlg: fence_pending stays set: command buffers of one queue start in order but may overlap
+    // on the GPU, and guest memory is untracked, so the next command buffer's encoders still
+    // wait for the last write (a fence works across the queue's command buffers). Resetting it
+    // here let the mid-frame commits (TLG_METAL_COMMIT_DRAWS) read guest memory a compute job
+    // in the previous command buffer was still writing: blocks of the opening cutscene's depth
+    // of field in the wrong places for a frame.
     current_tick.store(tick + 1, std::memory_order_release);
     PopPendingOperations();
 }

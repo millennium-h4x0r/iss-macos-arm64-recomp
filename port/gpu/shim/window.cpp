@@ -47,6 +47,15 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         SDL_SetHint(SDL_HINT_APP_ID, app_id && *app_id ? app_id : "infamous-pc");
     }
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
+    // tlg: TLG_BACKGROUND=1 (automated tests): the app is not activated and the window takes no
+    // focus, so it neither comes to the front nor captures the mouse while someone works.
+    const bool background = [] {
+        const char* v = std::getenv("TLG_BACKGROUND");
+        return v && v[0] == '1';
+    }();
+    if (background) {
+        SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "1");
+    }
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
     }
@@ -54,8 +63,29 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     // 1366x768 laptop it was larger than the screen and the picture was cut. It then opens at the
     // largest same-shape size that fits the usable area (taskbar and title bar kept clear); it can
     // still be maximized, resized or made fullscreen.
+    // tlg: TLG_DISPLAY=<index or part of the name> (e.g. "Built-in" or "Color LCD"): open on that
+    // display instead of the primary one (tests on the laptop screen while the main one is in use).
+    SDL_DisplayID target_display = SDL_GetPrimaryDisplay();
+    if (const char* want = std::getenv("TLG_DISPLAY"); want && *want) {
+        int count = 0;
+        if (SDL_DisplayID* ids = SDL_GetDisplays(&count)) {
+            char* end = nullptr;
+            const long index = std::strtol(want, &end, 10);
+            for (int i = 0; i < count; ++i) {
+                const char* name = SDL_GetDisplayName(ids[i]);
+                const bool by_index = end && *end == '\0' && index == i;
+                const bool by_name = name && SDL_strcasestr(name, want) != nullptr;
+                if (by_index || by_name) {
+                    target_display = ids[i];
+                    LOG_INFO(Frontend, "Opening on display {} ({})", i, name ? name : "?");
+                    break;
+                }
+            }
+            SDL_free(ids);
+        }
+    }
     SDL_Rect usable{};
-    if (width_ > 0 && height_ > 0 && SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) &&
+    if (width_ > 0 && height_ > 0 && SDL_GetDisplayUsableBounds(target_display, &usable) &&
         usable.w > 0 && usable.h > 0) {
         const double fit = std::min({1.0, usable.w * 0.95 / width_, (usable.h - 40) * 0.95 / height_});
         if (fit < 1.0) {
@@ -68,11 +98,14 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(target_display));
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(target_display));
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
+    if (background) {
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FOCUSABLE_BOOLEAN, false);
+    }
     #ifdef __APPLE__
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_METAL_BOOLEAN, true);
 #else

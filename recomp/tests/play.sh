@@ -4,6 +4,9 @@
 #   tests/play.sh <route> [seconds] [save]
 # route: opening  - fresh start: skip cutscenes, tilt/shake the spray can, spray (L2)
 #        intro    - fresh start: Continue at the title, then the intro movie with no input
+#        mural    - fresh start: as opening up to the spray can, then the player's recording of
+#                   the mural (work/routes/spray-mural.txt, F9 in the installed app), then the
+#                   video after it untouched
 #        explore  - free roaming: walk, sweep the camera, jump, climb, melee, interact
 # save:  fresh (no save: starts at the beginning), keep (whatever work/user has), or a
 #        folder name under work/saves (copied in; e.g. cannery-escape). Default: fresh for
@@ -14,15 +17,20 @@ set -uo pipefail
 cd -- "$(dirname -- "$0")/.."
 ROUTE=${1:?route: opening|explore}
 TOTAL=${2:-240}
-case $ROUTE in opening|intro) DEFSAVE=fresh ;; *) DEFSAVE=cannery-escape ;; esac
+case $ROUTE in opening|intro|mural) DEFSAVE=fresh ;; *) DEFSAVE=cannery-escape ;; esac
 SAVE=${3:-$DEFSAVE}
 WORK=$PWD/work
 OUT=$WORK/play/$ROUTE
 PY=${PY:-python3}
 DUMP_EVERY=${DUMP_EVERY:-10}   # seconds between frame dumps
 # DUMP_COUNT=<n>: consecutive frames per dump (frame_t<sec>_<index>.png when above 1)
+# DUMP_FROM=<sec>: no dumps before then
 mkdir -p "$OUT"
 rm -f "$OUT"/frame_t*.png "$OUT"/*.raw "$OUT"/fps.txt
+
+# The installed app runs as iss-recomp too: this script swaps the save folder and kills that
+# process name at the end, so never run it while the player's game is open.
+if pgrep -x iss-recomp >/dev/null; then echo "play.sh: the game is running (iss-recomp); quit it first" >&2; exit 1; fi
 
 # Save fixture
 SAVES=$WORK/user/savedata
@@ -40,6 +48,7 @@ trap 'pkill -x iss-recomp; pkill -9 -x iss-recomp-metal; restore_save; exit 1' I
 
 export TLG_PAD_FILE=$OUT/pad.txt TLG_DUMP_DIR=$OUT TLG_FRAME_DUMP_TRIGGER=$OUT/go TLG_FRAME_DUMP_COUNT=${DUMP_COUNT:-1}
 export TLG_PERF_FRAMES=1
+[[ $ROUTE == mural ]] && export TLG_PAD_REPLAY=${TLG_PAD_REPLAY:-$WORK/routes/spray-mural.txt}
 : > "$TLG_PAD_FILE"
 : > "$OUT/stats.txt"
 touch "$OUT/.started"   # only perf traces newer than this belong to this run
@@ -66,9 +75,26 @@ step_opening() {
         else pad l2 tilt_right aim=$(( yaw + off )),$(( 16 - row * 4 - off )); fi
     fi
 }
+step_mural() {   # Continue at the title, then the recorded mural from the spray can's first prompt
+    local t=$1
+    # The cutscenes play to the "hold the controller sideways" prompt (~150 s); the game waits
+    # there, so the replay starts a little after it (MURAL_AT). Once: a finished replay restarts.
+    local at=${MURAL_AT:-156}
+    if (( t >= 40 && t < 70 )); then tap cross
+    elif (( t >= at && t < at + 2 )); then pad replay
+    elif (( t >= 70 )); then pad; fi
+}
 step_intro() {   # press Continue once at the title, then watch the intro movie untouched
     local t=$1
     if (( t >= 42 && t < 44 )); then tap cross; fi
+}
+step_dash() {    # smoke dash: run forward holding circle in 3 s bursts (Delsin's particle form)
+    local t=$1
+    (( t < ${DASH_FROM:-22} )) && return
+    if (( t % 4 < 3 )); then pad ly=0 circle rx=$(( 128 + (t % 8 - 4) * 6 )); else pad; fi
+}
+step_idle() {    # no input at all: a fixed view of where the save loads (A/B frame comparisons)
+    pad
 }
 step_explore() {
     local t=$1
@@ -89,7 +115,7 @@ start=$(date +%s); last=-1
 while kill -0 $PID 2>/dev/null; do
     now=$(( $(date +%s) - start )); (( now >= TOTAL )) && break
     step_$ROUTE $now
-    if (( now / DUMP_EVERY != last )); then
+    if (( now / DUMP_EVERY != last && now >= ${DUMP_FROM:-0} )); then
         last=$(( now / DUMP_EVERY ))
         stats=$(ioreg -r -d 1 -c IOAccelerator | tr ',' '\n')
         util=$(grep -o '"Device Utilization %"=[0-9]*' <<<"$stats" | head -1 | cut -d= -f2)

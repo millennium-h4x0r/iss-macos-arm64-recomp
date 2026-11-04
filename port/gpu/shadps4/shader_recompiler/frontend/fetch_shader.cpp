@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -13,14 +14,21 @@ namespace Shader::Gcn {
 
 namespace {
 thread_local const FetchShaderSnapshot* compiler_snapshot = nullptr;
+/// tlg: set once any thread installs a snapshot (a thread-local access costs a _tlv_get_addr
+/// call on macOS, for every vertex attribute sharp a draw reads).
+std::atomic<bool> compiler_snapshot_used{false};
+const FetchShaderSnapshot* CompilerSnapshot() {
+    return compiler_snapshot_used.load(std::memory_order_relaxed) ? compiler_snapshot : nullptr;
+}
 }
 
 AmdGpu::Buffer VertexAttribute::GetSharp(const Shader::Info& info) const noexcept {
-    if (compiler_snapshot && compiler_snapshot->info == &info && compiler_snapshot->fetch) {
-        const auto& attributes = compiler_snapshot->fetch->attributes;
+    if (const auto* snapshot = CompilerSnapshot();
+        snapshot && snapshot->info == &info && snapshot->fetch) {
+        const auto& attributes = snapshot->fetch->attributes;
         for (size_t i = 0; i < attributes.size(); ++i) {
             if (attributes[i] == *this) {
-                return compiler_snapshot->buffers[i];
+                return snapshot->buffers[i];
             }
         }
         UNREACHABLE_MSG("Fetch attribute missing from compiler snapshot");
@@ -47,6 +55,7 @@ void FetchShaderSnapshot::Capture(const Info& source) {
 
 ScopedFetchShaderSnapshot::ScopedFetchShaderSnapshot(const FetchShaderSnapshot& snapshot)
     : previous{compiler_snapshot} {
+    compiler_snapshot_used.store(true, std::memory_order_relaxed);
     compiler_snapshot = &snapshot;
 }
 
@@ -93,8 +102,8 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
 }
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
-    if (compiler_snapshot && compiler_snapshot->info == &info) {
-        return compiler_snapshot->fetch;
+    if (const auto* snapshot = CompilerSnapshot(); snapshot && snapshot->info == &info) {
+        return snapshot->fetch;
     }
     if (!info.has_fetch_shader) {
         return std::nullopt;

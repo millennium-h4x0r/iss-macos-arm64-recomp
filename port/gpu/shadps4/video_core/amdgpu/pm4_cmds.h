@@ -378,16 +378,60 @@ inline u64 FixedGpuTimestampNs() {
 }
 
 static u64 GetGpuClock64() {
+    // tlg diagnosis: TLG_GPU_CLOCK_LOG=1 prints the timestamps asked for per second.
+    if (static const bool log = std::getenv("TLG_GPU_CLOCK_LOG") != nullptr; log) {
+        static std::atomic<u64> calls{0};
+        static std::atomic<s64> last_sec{0};
+        const s64 sec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const u64 n = calls.fetch_add(1) + 1;
+        if (s64 prev = last_sec.load(); prev != sec && last_sec.compare_exchange_strong(prev, sec)) {
+            std::printf("GPU clock: %llu timestamps in the last second\n", (unsigned long long)n);
+            calls.store(0);
+        }
+    }
     if (GpuTimestampMode().fixed) {
         return GpuTimestampMode().base_clock_ns + FixedGpuTimestampNs();
     }
     auto now = std::chrono::high_resolution_clock::now();
     auto duration = now.time_since_epoch();
     auto ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+    // tlg: TLG_GPU_CLOCK_MHZ=<n>: the global clock counter ticks at n MHz instead of 1000
+    // (nanoseconds). Experiment only: inFAMOUS never asks for this clock (it reads the
+    // performance counter, GetGpuPerfCounter).
+    static const u64 mhz = [] {
+        const char* v = std::getenv("TLG_GPU_CLOCK_MHZ");
+        return v && *v ? std::strtoull(v, nullptr, 10) : 1000ull;
+    }();
+    if (mhz != 1000) {
+        return Common::MultiplyAndDivide64(static_cast<u64>(ticks), mhz, 1000);
+    }
     return static_cast<u64>(ticks);
 }
 
 static u64 GetGpuPerfCounter() {
+    if (static const bool log = std::getenv("TLG_GPU_CLOCK_LOG") != nullptr; log) {
+        static std::atomic<u64> calls{0};
+        static std::atomic<s64> last_sec{0};
+        const s64 sec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const u64 n = calls.fetch_add(1) + 1;
+        if (s64 prev = last_sec.load(); prev != sec && last_sec.compare_exchange_strong(prev, sec)) {
+            std::printf("GPU perf counter: %llu timestamps in the last second\n", (unsigned long long)n);
+            calls.store(0);
+        }
+        // The spacing of 120 consecutive timestamps from the 20th second on (microseconds).
+        static std::atomic<u64> seq{0};
+        static std::atomic<u64> prev_tsc{0};
+        const u64 now_tsc = Libraries::Kernel::sceKernelReadTsc();
+        const u64 k = seq.fetch_add(1);
+        const u64 p = prev_tsc.exchange(now_tsc);
+        if (k >= 3300 && k < 3420 && p) {
+            std::printf("GPU perf counter delta %llu us\n",
+                        (unsigned long long)Common::MultiplyAndDivide64(
+                            now_tsc - p, 1000000, Libraries::Kernel::sceKernelGetTscFrequency()));
+        }
+    }
     const auto cpu_freq = Libraries::Kernel::sceKernelGetTscFrequency();
     const auto gpu_freq = Libraries::GnmDriver::sceGnmGetGpuCoreClockFrequency();
 
@@ -397,7 +441,17 @@ static u64 GetGpuPerfCounter() {
     }
     const auto cpu_cycles = Libraries::Kernel::sceKernelReadTsc();
     const auto gpu_cycles = Common::MultiplyAndDivide64(cpu_cycles, gpu_freq, cpu_freq);
-
+    // tlg experiment: TLG_GPU_PERF_DIV=<n>: the counter advances n times slower (the game sees
+    // its GPU work take 1/n of the time). Default 1. (It hid the early compute fences that
+    // killed inFAMOUS's fires, fixed in RunComputeReleaseMem.)
+    static const u64 div = [] {
+        const char* v = std::getenv("TLG_GPU_PERF_DIV");
+        return v && *v ? std::max<u64>(std::strtoull(v, nullptr, 10), 1) : 1ull;
+    }();
+    if (div > 1) {
+        static const u64 base = gpu_cycles;
+        return base + (gpu_cycles - base) / div;
+    }
     return gpu_cycles;
 }
 

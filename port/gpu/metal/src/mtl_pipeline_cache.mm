@@ -13,6 +13,8 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <atomic>
+#include <memory>
 #include <vector>
 #include <thread>
 #include <condition_variable>
@@ -53,6 +55,7 @@ std::atomic<u32> g_compiles{0};
 std::atomic<u32> g_pipelines{0};
 std::atomic<u32> g_failed{0};
 std::atomic<u32> g_async_skips{0}, g_async_queued{0}; // tlg: async shaders
+std::atomic<u64> g_stage_skips[16]{}; // tlg: draws dropped for their shader stages (GS/tess)
 std::atomic<u64> g_stage_ns[4]{}; // tlg: recompile+SPIR-V, SPIRV-Cross, MSL compile, render PSO
 inline u64 NsSince(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count();
@@ -107,6 +110,7 @@ struct Module {
     Shader::StageSpecialization spec;
     id<MTLFunction> function = nil;
     MetalStage meta{};
+    bool cold = false; ///< first compiled in this run (not in the MSL cache): async pipeline
 };
 
 struct Program {
@@ -146,6 +150,7 @@ struct MslResult {
     std::string error;
     u32 num_buffers = 0, num_textures = 0, num_samplers = 0;
     bool uses_buffer_sizes = false;
+    bool cache_hit = false; ///< from the MSL disk cache: compiled in an earlier run
 };
 
 MslResult TranslateStage(const std::vector<u32>& spirv, bool flip_y) {
@@ -279,7 +284,19 @@ std::string MslSource(const std::string& msl) {
         const char* env = std::getenv("TLG_METAL_CONTRACT");
         return !(env && env[0] == '1');
     }();
-    return (contract_off ? std::string("#pragma METAL fp contract(off)\n") : std::string()) + msl;
+    // Testing: TLG_METAL_COLD_SHADERS=1 makes every source unique to this run, so Metal's own
+    // shader cache (keyed by source) misses and each shader compiles as on first sight.
+    static const std::string cold = [] {
+        const char* env = std::getenv("TLG_METAL_COLD_SHADERS");
+        if (!(env && env[0] == '1')) {
+            return std::string();
+        }
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "// cold %d %lld\n", int(getpid()),
+                      (long long)std::chrono::steady_clock::now().time_since_epoch().count());
+        return std::string(tag);
+    }();
+    return cold + (contract_off ? std::string("#pragma METAL fp contract(off)\n") : std::string()) + msl;
 }
 
 // tlg: Metal compiles each MSL source on the command processor thread, one at a time, when a
@@ -343,9 +360,16 @@ public:
             std::lock_guard lock{mutex};
             const auto [it, inserted] = slots.emplace(key, Slot{});
             if (inserted) {
-                queue.emplace_back(key, source);
+                urgent.emplace_back(key, source);
                 pending = true;
-            } else if (it->second.state == State::Queued || it->second.state == State::Compiling) {
+            } else if (it->second.state == State::Queued) {
+                // Still in the startup precompile queue (thousands deep): a draw needs it now.
+                if (!it->second.urgent) {
+                    it->second.urgent = true;
+                    urgent.emplace_back(key, source);
+                }
+                pending = true;
+            } else if (it->second.state == State::Compiling) {
                 pending = true;
             } else if (it->second.state == State::Done) {
                 return it->second.library;
@@ -384,6 +408,7 @@ private:
     enum class State { Queued, Compiling, Done, Claimed };
     struct Slot {
         State state = State::Queued;
+        bool urgent = false;
         id<MTLLibrary> library = nil;
     };
 
@@ -393,20 +418,35 @@ private:
             std::string source;
             {
                 std::unique_lock lock{mutex};
+                // tlg: shaders a draw waits for (async) go before the startup precompile queue.
+                bool got = false;
                 for (;;) {
+                    while (!urgent.empty()) {
+                        auto item = std::move(urgent.front());
+                        urgent.pop_front();
+                        if (slots[item.first].state == State::Queued) {
+                            key = item.first;
+                            source = std::move(item.second);
+                            got = true;
+                            break;
+                        }
+                    }
+                    if (got) {
+                        break;
+                    }
                     while (next < queue.size() && slots[queue[next].first].state != State::Queued) {
                         ++next;
                     }
                     if (next < queue.size()) {
+                        key = queue[next].first;
+                        source = std::move(queue[next].second);
+                        ++next;
                         break;
                     }
                     // Workers stay for async shaders (Poll queues more).
                     work_cv.wait(lock);
                 }
-                key = queue[next].first;
-                source = std::move(queue[next].second);
                 slots[key].state = State::Compiling;
-                ++next;
             }
             id<MTLLibrary> library;
             @autoreleasepool {
@@ -440,6 +480,7 @@ private:
     size_t startup_left = 0;
     std::unordered_map<u64, Slot> slots;
     std::vector<std::pair<u64, std::string>> queue;
+    std::deque<std::pair<u64, std::string>> urgent;
     size_t next = 0;
     u32 compiled = 0, taken = 0;
     std::atomic<u32> running{0};
@@ -472,7 +513,9 @@ public:
             std::lock_guard lock{mutex};
             if (auto it = entries.find(key); it != entries.end()) {
                 ++hits;
-                return it->second;
+                MslResult r = it->second;
+                r.cache_hit = true;
+                return r;
             }
         }
         MslResult r = TranslateStage(spirv, flip_y);
@@ -503,6 +546,7 @@ private:
         const char* off = std::getenv("TLG_METAL_NO_MSL_CACHE");
         enabled = !(off && off[0] == '1');
         if (!enabled) {
+            MslPrewarm::Get().Start({}); // the workers also serve async shaders
             return;
         }
         const std::string path = std::string(runtime_file_user_dir()) + "/metal-msl-cache.bin";
@@ -672,6 +716,12 @@ struct PipelineCache::Impl {
     Shader::Pools pools;
     std::unordered_map<u64, std::unique_ptr<Program>> programs;
     std::unordered_map<u64, std::unique_ptr<GraphicsPipeline>> graphics;
+    // tlg: async shaders: render pipelines Metal still builds (pso null meanwhile; draws skip).
+    struct PendingPso {
+        std::atomic<bool> done{false};
+        void* pso = nullptr; // +1 retained; valid once done
+    };
+    std::unordered_map<u64, std::shared_ptr<PendingPso>> pending_psos;
     std::unordered_map<u64, std::unique_ptr<ComputePipeline>> compute;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
@@ -801,7 +851,7 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
                                               Shader::Backend::Bindings& binding,
                                               const Shader::Info** out_info,
                                               bool last_vertex_stage) {
-    auto runtime_info = BuildRuntimeInfo(regs, hw_stage, sw_stage);
+    const auto& runtime_info = BuildRuntimeInfo(regs, hw_stage, sw_stage);
     auto [it, inserted] = programs.try_emplace(params.hash);
     if (inserted) {
         it->second = std::make_unique<Program>(hw_stage, sw_stage, params);
@@ -982,7 +1032,10 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
             p = end ? end + 1 : p + n;
         }
     }
-    if (async) {
+    // tlg: shaders of earlier runs (MSL cache hit) compile here at once: Metal's own cache has
+    // them (~1 ms). Going async for them too skipped their draws for a frame or more whenever a
+    // new permutation showed up (flames that started, stopped and started again).
+    if (async && !msl.cache_hit) {
         std::string source = MslSource(msl.msl);
         bool still = false;
         MslPrewarm::Get().Poll(source, still);
@@ -1014,6 +1067,7 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
     module.meta.num_textures = msl.num_textures;
     module.meta.num_samplers = msl.num_samplers;
     module.meta.uses_buffer_sizes = msl.uses_buffer_sizes;
+    module.cold = !msl.cache_hit;
     program.modules.push_back(std::move(module));
     program.last_used = program.modules.size() - 1;
     remember(program.last_used);
@@ -1133,7 +1187,11 @@ bool PipelineCache::Impl::RefreshGraphicsStages(const Shader::Profile& profile,
         }
         break;
     default:
-        // Tessellation and geometry shaders: not yet.
+        // Tessellation and geometry shaders: not yet (counted by stage set, ReportCompilerStats).
+        {
+            const u32 raw = u32(regs.stage_enable.raw);
+            g_stage_skips[raw == 0xB0u ? 1 : raw == 0x45u ? 2 : raw == 0xADu ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
+        }
         return false;
     }
 
@@ -1172,6 +1230,17 @@ GraphicsPipeline* PipelineCache::Impl::CreateGraphics() {
     }
     const auto& vs = pipeline->stages[u32(SwStage::Vertex)];
     const auto& fs = pipeline->stages[u32(SwStage::Fragment)];
+    // Diagnosis: TLG_METAL_LOG_PIPELINES=1 names each new pipeline with its time (s since the
+    // first one), so the effects that first appear at a given moment can be found.
+    if (static const bool log_pl = std::getenv("TLG_METAL_LOG_PIPELINES") != nullptr; log_pl) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("GPU (Metal): pipeline t=%.2f vs %016llx ps %016llx prim %u rt %u fmt0 %u blend0 %u\n", t,
+                    (unsigned long long)(vs.info ? vs.info->pgm_hash : 0),
+                    (unsigned long long)(fs.info ? fs.info->pgm_hash : 0), u32(key.prim_type),
+                    u32(key.num_color_attachments), u32(key.color_buffers[0].data_format),
+                    u32(key.blend_controls[0].enable));
+    }
 
     MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
     desc.vertexFunction = (__bridge id<MTLFunction>)vs.function;
@@ -1279,6 +1348,35 @@ GraphicsPipeline* PipelineCache::Impl::CreateGraphics() {
         }
         desc.vertexDescriptor = vd;
     }
+    const u64 hash = XXH3_64bits(&key, sizeof(key));
+    // tlg: with async shaders the pipeline (Metal's backend compile, up to ~0.7 s for a burst of
+    // new shaders) builds on Metal's compiler threads; its draws are skipped until it is ready.
+    // Only pipelines with a shader new to this run (not in the MSL cache): Metal's pipeline
+    // cache has the others, created at once (skipping their draws made flames blink).
+    const bool cold_stage = std::ranges::any_of(modules, [](const Module* m) { return m && m->cold; });
+    if (cold_stage && TlgSettings::Get().async_shaders.load(std::memory_order_relaxed)) {
+        auto pending = std::make_shared<PendingPso>();
+        const u64 vs_hash = vs.info ? vs.info->pgm_hash : 0, fs_hash = fs.info ? fs.info->pgm_hash : 0;
+        // A blocking create on GCD's concurrent queue: Metal's completionHandler variant was
+        // seen building one pipeline at a time (a single busy MTLCompilerService).
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSError* err = nil;
+            id<MTLRenderPipelineState> state =
+                [Metal::Device() newRenderPipelineStateWithDescriptor:desc error:&err];
+            if (!state && g_failed.fetch_add(1) < 32) {
+                std::printf("GPU (Metal): render pipeline (vs %016llx ps %016llx) failed: %s\n",
+                            (unsigned long long)vs_hash, (unsigned long long)fs_hash,
+                            err.localizedDescription.UTF8String);
+            }
+            pending->pso = state ? (__bridge_retained void*)state : nullptr;
+            pending->done.store(true, std::memory_order_release);
+        });
+        pending_psos[hash] = std::move(pending);
+        g_async_queued.fetch_add(1, std::memory_order_relaxed);
+        g_async_skips.fetch_add(1, std::memory_order_relaxed);
+        graphics[hash] = std::move(pipeline);
+        return nullptr;
+    }
     NSError* error = nil;
     const auto tp = std::chrono::steady_clock::now();
     id<MTLRenderPipelineState> pso = [Metal::Device() newRenderPipelineStateWithDescriptor:desc
@@ -1295,7 +1393,6 @@ GraphicsPipeline* PipelineCache::Impl::CreateGraphics() {
     }
     pipeline->pso = (__bridge_retained void*)pso;
     g_pipelines.fetch_add(1, std::memory_order_relaxed);
-    const u64 hash = XXH3_64bits(&key, sizeof(key));
     auto* raw = pipeline.get();
     graphics[hash] = std::move(pipeline);
     return raw;
@@ -1365,6 +1462,10 @@ PipelineCache::PipelineCache(const Instance& instance, Scheduler&, AmdGpu::Liver
         std::printf("GPU (Metal): NoContraction on every float op (TLG_METAL_FP=decorated, slow)\n");
     }
     AmdGpu::all_1d_as_2d.store(true, std::memory_order_relaxed);
+    // TLG_METAL_CLAMP_LAYERS=0: array sample layers as the shader computes them (unclamped).
+    if (const char* env = std::getenv("TLG_METAL_CLAMP_LAYERS"); !(env && env[0] == '0')) {
+        Shader::clamp_array_layers.store(true, std::memory_order_relaxed);
+    }
 }
 
 PipelineCache::~PipelineCache() = default;
@@ -1382,10 +1483,23 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(IndirectParams params
         for (u32 i = 0; i < MaxShaderStages; ++i) {
             pipeline->stages[i].info = impl->infos[i];
         }
+        if (!pipeline->pso && !impl->pending_psos.empty()) {
+            if (const auto p = impl->pending_psos.find(hash); p != impl->pending_psos.end()) {
+                if (!p->second->done.load(std::memory_order_acquire)) {
+                    g_async_skips.fetch_add(1, std::memory_order_relaxed);
+                    return nullptr;
+                }
+                pipeline->pso = p->second->pso; // null: failed, stays skipped
+                if (pipeline->pso) {
+                    g_pipelines.fetch_add(1, std::memory_order_relaxed);
+                }
+                impl->pending_psos.erase(p);
+            }
+        }
         return pipeline->pso ? pipeline : nullptr;
     }
     auto* created = impl->CreateGraphics();
-    if (!created) {
+    if (!created && !impl->pending_psos.contains(hash)) {
         // Remember the failure.
         auto failed = std::make_unique<GraphicsPipeline>();
         failed->key = impl->key;
@@ -1432,6 +1546,18 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 }
 
 void PipelineCache::ReportCompilerStats() {
+    {
+        std::string skipped;
+        for (u32 i = 0; i < 16; ++i) {
+            if (const u64 n = g_stage_skips[i].exchange(0)) {
+                static const char* names[] = {"vs", "es+gs", "ls+hs (tess)", "ls+hs+es+gs", "other"};
+                skipped += std::string(" ") + names[i < 5 ? i : 4] + ":" + std::to_string(n);
+            }
+        }
+        if (!skipped.empty()) {
+            std::printf("GPU (Metal): draws dropped for unsupported shader stages (5 s):%s\n", skipped.c_str());
+        }
+    }
     if (const u32 queued = g_async_queued.exchange(0), skips = g_async_skips.exchange(0);
         queued || skips) {
         std::printf("GPU (Metal): async shaders: %u queued, %u stage lookups skipped while "

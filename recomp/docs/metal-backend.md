@@ -257,6 +257,47 @@ frames over 17 ms 16% -> 4%), 1000 draws 39.7 / 48.3, 150 draws 57.2, 250 draws 
 A small per-program cache of recent lookups did not help (the user data changes on almost
 every draw, so the specialization is rebuilt: ~6% of the command processor thread).
 
+## Recording cost (2026-11-03)
+
+Heavy cannery stretches: the command processor thread was ~76% busy (~13.6 ms of recording a
+frame) and the GPU ~65% (`TLG_METAL_PASS_STATS=1` prints the union of the command buffers' GPU
+time, ~12 ms a frame), so recording sets the pace. Recording cost per frame (Time Profiler at
+70-85 s, busy time / FPS): 13.6 -> 10.4 ms.
+- Thread-locals: `Info::UserData()`/`FlatUserData()` and the fetch shader's attribute sharps
+  checked thread-local snapshots (Vulkan's draw pipe, compiler workers) on every sharp read;
+  each thread-local access is a `_tlv_get_addr` call on macOS (12.9% of the thread). A global
+  flag set by the first thread that installs one now skips them (4.5% left, mostly the guest
+  memory region cache in runtime_memory.c, per thread by design).
+- ARC: per-draw Metal objects (render targets, vertex/index/argument buffers, bound textures
+  and samplers) are unretained, taken with `Metal::Raw` (retain/release 6% -> 0.7%).
+- Draws with no attachments that write no memory (~9 a frame) are not recorded
+  (`TLG_METAL_KEEP_NOOP_DRAWS=1` keeps them): each was a render pass and ended the one around it.
+- Tried, no gain: a signature of the specialization's inputs instead of building it (the cost
+  is reading the sharps from guest memory, the same either way); keeping a pass open for a
+  draw that binds fewer of its attachments with a pipeline variant (after the no-op draws are
+  gone, ~6 a frame); committing every 150 draws instead of 400.
+
+Why passes end (`TLG_METAL_PASS_STATS=1`, per 5 s, ~130 passes a frame): other colour targets
+~16.5k, colour and depth ~5k, a superset of the open pass's attachments ~3k, clears ~3k, the
+400-draw commits ~2.3k, a subset ~2k, compute jobs and copies ~2.5k.
+
+## Depth of field blocks in the cutscene after the mural (2026-11-03, fixed)
+
+Player report: black flicker in the video after the spray mural. Rectangular blocks of the
+cutscene's depth of field (dark, blurred, over faces) for single frames, 13 of 224 frames in
+dense bursts. Cause: the scheduler stopped waiting on its guest-memory fence at every command
+buffer boundary ("the queue orders command buffers"); command buffers of one queue start in
+order but overlap on the GPU, and guest memory is untracked, so with the mid-frame commits a
+pass read tile data a compute job in the previous command buffer was still writing. The fence
+wait now carries over (0 of 224; cannery 56.8-58.4 FPS, no cost). With TLG_METAL_COMMIT_DRAWS=0
+it had been 0 too; the no-op draw skip was not the cause.
+
+Tests: `tests/play.sh mural` replays the player's recording of the mural
+(work/routes/spray-mural.txt, from F9 in the installed app: pad, motion and touches) from the
+"hold the controller sideways" prompt (MURAL_AT, 156 s), then the cutscene plays and the
+cannery starts (~320 s). DUMP_FROM=<s> limits dumps to the part of interest; scratchpad
+holes.py finds frames with black patches their burst neighbours do not have.
+
 ## MSL cache size (2026-11-03)
 
 `metal-msl-cache.bin` is append-only; past 4096 records it is rewritten with the newest 3072 at

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -176,8 +177,15 @@ struct Info : InfoPersistent {
     static constexpr u32 MaxUdSnapshots = 6;
     static inline thread_local UdSnapshot ud_snapshots[MaxUdSnapshots];
     static inline thread_local u32 num_ud_snapshots = 0;
+    /// tlg: set once any thread installs snapshots. Every thread-local access is a
+    /// _tlv_get_addr call on macOS, and UserData()/FlatUserData() run for every sharp a draw
+    /// reads (~13% of the Metal command thread, which never installs snapshots).
+    static inline std::atomic<bool> ud_snapshots_used{false};
 
     const UdSnapshot* Snapshot() const noexcept {
+        if (!ud_snapshots_used.load(std::memory_order_relaxed)) [[likely]] {
+            return nullptr;
+        }
         for (u32 i = 0; i < num_ud_snapshots; ++i) {
             if (ud_snapshots[i].info == this) {
                 return &ud_snapshots[i];
@@ -244,12 +252,13 @@ struct Info : InfoPersistent {
     /// user data it rebuilt from the game files, and RefreshFlatBuf copies that instead of
     /// walking the resource tables (the translation then sees the values a draw would have).
     static inline thread_local const std::unordered_map<u64, std::vector<u32>>* replay_flats{};
+    static inline std::atomic<bool> replay_flats_used{false}; ///< as ud_snapshots_used
 
     void RefreshFlatBuf() {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
-        if (replay_flats) {
+        if (replay_flats_used.load(std::memory_order_relaxed) && replay_flats) {
             if (const auto it = replay_flats->find(pgm_hash); it != replay_flats->end()) {
                 const size_t n = std::min(it->second.size(), flattened_ud_buf.size());
                 std::memcpy(flattened_ud_buf.data(), it->second.data(), n * sizeof(u32));

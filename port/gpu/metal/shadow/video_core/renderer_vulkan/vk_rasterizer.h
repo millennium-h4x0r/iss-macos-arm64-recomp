@@ -160,6 +160,11 @@ public:
     void NotePendingGpuWrite(VAddr, u64) {}
     /// Runs `write` (a guest label write) when the GPU has finished the work recorded so far.
     bool DeferUnifiedFence(Common::UniqueFunction<void>&& write);
+    /// A command processor memory write (WRITE_DATA) issued while a GPU-side copy into guest
+    /// memory (DMA_DATA) is still pending: run on the GPU's completion, after the copy, as the
+    /// console's command processor orders them. False when nothing is pending (write at once).
+    bool DeferWriteAfterCopy(Common::UniqueFunction<void>&& write);
+    bool pending_guest_copy = false;
     void SyncUnifiedRead(VAddr address, u64 size);
     void WaitDeferredSignals() {
         scheduler.WaitSignals();

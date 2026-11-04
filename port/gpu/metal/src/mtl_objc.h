@@ -42,6 +42,14 @@ inline T MtlGet(Handle handle) {
     return raw ? (__bridge T)reinterpret_cast<void*>(raw) : nil;
 }
 
+/// The object of a handle as a plain pointer, for per-draw code: `(__bridge id<...>)Raw(h)`
+/// stored in an __unsafe_unretained variable costs no retain/release (the handle's owner keeps
+/// the object alive). The typed accessors below return strong references.
+template <typename Handle>
+inline void* Raw(Handle handle) {
+    return reinterpret_cast<void*>(static_cast<typename Handle::CType>(handle));
+}
+
 inline id<MTLTexture> Texture(vk::Image image) {
     return MtlGet<id<MTLTexture>>(image);
 }

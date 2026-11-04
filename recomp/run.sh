@@ -48,6 +48,20 @@ GUARD=$WORK/wsguard
 if [[ ${ISS_WSGUARD:-1} != 0 && ( ! -x $GUARD || $ROOT/tests/wsguard.swift -nt $GUARD ) ]]; then
     swiftc -O "$ROOT/tests/wsguard.swift" -o "$GUARD" || echo "run.sh: could not build wsguard" >&2
 fi
+# Started by the app that install-app.sh puts in /Applications (its launcher sets
+# ISS_APP_BIN to the binary inside it): this process becomes the game, so macOS sees that app
+# (its icon, Game Mode). Output goes to work/game.log.
+if [[ -n ${ISS_APP_BIN:-} ]]; then
+    cd "$WORK"
+    # F9 starts and stops a pad recording (with the motion: the spray can) for scripted tests.
+    export TLG_PAD_RECORD=${TLG_PAD_RECORD:-$WORK/pad-recording.txt}
+    exec >"$WORK/game.log" 2>&1
+    if [[ ${ISS_WSGUARD:-1} != 0 && -x $GUARD ]]; then
+        "$GUARD" $$ "$WORK/wsguard.log" &
+    fi
+    exec "$ISS_APP_BIN" "$OUT/boot-linked.bin" --content-profile "$OUT/content.bin" --app0 "$GAME" \
+        --user "$WORK/user" "$@"
+fi
 # Run from an app bundle: an unbundled binary is a background process to macOS
 # (RunningBoard "anon<...> running-NotVisible"), whose GPU memory gets evicted and paged
 # back in under the kernel GPU lock (a desktop-wide freeze), and which gets no Game Mode.

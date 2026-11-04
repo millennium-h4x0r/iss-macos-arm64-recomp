@@ -104,7 +104,7 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
     }
     id<MTLBuffer> s = Metal::Buffer(src->Handle());
     id<MTLBuffer> d = Metal::Buffer(dst->Handle());
-    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler);
+    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler, "CopyBuffer");
     for (const auto& c : copies) {
         if (c.size == 0) {
             continue;
@@ -124,7 +124,7 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
     id<MTLBuffer> d = Metal::Buffer(dst->Handle());
     const u8 b = value & 0xff;
     if (value == u32(b) * 0x01010101u) {
-        [MetalScheduler::Blit(scheduler) fillBuffer:d range:NSMakeRange(offset, size) value:b];
+        [MetalScheduler::Blit(scheduler, "FillBuffer") fillBuffer:d range:NSMakeRange(offset, size) value:b];
     } else {
         ASSERT_MSG(offset % 4 == 0 && size % 4 == 0, "unaligned u32 fill");
         id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "fill");
@@ -173,7 +173,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     }
     const FormatInfo& f = Metal::GetFormat(dst->info.pixel_format);
     id<MTLBuffer> buffer = Metal::Buffer(src->Handle());
-    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler);
+    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler, "UploadImage");
     const bool is_3d = texture.textureType == MTLTextureType3D;
     for (const auto& c : upload_copies) {
         const auto [bytes, option] = AspectBytes(f, c.imageSubresource.aspectMask);
@@ -224,7 +224,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     texture = Metal::Texture(src->GetImage());
     const FormatInfo& f = Metal::GetFormat(src->info.pixel_format);
     id<MTLBuffer> buffer = Metal::Buffer(dst->Handle());
-    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler);
+    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler, "DownloadImage");
     const bool is_3d = texture.textureType == MTLTextureType3D;
     for (const auto& c : download_copies) {
         const auto [bytes, option] = AspectBytes(f, c.imageSubresource.aspectMask);
@@ -300,7 +300,7 @@ void Runtime::CopyRegion(VideoCore::Image* src, VideoCore::Image* dst, const vk:
         LogOnce("image copy between incompatible formats skipped");
         return;
     }
-    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler);
+    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler, "CopyRegion");
     for (u32 layer = 0; layer < layers; ++layer) {
         const u32 src_slice = s3d ? 0 : r.srcSubresource.baseArrayLayer + layer;
         const u32 dst_slice = d3d ? 0 : r.dstSubresource.baseArrayLayer + layer;
@@ -457,6 +457,9 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
         return;
     }
     // A render pass whose only work is the MSAA resolve.
+    if (MetalScheduler::PassStatsEnabled()) {
+        MetalScheduler::NoteRenderBreak(scheduler, "ResolveImage");
+    }
     scheduler.EndEncoding();
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = s;
@@ -482,6 +485,9 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     if (!f.renderable && !f.depth) {
         LogOnce("clear of a non-renderable image skipped");
         return;
+    }
+    if (MetalScheduler::PassStatsEnabled()) {
+        MetalScheduler::NoteRenderBreak(scheduler, "ClearImage");
     }
     scheduler.EndEncoding();
     const bool is_3d = d.textureType == MTLTextureType3D;
