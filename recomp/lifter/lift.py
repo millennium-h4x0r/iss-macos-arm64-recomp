@@ -144,6 +144,11 @@ class Lifter:
           grew = False
           for site, win in indirect.items():
               tg = self.jump_table(win, insns[site], lo, hi, insns, everything=True)
+              if not tg:
+                  # the window is the trace that first decoded the jump, which can start just
+                  # before it (a label reached from elsewhere); use the code preceding it by address
+                  prev = [insns[b] for b in sorted(insns) if b < site and insns[b]][-128:]
+                  tg = self.jump_table(prev, insns[site], lo, hi, insns, everything=True)
               if tg:
                   new = [t for t in tg if t not in labels]
                   tables[site] = sorted(set(tables.get(site, [])) | set(tg))

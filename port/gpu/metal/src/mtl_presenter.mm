@@ -54,15 +54,18 @@ constant float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
 
 // The Vulkan renderer's post_process.frag: sRGB-encoded input, display gamma.
 fragment float4 present_frag(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],
-                             sampler s [[sampler(0)]], constant float& gamma [[buffer(0)]]) {
+                             sampler s [[sampler(0)]], constant float2& pp [[buffer(0)]]) {
+    const float gamma = pp.x, brightness = pp.y;   // game gamma (sceVideoOutAdjustColor), user brightness
     float3 c = t.sample(s, in.uv).rgb;
-    if (gamma == 1.0) {
-        return float4(c, 1.0);
+    if (gamma != 1.0) {
+        const float3 lin = select(pow(max(c + b, 0.0) / a, float3(2.4)), c / d, c < float3(d * cutoff));
+        c = select(a * pow(lin, float3(1.0 / (2.4 + 1.0 - gamma))) - b, d * lin / gamma, lin < float3(cutoff));
     }
-    const float3 lin = select(pow(max(c + b, 0.0) / a, float3(2.4)), c / d, c < float3(d * cutoff));
-    const float3 g = select(a * pow(lin, float3(1.0 / (2.4 + 1.0 - gamma))) - b, d * lin / gamma,
-                            lin < float3(cutoff));
-    return float4(g, 1.0);
+    // tlg: user brightness, a gamma on the display-encoded image (0 and 1 stay fixed)
+    if (brightness != 1.0) {
+        c = pow(max(c, 0.0), float3(1.0 / brightness));
+    }
+    return float4(c, 1.0);
 }
 )";
 
@@ -593,8 +596,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool) {
             [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)blit_pipeline];
             [enc setFragmentTexture:(__bridge id<MTLTexture>)frame->texture atIndex:0];
             [enc setFragmentSamplerState:(__bridge id<MTLSamplerState>)sampler atIndex:0];
-            const float gamma = pp_settings.gamma;
-            [enc setFragmentBytes:&gamma length:sizeof(gamma) atIndex:0];
+            const float pp[2] = {pp_settings.gamma, TlgSettings::Get().brightness.load()};
+            [enc setFragmentBytes:pp length:sizeof(pp) atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         }
         scheduler.EndEncoding();

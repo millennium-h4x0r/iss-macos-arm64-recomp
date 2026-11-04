@@ -436,6 +436,9 @@ void ImageTab() {
         ChoiceRow(TL("Display mode", "Modo de exibição"), s.display_mode, G::DisplayModeCount == 3 ? modes : G::DisplayModeNames.data(),
                   nullptr, G::DisplayModeCount, TL("Windowed, borderless window or exclusive fullscreen.", "Janela, janela sem borda ou tela cheia exclusiva."));
         CheckRow("VSync", s.vsync, TL("Waits for the monitor: no tearing, a little more input delay.", "Espera o monitor: sem tearing, um pouco mais de atraso de entrada."));
+        FloatRow(TL("Brightness", "Brilho"), s.brightness, 0.5f, 2.5f, "%.2f",
+                 TL("Lifts dark areas and midtones; highlights stay as they are. 1.00 is the game's own image (as on PS4).",
+                    "Clareia áreas escuras e tons médios; os realces ficam como estão. 1,00 é a imagem original do jogo (como no PS4)."));
         ImGui::EndTable();
     }
     const int iw = s.image_width, ih = s.image_height, ww = s.window_width, wh = s.window_height;

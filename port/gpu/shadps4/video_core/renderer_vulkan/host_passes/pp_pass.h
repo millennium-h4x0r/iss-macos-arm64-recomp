@@ -18,6 +18,7 @@ public:
         float gamma = 1.0f;
         u32 hdr = 0;
         u32 srgb_input = 0;
+        float brightness = 1.0f; // tlg: user display gamma on the final image (1 = unchanged)
     };
 
     void Create(vk::Device device, vk::Format surface_format);

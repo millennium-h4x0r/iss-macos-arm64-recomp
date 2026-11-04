@@ -12,6 +12,7 @@ layout (push_constant) uniform settings {
     float gamma;
     bool hdr;
     bool srgb_input;
+    float brightness;
 } pp;
 
 const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
@@ -40,5 +41,7 @@ void main() {
     } else {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
         color = vec4(gamma(color_linear.rgb), color_linear.a);
+        // tlg: user brightness, a gamma on the display-encoded image (0 and 1 stay fixed)
+        if (pp.brightness != 1.0) color.rgb = pow(max(color.rgb, vec3(0.0)), vec3(1.0 / pp.brightness));
     }
 }

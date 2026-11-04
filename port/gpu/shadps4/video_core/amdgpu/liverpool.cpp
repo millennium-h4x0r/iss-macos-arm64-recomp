@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <utility>
+#include <map>
+#include <tuple>
 #include <pthread.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -423,7 +425,49 @@ bool PipelinedComputeOpcode(PM4ItOpcode opcode) {
 struct ComputeReleaseMem {
     u32 packet[sizeof(PM4CmdReleaseMem) / sizeof(u32)];
     u32 pipe_id;
+    std::atomic<bool>* written; // tlg (Metal): set once the GPU wrote the label (or null)
 };
+
+#ifdef TLG_METAL
+static bool TlgComputeFenceNow() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_COMPUTE_FENCE_NOW");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+// tlg: which compute labels are written when recorded rather than when the GPU has run the work.
+// inFAMOUS uses two kinds: timeline counters (one address, a rising value: its GPU particle
+// state is read once they pass) and job flags (a fresh address set to 1 per GPU job, polled by
+// its job system). Here every queue runs in one GPU stream, so a compute job finishes behind the
+// whole frame of graphics before it (on the console it runs beside it); a job flag written that
+// late made the game drop work it took as late (Walk to Seattle: no lighting, the frame gray).
+// The flags are written when recorded (as before 2026-11-04), the counters wait for the GPU.
+// TLG_METAL_CF_NOW_RANGE=<lo>:<hi> (hex): labels in that range are written when recorded too;
+// TLG_METAL_CF_FLAGS_DEFER=1: job flags wait for the GPU as well.
+static bool TlgComputeLabelNow(const PM4CmdReleaseMem& release_mem) {
+    static const std::pair<VAddr, VAddr> range = [] {
+        const char* v = std::getenv("TLG_METAL_CF_NOW_RANGE");
+        if (!v) {
+            return std::pair<VAddr, VAddr>{0, 0};
+        }
+        char* end = nullptr;
+        const VAddr lo = std::strtoull(v, &end, 16);
+        const VAddr hi = end && *end == ':' ? std::strtoull(end + 1, nullptr, 16) : 0;
+        return std::pair<VAddr, VAddr>{lo, hi};
+    }();
+    static const bool flags_defer = [] {
+        const char* v = std::getenv("TLG_METAL_CF_FLAGS_DEFER");
+        return v && v[0] == '1';
+    }();
+    const VAddr address = release_mem.Address<VAddr>();
+    if (address >= range.first && address < range.second) {
+        return true;
+    }
+    return !flags_defer && release_mem.data_sel.Value() == DataSelect::Data32Low &&
+           release_mem.DataDWord() == 1;
+}
+#endif
 
 // tlg: a compute queue's end-of-pipe fence, after the draws and dispatches handed over before it.
 void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
@@ -434,11 +478,11 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // compute work done before it ran and read a stale GPU particle count (inFAMOUS: GDS 0x404,
     // copied by the GDS store before the label), so its fires died every few seconds. A GDS
     // store records its GPU copy now. TLG_METAL_COMPUTE_FENCE_NOW=1: the old way.
-    static const bool fence_now = [] {
-        const char* v = std::getenv("TLG_METAL_COMPUTE_FENCE_NOW");
-        return v && v[0] == '1';
-    }();
-    if (!fence_now) {
+    // Compute waits pass on the label's value meanwhile (DeferredComputeValue): a dependent
+    // queue stalled until the GPU finished let graphics use its results before they were
+    // recorded (inFAMOUS "Walk to Seattle": lighting missing, the frame gray).
+    if (!TlgComputeFenceNow() &&
+        !TlgComputeLabelNow(*reinterpret_cast<const PM4CmdReleaseMem*>(task.packet))) {
         rasterizer.WaitHostCopies();
         rasterizer.ProcessDownloadImages();
         const auto* packet = reinterpret_cast<const PM4CmdReleaseMem*>(task.packet);
@@ -458,6 +502,9 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
         rasterizer.DeferUnifiedFence([copy, irq] {
             reinterpret_cast<const PM4CmdReleaseMem*>(copy.packet)->SignalFence(
                 irq, [](VAddr, u16, u16) {});
+            if (copy.written) {
+                copy.written->store(true, std::memory_order_release);
+            }
         });
         return;
     }
@@ -588,6 +635,51 @@ bool Liverpool::KnownOcclusionValue(VAddr address, u32& value) const {
     }
     return false;
 }
+
+#ifdef TLG_METAL
+std::atomic<bool>* Liverpool::NoteDeferredComputeLabel(const u32* packet) {
+    const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(packet);
+    const DataSelect sel = release_mem->data_sel.Value();
+    const u32 num_bytes = sel == DataSelect::Data32Low ? 4 : sel == DataSelect::Data64 ? 8 : 0;
+    if (!num_bytes || TlgComputeFenceNow() ||
+        TlgComputeLabelNow(*release_mem)) {
+        return nullptr;
+    }
+    std::scoped_lock lock{deferred_compute_mutex};
+    std::erase_if(deferred_compute_labels,
+                  [](const auto& l) { return l.written->load(std::memory_order_acquire); });
+    const auto now = std::chrono::steady_clock::now();
+    // TLG_LOG_COMPUTE_RELEASE: labels not yet written by the GPU, and the oldest one's age.
+    if (static const bool log = std::getenv("TLG_LOG_COMPUTE_RELEASE") != nullptr; log) {
+        static u64 notes = 0;
+        if (++notes % 300 == 0 && !deferred_compute_labels.empty()) {
+            std::printf("deferred compute labels: %zu pending, oldest %.1f ms (%#llx)\n",
+                        deferred_compute_labels.size(),
+                        std::chrono::duration<double, std::milli>(now - deferred_compute_labels.front().noted).count(),
+                        (unsigned long long)deferred_compute_labels.front().address);
+        }
+    }
+    auto written = std::make_shared<std::atomic<bool>>(false);
+    deferred_compute_labels.push_back({release_mem->Address<VAddr>(),
+                                       num_bytes == 4 ? release_mem->DataDWord() : release_mem->DataQWord(),
+                                       num_bytes, written, now});
+    return written.get();
+}
+
+bool Liverpool::DeferredComputeValue(VAddr address, u32& value) {
+    std::scoped_lock lock{deferred_compute_mutex};
+    for (auto it = deferred_compute_labels.rbegin(); it != deferred_compute_labels.rend(); ++it) {
+        if (it->written->load(std::memory_order_acquire)) {
+            continue; // memory holds it (or a later write)
+        }
+        if (address >= it->address && address + sizeof(u32) <= it->address + it->num_bytes) {
+            value = static_cast<u32>(it->data >> ((address - it->address) * 8));
+            return true;
+        }
+    }
+    return false;
+}
+#endif
 
 bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
     for (auto it = pending_fences.rbegin(); it != pending_fences.rend(); ++it) {
@@ -2054,6 +2146,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+#ifdef TLG_METAL
+            // tlg (Metal): a label another compute queue handed to the recording thread counts
+            // as written; the GPU runs the work recorded after this wait after it.
+            if (u32 value; pipelined &&
+                           wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
+                           !wait_reg_mem->Test(regs.reg_array) &&
+                           DeferredComputeValue(wait_reg_mem->Address<VAddr>(), value) &&
+                           wait_reg_mem->TestValue(value)) {
+                break;
+            }
+#endif
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 // tlg: the value may come from a fence the recording thread has yet to write.
                 if (pipelined && !rasterizer->DrawPipeIdle()) {
@@ -2069,6 +2172,26 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 ComputeReleaseMem task;
                 std::memcpy(task.packet, header, sizeof(task.packet));
                 task.pipe_id = queue.pipe_id;
+#ifdef TLG_METAL
+                // TLG_LOG_COMPUTE_RELEASE=1: each compute label's queue, address, data and
+                // interrupt kind once (with a count every 600 releases).
+                if (static const bool log = std::getenv("TLG_LOG_COMPUTE_RELEASE") != nullptr; log) {
+                    static std::mutex m;
+                    static std::map<std::tuple<u32, u32, VAddr>, u64> seen;
+                    std::scoped_lock lk{m};
+                    const auto* rm = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+                    const auto key = std::make_tuple(queue.pipe_id, vqid, rm->Address<VAddr>());
+                    if (seen[key]++ == 0 || seen[key] % 600 == 0) {
+                        std::printf("compute release pipe %u vqid %u addr %#llx sel %u int %u data %#x n=%llu\n",
+                                    queue.pipe_id, vqid, (unsigned long long)rm->Address<VAddr>(),
+                                    u32(rm->data_sel.Value()), u32(rm->int_sel.Value()), rm->data_lo,
+                                    (unsigned long long)seen[key]);
+                    }
+                }
+                task.written = NoteDeferredComputeLabel(task.packet);
+#else
+                task.written = nullptr;
+#endif
                 rasterizer->RunInOrder(&RunComputeReleaseMem, &task, sizeof(task));
                 break;
             }

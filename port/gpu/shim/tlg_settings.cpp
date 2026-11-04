@@ -143,6 +143,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.display_mode = TlgGraphics::ParseDisplayMode(value);
     } else if (key == "vsync") {
         v.vsync = i != 0;
+    } else if (key == "brightness") {
+        v.brightness = std::clamp(f, 0.5f, 2.5f);
     } else if (key == "fps_limit") {
         v.fps_limit = TlgGraphics::ParseFpsLimit(i);
     } else if (key == "async_shaders") {
@@ -389,6 +391,7 @@ void Save() {
         int(v.iss_power_switch_enabled.load()),v.iss_power_keys[0].load(),v.iss_power_keys[1].load(),v.iss_power_keys[2].load(),v.iss_power_keys[3].load());
     std::fprintf(file,"iss_power_instant=%d\n",int(v.iss_power_instant.load()));
     std::fprintf(file,"iss_power_glow=%.2f\n",v.iss_power_glow.load());
+    std::fprintf(file, "brightness=%.2f\n", v.brightness.load());
     std::fprintf(file, "red_orb_multiplier=%.3f\n", v.red_orb_multiplier.load());
     std::fprintf(file, "damage_dealt=%.3f\n", v.damage_dealt.load());
     std::fprintf(file, "damage_taken=%.3f\n", v.damage_taken.load());

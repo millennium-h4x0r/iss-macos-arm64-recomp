@@ -5,7 +5,10 @@
 
 #include <cstdlib>
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <deque>
 #include <coroutine>
 #include <exception>
@@ -80,6 +83,22 @@ struct Liverpool {
         u64 position;
     };
     std::deque<PendingFence> pending_fences;
+#ifdef TLG_METAL
+    // tlg (Metal): compute end-of-pipe labels handed to the recording thread, written when the
+    // GPU has run the work before them (RunComputeReleaseMem). Until then a compute queue's wait
+    // for one passes on the value: the GPU runs the recorded work in order.
+    struct DeferredComputeLabel {
+        VAddr address;
+        u64 data;
+        u32 num_bytes;
+        std::shared_ptr<std::atomic<bool>> written;
+        std::chrono::steady_clock::time_point noted;
+    };
+    std::deque<DeferredComputeLabel> deferred_compute_labels;
+    std::mutex deferred_compute_mutex;
+    std::atomic<bool>* NoteDeferredComputeLabel(const u32* release_mem);
+    bool DeferredComputeValue(VAddr address, u32& value);
+#endif
     void NotePendingFences(const auto& event);
     bool PendingFenceValue(VAddr address, u32& value);
     void NotePendingWrite(const struct PM4CmdWriteData& write_data, u32 num_bytes);

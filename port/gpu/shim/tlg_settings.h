@@ -86,6 +86,9 @@ struct Values {
     std::atomic<int> exclusive_status{0}; // 0 off, 1 waiting, 2 acquired, -1 unavailable
     std::atomic<const char*> exclusive_problem{nullptr};
     std::atomic<bool> vsync{true};
+    /// Display brightness applied when presenting (a gamma on the final image): 1 = as the game
+    /// outputs it (PS4), above 1 brighter shadows and midtones, below 1 darker. Highlights stay put.
+    std::atomic<float> brightness{1.0f};
     std::atomic<int> fps_limit{0};
     /// Off by default (2026-10-16): a draw whose pipeline was still compiling was skipped, and the
     /// object vanished for a frame (grey flashes when the camera turns). Measured in the city with the
