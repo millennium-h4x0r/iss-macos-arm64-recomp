@@ -35,14 +35,14 @@ trap 'rm -rf "$TMP"' EXIT
 STAGE=$TMP/$NAME.app
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp "$SRC" "$STAGE/Contents/MacOS/iss-recomp"
-cat > "$STAGE/Contents/MacOS/launcher" <<LAUNCH
+cat > "$STAGE/Contents/Resources/launcher" <<LAUNCH
 #!/bin/bash
 # Written by install-app.sh: starts the game through run.sh (its environment and arguments).
-export ISS_APP_BIN="\$(cd "\$(dirname "\$0")" && pwd)/iss-recomp"
+export ISS_APP_BIN="\$(cd "\$(dirname "\$0")/../MacOS" && pwd)/iss-recomp"
 export ISS_METAL=$METAL
 exec "$ROOT/run.sh" "\$@"
 LAUNCH
-chmod +x "$STAGE/Contents/MacOS/launcher"
+chmod +x "$STAGE/Contents/Resources/launcher"
 
 # Icon: the game's own (sce_sys/icon0.png).
 ICON=$GAME/sce_sys/icon0.png
@@ -66,7 +66,7 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>$ID</string>
     <key>CFBundleName</key><string>$NAME</string>
     <key>CFBundleDisplayName</key><string>$NAME</string>
-    <key>CFBundleExecutable</key><string>launcher</string>
+    <key>CFBundleExecutable</key><string>iss-recomp</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.07</string>

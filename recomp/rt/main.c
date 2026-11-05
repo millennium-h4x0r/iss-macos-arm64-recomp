@@ -208,7 +208,31 @@ void runtime_restart(void) {
 static int boot_main(int argc, char **argv);
 static int boot_argc; static char **boot_argv;
 static void *boot_thread(void *arg) { (void)arg; exit(boot_main(boot_argc, boot_argv)); return NULL; }
+#ifdef __APPLE__
+#include <limits.h>
+#include <mach-o/dyld.h>
+/* tlg: the app bundle's main executable is this binary (Game Mode looks at the process's
+ * executable, not a launcher script). Started by macOS with no arguments, it runs the bundle's
+ * launcher (environment, run.sh), which execs it again with the game's arguments: one process. */
+static void app_reexec(int argc, char **argv) {
+    if ((argc != 1 && !(argc == 2 && strncmp(argv[1], "-psn", 4) == 0)) || getenv("ISS_APP_REEXEC")) return;
+    char self[PATH_MAX], real[PATH_MAX];
+    uint32_t n = sizeof(self);
+    if (_NSGetExecutablePath(self, &n) != 0 || !realpath(self, real)) return;
+    char *macos = strstr(real, ".app/Contents/MacOS/");
+    if (!macos) return;
+    strcpy(macos + strlen(".app/Contents/"), "Resources/launcher");
+    if (access(real, X_OK) != 0) return;
+    setenv("ISS_APP_REEXEC", "1", 1);
+    char *args[] = {real, NULL};
+    execv(real, args);
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef __APPLE__
+    app_reexec(argc, argv);
+#endif
     saved_argv = argv;
     setvbuf(stdout, NULL, _IONBF, 0);
     /* The process main thread belongs to the window (Cocoa); the game boots on another thread. */
