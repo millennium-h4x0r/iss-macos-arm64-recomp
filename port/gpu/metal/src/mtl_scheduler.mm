@@ -63,6 +63,9 @@ struct Scheduler::Impl {
     std::condition_variable cv;
     std::mutex pending_mutex; ///< DeferOperation may come from guest threads (unmaps)
     std::deque<std::pair<u64, Common::UniqueFunction<void>>> pending;
+    /// tlg: the front's tick (~0: none), so the per-draw PopPendingOperations needs no lock
+    /// until one is due. Written under pending_mutex.
+    std::atomic<u64> pending_front{~u64(0)};
 
     std::mutex signal_mutex;
     std::condition_variable signal_cv;
@@ -442,10 +445,15 @@ void Scheduler::Wait(u64 tick) {
 void Scheduler::DeferOperation(Common::UniqueFunction<void>&& func) {
     std::scoped_lock lock{impl->pending_mutex};
     impl->pending.emplace_back(CurrentTick(), std::move(func));
+    impl->pending_front.store(impl->pending.front().first, std::memory_order_release);
 }
 
 void Scheduler::PopPendingOperations() {
     for (;;) {
+        if (const u64 front = impl->pending_front.load(std::memory_order_acquire);
+            front == ~u64(0) || !IsFree(front)) {
+            return;
+        }
         Common::UniqueFunction<void> func;
         {
             std::scoped_lock lock{impl->pending_mutex};
@@ -454,6 +462,8 @@ void Scheduler::PopPendingOperations() {
             }
             func = std::move(impl->pending.front().second);
             impl->pending.pop_front();
+            impl->pending_front.store(impl->pending.empty() ? ~u64(0) : impl->pending.front().first,
+                                      std::memory_order_release);
         }
         func();
     }

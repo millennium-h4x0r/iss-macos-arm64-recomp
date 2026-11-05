@@ -105,6 +105,35 @@ struct Rasterizer::DrawState::Impl {
     u32 pass_width = 0, pass_height = 0;
     bool pass_open = false;
     u32 since_commit = 0; ///< draws recorded since the command buffer was last committed
+
+    /// tlg: the state set on the current render encoder, so a draw only sets what changed
+    /// (every draw set ~20 states: a third of the command processor thread is in Metal). Valid
+    /// for one encoder (pointer and the scheduler's encoder count). TLG_METAL_STATE_CACHE=0: off.
+    struct EncCache {
+        void* enc = nullptr;
+        u64 count = ~0ull;
+        void* pso = nullptr;
+        void* buf[2][32]{};
+        u64 off[2][32]{};
+        void* tex[2][128]{};
+        void* smp[2][16]{};
+        u32 sizes[2][32]{};
+        bool sizes_valid[2]{};
+        Shader::PushData push[2]{};
+        bool push_valid[2]{};
+        MTLViewport viewport{};
+        bool viewport_valid = false;
+        MTLScissorRect scissor{};
+        bool scissor_valid = false;
+        int cull = -1, winding = -1, fill = -1, clip = -1;
+        float bias[3]{};
+        bool bias_valid = false;
+        float blend[4]{};
+        bool blend_valid = false;
+        void* ds = nullptr;
+        u32 sref[2]{};
+        bool sref_valid = false;
+    } ec;
 };
 
 namespace {
@@ -1452,36 +1481,82 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         enc.label = [NSString stringWithUTF8String:label];
     }
 
-    // State.
-    [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pipeline->pso];
-    const auto bind = [&](const StageBindings& b, bool vertex) {
-        for (u32 i = 0; i < b.num_buffers; ++i) {
-            if (vertex) {
-                [enc setVertexBuffer:b.buffers[i] offset:b.offsets[i] atIndex:i];
-            } else {
-                [enc setFragmentBuffer:b.buffers[i] offset:b.offsets[i] atIndex:i];
-            }
+    // State (only what changed on this encoder: d.ec).
+    static const bool state_cache = [] {
+        const char* v = std::getenv("TLG_METAL_STATE_CACHE");
+        return !v || v[0] != '0';
+    }();
+    auto& ec = d.ec;
+    if (!state_cache || ec.enc != (__bridge void*)enc || ec.count != scheduler.EncoderCount()) {
+        ec = {};
+        ec.enc = (__bridge void*)enc;
+        ec.count = scheduler.EncoderCount();
+    }
+    if (ec.pso != pipeline->pso) {
+        [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pipeline->pso];
+        ec.pso = pipeline->pso;
+    }
+    const auto set_buffer = [&](int st, __unsafe_unretained id<MTLBuffer> buffer, u64 offset, u32 index) {
+        if (index < 32 && ec.buf[st][index] == (__bridge void*)buffer && ec.off[st][index] == offset) {
+            return;
         }
-        if (b.num_textures) {
+        if (st == 0) {
+            [enc setVertexBuffer:buffer offset:offset atIndex:index];
+        } else {
+            [enc setFragmentBuffer:buffer offset:offset atIndex:index];
+        }
+        if (index < 32) {
+            ec.buf[st][index] = (__bridge void*)buffer;
+            ec.off[st][index] = offset;
+        }
+        if (index == BufferSizesBufferIndex) {
+            ec.sizes_valid[st] = false;
+        } else if (index == PushDataBufferIndex) {
+            ec.push_valid[st] = false;
+        }
+    };
+    const auto bind = [&](const StageBindings& b, bool vertex) {
+        const int st = vertex ? 0 : 1;
+        for (u32 i = 0; i < b.num_buffers; ++i) {
+            set_buffer(st, b.buffers[i], b.offsets[i], i);
+        }
+        if (b.num_textures &&
+            std::memcmp(ec.tex[st], b.textures.data(), sizeof(void*) * b.num_textures) != 0) {
             if (vertex) {
                 [enc setVertexTextures:b.textures.data() withRange:NSMakeRange(0, b.num_textures)];
             } else {
                 [enc setFragmentTextures:b.textures.data() withRange:NSMakeRange(0, b.num_textures)];
             }
+            std::memcpy(ec.tex[st], b.textures.data(), sizeof(void*) * b.num_textures);
         }
-        if (b.num_samplers) {
+        if (b.num_samplers &&
+            std::memcmp(ec.smp[st], b.samplers.data(), sizeof(void*) * b.num_samplers) != 0) {
             if (vertex) {
                 [enc setVertexSamplerStates:b.samplers.data() withRange:NSMakeRange(0, b.num_samplers)];
             } else {
                 [enc setFragmentSamplerStates:b.samplers.data() withRange:NSMakeRange(0, b.num_samplers)];
             }
+            std::memcpy(ec.smp[st], b.samplers.data(), sizeof(void*) * b.num_samplers);
         }
-        if (vertex) {
-            [enc setVertexBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
-            [enc setVertexBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
-        } else {
-            [enc setFragmentBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
-            [enc setFragmentBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
+        if (!ec.sizes_valid[st] || std::memcmp(ec.sizes[st], b.sizes.data(), sizeof(u32) * 32) != 0) {
+            if (vertex) {
+                [enc setVertexBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
+            } else {
+                [enc setFragmentBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
+            }
+            std::memcpy(ec.sizes[st], b.sizes.data(), sizeof(u32) * 32);
+            ec.sizes_valid[st] = true;
+            ec.buf[st][BufferSizesBufferIndex] = nullptr;
+        }
+        if (!ec.push_valid[st] || std::memcmp(&ec.push[st], &push_data, sizeof(push_data)) != 0) {
+            if (vertex) {
+                [enc setVertexBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
+            } else {
+                [enc setFragmentBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
+            }
+            std::memcpy(&ec.push[st], &push_data, sizeof(push_data));
+            ec.push_valid[st] = true;
+            ec.buf[st][PushDataBufferIndex] = nullptr;
         }
     };
     bind(stage_bindings[u32(SwStage::Vertex)], true);
@@ -1489,9 +1564,8 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         bind(stage_bindings[u32(SwStage::Fragment)], false);
     }
     for (u32 i = 0; i < num_vertex_buffers; ++i) {
-        [enc setVertexBuffer:vertex_buffers[i].buffer
-                      offset:vertex_buffers[i].offset
-                     atIndex:pipeline->vertex_buffer_base + i];
+        set_buffer(0, vertex_buffers[i].buffer, vertex_buffers[i].offset,
+                   pipeline->vertex_buffer_base + i);
     }
 
     // Viewport and scissor.
@@ -1531,7 +1605,11 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             viewport.originY = vy + vh;
             viewport.height = -vh;
         }
-        [enc setViewport:viewport];
+        if (!ec.viewport_valid || std::memcmp(&ec.viewport, &viewport, sizeof(viewport)) != 0) {
+            [enc setViewport:viewport];
+            ec.viewport = viewport;
+            ec.viewport_valid = true;
+        }
 
         const auto tl = [](s16 scr, s16 win, s16 gen, s16 off) {
             return std::max({scr, s16(win + off), s16(gen + off)});
@@ -1578,8 +1656,13 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             ResetBindings();
             return; // nothing visible
         }
-        [enc setScissorRect:MTLScissorRect{NSUInteger(x0), NSUInteger(y0), NSUInteger(x1 - x0),
-                                           NSUInteger(y1 - y0)}];
+        const MTLScissorRect scissor{NSUInteger(x0), NSUInteger(y0), NSUInteger(x1 - x0),
+                                     NSUInteger(y1 - y0)};
+        if (!ec.scissor_valid || std::memcmp(&ec.scissor, &scissor, sizeof(scissor)) != 0) {
+            [enc setScissorRect:scissor];
+            ec.scissor = scissor;
+            ec.scissor_valid = true;
+        }
     }
 
     // Rasterization.
@@ -1590,33 +1673,58 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         ResetBindings();
         return;
     }
-    [enc setCullMode:no_cull ? MTLCullModeNone
-                     : cull == vk::CullModeFlagBits::eFront ? MTLCullModeFront
-                     : cull == vk::CullModeFlagBits::eBack ? MTLCullModeBack
-                                                            : MTLCullModeNone];
+    const MTLCullMode cull_mode = no_cull ? MTLCullModeNone
+                                  : cull == vk::CullModeFlagBits::eFront ? MTLCullModeFront
+                                  : cull == vk::CullModeFlagBits::eBack ? MTLCullModeBack
+                                                                         : MTLCullModeNone;
+    if (ec.cull != int(cull_mode)) {
+        [enc setCullMode:cull_mode];
+        ec.cull = int(cull_mode);
+    }
     // Window positions match Vulkan's (viewport above), so does the winding.
-    [enc setFrontFacingWinding:LiverpoolToVK::FrontFace(regs.polygon_control.front_face) ==
+    const MTLWinding winding = LiverpoolToVK::FrontFace(regs.polygon_control.front_face) ==
                                        vk::FrontFace::eClockwise
                                    ? MTLWindingClockwise
-                                   : MTLWindingCounterClockwise];
-    [enc setTriangleFillMode:regs.polygon_control.PolyMode() == AmdGpu::PolygonMode::Fill
-                                 ? MTLTriangleFillModeFill
-                                 : MTLTriangleFillModeLines];
+                                   : MTLWindingCounterClockwise;
+    if (ec.winding != int(winding)) {
+        [enc setFrontFacingWinding:winding];
+        ec.winding = int(winding);
+    }
+    const MTLTriangleFillMode fill = regs.polygon_control.PolyMode() == AmdGpu::PolygonMode::Fill
+                                         ? MTLTriangleFillModeFill
+                                         : MTLTriangleFillModeLines;
+    if (ec.fill != int(fill)) {
+        [enc setTriangleFillMode:fill];
+        ec.fill = int(fill);
+    }
     const bool clamp = !regs.depth_render_override.disable_viewport_clamp;
-    [enc setDepthClipMode:(!regs.clipper_control.ZclipEnable() && clamp) ? MTLDepthClipModeClamp
-                                                                         : MTLDepthClipModeClip];
+    const MTLDepthClipMode clip = (!regs.clipper_control.ZclipEnable() && clamp) ? MTLDepthClipModeClamp
+                                                                                 : MTLDepthClipModeClip;
+    if (ec.clip != int(clip)) {
+        [enc setDepthClipMode:clip];
+        ec.clip = int(clip);
+    }
+    float bias[3] = {0, 0, 0};
     if (regs.polygon_control.NeedsBias()) {
         const bool front = regs.polygon_control.enable_polygon_offset_front;
         const float slope = front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale;
         const float constant = front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset;
-        [enc setDepthBias:constant slopeScale:slope / 16.f clamp:regs.poly_offset.depth_bias];
-    } else {
-        [enc setDepthBias:0 slopeScale:0 clamp:0];
+        bias[0] = constant;
+        bias[1] = slope / 16.f;
+        bias[2] = regs.poly_offset.depth_bias;
     }
-    [enc setBlendColorRed:regs.blend_constants[0]
-                    green:regs.blend_constants[1]
-                     blue:regs.blend_constants[2]
-                    alpha:regs.blend_constants[3]];
+    if (!ec.bias_valid || std::memcmp(ec.bias, bias, sizeof(bias)) != 0) {
+        [enc setDepthBias:bias[0] slopeScale:bias[1] clamp:bias[2]];
+        std::memcpy(ec.bias, bias, sizeof(bias));
+        ec.bias_valid = true;
+    }
+    const float blend[4] = {regs.blend_constants[0], regs.blend_constants[1],
+                            regs.blend_constants[2], regs.blend_constants[3]};
+    if (!ec.blend_valid || std::memcmp(ec.blend, blend, sizeof(blend)) != 0) {
+        [enc setBlendColorRed:blend[0] green:blend[1] blue:blend[2] alpha:blend[3]];
+        std::memcpy(ec.blend, blend, sizeof(blend));
+        ec.blend_valid = true;
+    }
 
     // Depth and stencil.
     {
@@ -1705,9 +1813,15 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             }
             ds = [Metal::Device() newDepthStencilStateWithDescriptor:dd];
         }
-        [enc setDepthStencilState:ds];
-        if (stencil) {
+        if (ec.ds != (__bridge void*)ds) {
+            [enc setDepthStencilState:ds];
+            ec.ds = (__bridge void*)ds;
+        }
+        if (stencil && (!ec.sref_valid || ec.sref[0] != ff.reference || ec.sref[1] != bf.reference)) {
             [enc setStencilFrontReferenceValue:ff.reference backReferenceValue:bf.reference];
+            ec.sref[0] = ff.reference;
+            ec.sref[1] = bf.reference;
+            ec.sref_valid = true;
         }
     }
 
