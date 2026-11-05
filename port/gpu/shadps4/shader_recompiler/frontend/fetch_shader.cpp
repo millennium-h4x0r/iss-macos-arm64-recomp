@@ -17,8 +17,12 @@ thread_local const FetchShaderSnapshot* compiler_snapshot = nullptr;
 /// tlg: set once any thread installs a snapshot (a thread-local access costs a _tlv_get_addr
 /// call on macOS, for every vertex attribute sharp a draw reads).
 std::atomic<bool> compiler_snapshot_used{false};
+/// Out of line: inlined, clang loaded the thread-local before testing the flag.
+[[gnu::noinline]] const FetchShaderSnapshot* CompilerSnapshotTls() {
+    return compiler_snapshot;
+}
 const FetchShaderSnapshot* CompilerSnapshot() {
-    return compiler_snapshot_used.load(std::memory_order_relaxed) ? compiler_snapshot : nullptr;
+    return compiler_snapshot_used.load(std::memory_order_relaxed) ? CompilerSnapshotTls() : nullptr;
 }
 }
 
@@ -102,11 +106,18 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
 }
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
+    if (const auto* data = ParseFetchShaderRef(info)) {
+        return *data;
+    }
+    return std::nullopt;
+}
+
+const FetchShaderData* ParseFetchShaderRef(const Shader::Info& info) {
     if (const auto* snapshot = CompilerSnapshot(); snapshot && snapshot->info == &info) {
-        return snapshot->fetch;
+        return snapshot->fetch ? &*snapshot->fetch : nullptr;
     }
     if (!info.has_fetch_shader) {
-        return std::nullopt;
+        return nullptr;
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
@@ -122,7 +133,7 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (const auto it = cache.find(code);
         !TlgToggle::Disabled(TlgToggle::FetchShaderCache) && it != cache.end() &&
         std::memcmp(code, it->second.code.data(), it->second.code.size() * sizeof(u32)) == 0) {
-        return it->second.data;
+        return &it->second.data;
     }
 
     FetchShaderData data{};
@@ -185,8 +196,9 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (cache.size() >= 4096) {
         cache.clear();
     }
-    cache[code] = CachedParse{std::vector<u32>(code, code_slice.position()), data};
-    return data;
+    auto& entry = cache[code];
+    entry = CachedParse{std::vector<u32>(code, code_slice.position()), std::move(data)};
+    return &entry.data;
 }
 
 } // namespace Shader::Gcn

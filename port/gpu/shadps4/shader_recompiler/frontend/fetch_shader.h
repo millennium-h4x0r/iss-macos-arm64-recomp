@@ -79,5 +79,8 @@ private:
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
+/// tlg: as ParseFetchShader, without the copy: null without a fetch shader. The data stays
+/// valid until the next parse on this thread.
+const FetchShaderData* ParseFetchShaderRef(const Shader::Info& info);
 
 } // namespace Shader::Gcn

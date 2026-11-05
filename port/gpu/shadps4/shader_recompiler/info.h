@@ -186,12 +186,20 @@ struct Info : InfoPersistent {
         if (!ud_snapshots_used.load(std::memory_order_relaxed)) [[likely]] {
             return nullptr;
         }
+        return FindSnapshot();
+    }
+    /// Out of line: inlined, clang loaded the thread-locals before testing the flag (a
+    /// _tlv_get_addr call on every user data access).
+    [[gnu::noinline]] const UdSnapshot* FindSnapshot() const noexcept {
         for (u32 i = 0; i < num_ud_snapshots; ++i) {
             if (ud_snapshots[i].info == this) {
                 return &ud_snapshots[i];
             }
         }
         return nullptr;
+    }
+    [[gnu::noinline]] static const std::unordered_map<u64, std::vector<u32>>* ReplayFlats() noexcept {
+        return replay_flats;
     }
     std::span<const u32> UserData() const noexcept {
         if (const auto* snapshot = Snapshot()) [[unlikely]] {
@@ -258,8 +266,8 @@ struct Info : InfoPersistent {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
-        if (replay_flats_used.load(std::memory_order_relaxed) && replay_flats) {
-            if (const auto it = replay_flats->find(pgm_hash); it != replay_flats->end()) {
+        if (const auto* flats = replay_flats_used.load(std::memory_order_relaxed) ? ReplayFlats() : nullptr) {
+            if (const auto it = flats->find(pgm_hash); it != flats->end()) {
                 const size_t n = std::min(it->second.size(), flattened_ud_buf.size());
                 std::memcpy(flattened_ud_buf.data(), it->second.data(), n * sizeof(u32));
                 return;

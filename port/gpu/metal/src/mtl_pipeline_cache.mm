@@ -56,6 +56,7 @@ std::atomic<u32> g_pipelines{0};
 std::atomic<u32> g_failed{0};
 std::atomic<u32> g_async_skips{0}, g_async_queued{0}; // tlg: async shaders
 std::atomic<u64> g_stage_skips[16]{}; // tlg: draws dropped for their shader stages (GS/tess)
+std::atomic<u64> g_prog_stats[8]{}; // tlg diag: lookups, fast, miss user_data/flat/runtime/start/attribs/new
 std::atomic<u64> g_stage_ns[4]{}; // tlg: recompile+SPIR-V, SPIRV-Cross, MSL compile, render PSO
 inline u64 NsSince(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count();
@@ -884,6 +885,17 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         }
         last.module = index;
     };
+    static const bool prog_stats = std::getenv("TLG_METAL_PROGRAM_STATS") != nullptr;
+    if (prog_stats) {
+        auto& last = program.last;
+        g_prog_stats[0].fetch_add(1, std::memory_order_relaxed);
+        if (!last.valid) g_prog_stats[7].fetch_add(1, std::memory_order_relaxed);
+        else if (!SameSpan(last.user_data, info.user_data)) g_prog_stats[2].fetch_add(1, std::memory_order_relaxed);
+        else if (!SameSpan(last.flat, info.FlatUserData())) g_prog_stats[3].fetch_add(1, std::memory_order_relaxed);
+        else if (!(last.runtime_info == runtime_info)) g_prog_stats[4].fetch_add(1, std::memory_order_relaxed);
+        else if (!(last.start == start)) g_prog_stats[5].fetch_add(1, std::memory_order_relaxed);
+        else g_prog_stats[1].fetch_add(1, std::memory_order_relaxed);
+    }
     if (auto& last = program.last; !no_fast && last.valid && last.module < program.modules.size() &&
                                    last.start == start && SameSpan(last.user_data, info.user_data) &&
                                    SameSpan(last.flat, info.FlatUserData()) &&
@@ -906,11 +918,44 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         }
     }
     if (!program.modules.empty()) {
-        auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
-        auto found = program.last_used < program.modules.size() &&
-                             program.modules[program.last_used].spec == spec
-                         ? program.modules.begin() + program.last_used
-                         : std::ranges::find(program.modules, spec, &Module::spec);
+        // tlg: the permutation lookup compares each module's specialization with this draw's in
+        // place (Matches) instead of building one (~1-2 KB zeroed, a fetch shader copy) per
+        // lookup; most lookups get here (user data changes per draw). TLG_METAL_SPEC_BUILD=1:
+        // the old way. Tessellation stages derive runtime info: the old way too.
+        static const bool build_spec = std::getenv("TLG_METAL_SPEC_BUILD") != nullptr;
+        const bool tess = sw_stage == SwStage::TessellationControl || sw_stage == SwStage::TessellationEval;
+        auto found = program.modules.end();
+        if (build_spec || tess) {
+            auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+            found = program.last_used < program.modules.size() &&
+                            program.modules[program.last_used].spec == spec
+                        ? program.modules.begin() + program.last_used
+                        : std::ranges::find(program.modules, spec, &Module::spec);
+        } else if (program.last_used < program.modules.size() &&
+                   program.modules[program.last_used].spec.Matches(info, runtime_info, binding)) {
+            found = program.modules.begin() + program.last_used;
+        } else {
+            found = std::ranges::find_if(program.modules, [&](const Module& m) {
+                return m.spec.Matches(info, runtime_info, binding);
+            });
+        }
+        if (static const bool verify = std::getenv("TLG_METAL_SPEC_VERIFY") != nullptr;
+            verify && !build_spec && !tess) {
+            // Diagnosis: the in-place match must agree with operator== on every module.
+            const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+            static std::atomic<u64> checks{0}, bad{0};
+            for (const Module& m : program.modules) {
+                if ((m.spec == spec) != m.spec.Matches(info, runtime_info, binding) &&
+                    bad.fetch_add(1) < 16) {
+                    std::printf("GPU (Metal): spec match disagrees on %016llx (stage %u)\n",
+                                (unsigned long long)params.hash, u32(sw_stage));
+                }
+            }
+            if ((checks.fetch_add(1) & 0x3ffff) == 0) {
+                std::printf("GPU (Metal): spec verify %llu lookups, %llu disagreements\n",
+                            (unsigned long long)checks.load(), (unsigned long long)bad.load());
+            }
+        }
         if (found != program.modules.end()) {
             program.last_used = std::distance(program.modules.begin(), found);
             remember(program.last_used);
@@ -1563,6 +1608,13 @@ void PipelineCache::ReportCompilerStats() {
         std::printf("GPU (Metal): async shaders: %u queued, %u stage lookups skipped while "
                     "compiling\n",
                     queued, skips);
+    }
+    if (const u64 n = g_prog_stats[0].exchange(0)) {
+        std::printf("GPU (Metal): program lookups %llu: fast-eligible %llu, miss user_data %llu flat %llu runtime %llu start %llu first %llu\n",
+                    (unsigned long long)n, (unsigned long long)g_prog_stats[1].exchange(0),
+                    (unsigned long long)g_prog_stats[2].exchange(0), (unsigned long long)g_prog_stats[3].exchange(0),
+                    (unsigned long long)g_prog_stats[4].exchange(0), (unsigned long long)g_prog_stats[5].exchange(0),
+                    (unsigned long long)g_prog_stats[7].exchange(0));
     }
     const u32 compiles = g_compiles.exchange(0);
     if (compiles) {

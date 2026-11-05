@@ -554,6 +554,46 @@ struct StageBindings {
     bool writes_images = false; ///< binds a storage image
 };
 
+// tlg: a texture binding's ImageDesc (ImageInfo with its mip layout, ImageViewInfo) depends only
+// on the T# and the shader's resource flags; built for every texture of every draw it was ~6% of
+// the command processor thread. A direct-mapped memo of the last ones (BindStage runs on the
+// command processor thread only). TLG_METAL_IMAGE_DESC_MEMO=0: off.
+static VideoCore::TextureCache::ImageDesc CachedImageDesc(const AmdGpu::Image& tsharp,
+                                                          const Shader::ImageResource& res) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("TLG_METAL_IMAGE_DESC_MEMO");
+        return !v || v[0] != '0';
+    }();
+    if (!enabled) {
+        return VideoCore::TextureCache::ImageDesc{tsharp, res};
+    }
+    static_assert(sizeof(AmdGpu::Image) == 32);
+    const u32 flags = u32(res.is_depth) | u32(res.is_atomic) << 1 | u32(res.is_array) << 2 |
+                      u32(res.is_written) << 3 | u32(res.is_r128) << 4 | u32(res.needs_native) << 5 |
+                      u32(res.constant_mip_index) << 8 | u32(res.mip_fallback_mode) << 16 |
+                      u32(res.post_op) << 24;
+    struct Entry {
+        u64 sharp[4];
+        u32 flags;
+        bool valid;
+        VideoCore::TextureCache::ImageDesc desc;
+    };
+    static Entry entries[256];
+    u64 words[4];
+    std::memcpy(words, &tsharp, sizeof(words));
+    u64 h = (words[0] ^ words[1] * 0x9E3779B97F4A7C15ull ^ words[2] * 0xC2B2AE3D27D4EB4Full ^
+             words[3] * 0x165667B19E3779F9ull ^ flags) * 0xFF51AFD7ED558CCDull;
+    Entry& e = entries[h >> 56];
+    if (e.valid && e.flags == flags && std::memcmp(e.sharp, words, sizeof(words)) == 0) {
+        return e.desc;
+    }
+    e.desc = VideoCore::TextureCache::ImageDesc{tsharp, res};
+    std::memcpy(e.sharp, words, sizeof(words));
+    e.flags = flags;
+    e.valid = true;
+    return e.desc;
+}
+
 /// Collects the resources of `stage` (texture cache and buffer cache work happens here, before
 /// any render pass is opened).
 bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& binding,
@@ -683,7 +723,7 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
             if (tsharp.Address() != 0 &&
                 tsharp.GetDataFmt() != AmdGpu::DataFormat::FormatInvalid &&
                 memory->IsValidGpuMapping(tsharp.Address(), 0)) {
-                VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+                VideoCore::TextureCache::ImageDesc desc = CachedImageDesc(tsharp, image_desc);
                 if (image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                     desc.view_info.range.base.level += image_desc.constant_mip_index;
                     desc.view_info.range.extent.levels = 1;

@@ -156,6 +156,9 @@ bool BufferCache::IsInPlace(VAddr addr, u64 size) {
     if (addr >= unified_base && addr + size <= unified_end) {
         return true;
     }
+    if (FindHint(addr, size)) {
+        return true;
+    }
     std::scoped_lock lock{imports_mutex};
     auto it = imports.upper_bound(addr);
     if (it == imports.begin()) {
@@ -182,12 +185,24 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr addr, u64 size, bo
     if (addr >= unified_base && addr + size <= unified_end) {
         return {unified.get(), addr - unified->CpuAddr()};
     }
+    static const bool hints_on = [] {
+        const char* v = std::getenv("TLG_METAL_IMPORT_HINTS");
+        return !v || v[0] != '0';
+    }();
+    if (hints_on) {
+        if (Buffer* b = FindHint(addr, size)) {
+            return {b, addr - b->CpuAddr()};
+        }
+    }
     {
         std::scoped_lock lock{imports_mutex};
         auto it = imports.upper_bound(addr);
         if (it != imports.begin()) {
             --it;
             if (addr + size <= it->second.end) {
+                if (hints_on) {
+                    AddHint(it->first, it->second.end, it->second.buffer.get());
+                }
                 return {it->second.buffer.get(), addr - it->second.buffer->CpuAddr()};
             }
         }
@@ -203,6 +218,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr addr, u64 size, bo
             auto* raw = buffer.get();
             auto& slot = imports[start];
             if (!slot.buffer || slot.end < end) {
+                ClearHints();
                 if (slot.buffer) {
                     // A smaller import at the same start: keep it alive until the GPU is done.
                     auto old = std::make_shared<std::unique_ptr<Buffer>>(std::move(slot.buffer));
@@ -236,6 +252,7 @@ void BufferCache::MapMemory(VAddr addr, u64 size) {
     std::scoped_lock lock{imports_mutex};
     const VAddr start = buffer->CpuAddr();
     const VAddr end = start + buffer->SizeBytes();
+    ClearHints();
     imports[start] = Import{end, std::move(buffer)};
 }
 
@@ -243,6 +260,7 @@ void BufferCache::UnmapMemory(VAddr addr, u64 size) {
     std::vector<std::unique_ptr<Buffer>> released;
     {
         std::scoped_lock lock{imports_mutex};
+        ClearHints();
         for (auto it = imports.begin(); it != imports.end();) {
             if (it->first < addr + size && addr < it->second.end) {
                 released.push_back(std::move(it->second.buffer));

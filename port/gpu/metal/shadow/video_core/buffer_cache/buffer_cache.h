@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -93,6 +94,59 @@ private:
     VAddr unified_end = 0;
     std::mutex imports_mutex;
     std::map<VAddr, Import> imports; ///< by start address
+    /// tlg: the imports the last bindings found, read without imports_mutex (a seqlock; written
+    /// and cleared under it, cleared on every change of imports). ObtainBuffer's lock was ~6% of
+    /// the command processor thread.
+    struct ImportHint {
+        std::atomic<VAddr> start{0};
+        std::atomic<VAddr> end{0};
+        std::atomic<Buffer*> buffer{nullptr};
+    };
+    static constexpr u32 NumHints = 8;
+    std::atomic<u32> hint_seq{0};
+    ImportHint hints[NumHints];
+    u32 hint_next = 0;
+    Buffer* FindHint(VAddr addr, u64 size) const noexcept {
+        const u32 seq = hint_seq.load(std::memory_order_acquire);
+        if (seq & 1) {
+            return nullptr;
+        }
+        Buffer* found = nullptr;
+        for (const auto& h : hints) {
+            Buffer* b = h.buffer.load(std::memory_order_relaxed);
+            if (b && h.start.load(std::memory_order_relaxed) <= addr &&
+                addr + size <= h.end.load(std::memory_order_relaxed)) {
+                found = b;
+                break;
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return hint_seq.load(std::memory_order_relaxed) == seq ? found : nullptr;
+    }
+    /// Under imports_mutex.
+    template <typename F>
+    void WriteHints(F&& f) noexcept {
+        const u32 seq = hint_seq.load(std::memory_order_relaxed);
+        hint_seq.store(seq + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        f();
+        hint_seq.store(seq + 2, std::memory_order_release);
+    }
+    void AddHint(VAddr start, VAddr end, Buffer* buffer) noexcept {
+        WriteHints([&] {
+            auto& h = hints[hint_next++ % NumHints];
+            h.start.store(start, std::memory_order_relaxed);
+            h.end.store(end, std::memory_order_relaxed);
+            h.buffer.store(buffer, std::memory_order_relaxed);
+        });
+    }
+    void ClearHints() noexcept {
+        WriteHints([&] {
+            for (auto& h : hints) {
+                h.buffer.store(nullptr, std::memory_order_relaxed);
+            }
+        });
+    }
     u64 copied_bindings = 0;
 };
 
