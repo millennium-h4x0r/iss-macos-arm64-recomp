@@ -526,11 +526,12 @@ void Rasterizer::DrawState::OnSubmit() {
         unaligned_vertex_buffers = 0;
     }
     if (!prims.empty() || indirect_draws) {
-        std::printf("GPU (Metal): skipped primitives (type:count)%s; indirect draws %llu, "
-                    "indirect dispatches %llu, draw barriers %llu\n",
-                    prims.c_str(), (unsigned long long)indirect_draws,
+        std::printf("GPU (Metal): skipped primitives (type:count)%s; indirect draws %llu "
+                    "(%llu quads as strips), indirect dispatches %llu, draw barriers %llu\n",
+                    prims.c_str(), (unsigned long long)indirect_draws, (unsigned long long)quad_strips,
                     (unsigned long long)indirect_dispatches, (unsigned long long)draw_barriers);
     }
+    quad_strips = 0;
     prim_counts = {};
     indirect_draws = indirect_dispatches = draw_barriers = 0;
     draws = skipped_draws = dispatches = skipped_dispatches = 0;
@@ -1075,7 +1076,56 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
 
     // Indirect quad lists: triangle-list indices and indexed arguments made on the GPU.
     bool quad_indirect = false;
-    if (indirect && regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
+    // Experiment: TLG_METAL_SKIP_QUAD_INDIRECT=1 drops indirect quad draws (cost of the conversion).
+    if (static const bool skip_qi = std::getenv("TLG_METAL_SKIP_QUAD_INDIRECT") != nullptr;
+        skip_qi && indirect && regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
+        ResetBindings();
+        return;
+    }
+    // tlg: indexed indirect quads of one quad per instance (inFAMOUS's particles: guest
+    // arguments {4, instances, 0, 0, 0}, the GPU writes the instance count) are drawn from the
+    // guest's arguments as they are (the same layout as Metal's) as triangle strips of the
+    // quad's 4 indices reordered 0 1 3 2. The conversion kernel otherwise ended the render pass
+    // before each such draw (~90 per frame on the burning road: the attachments stored and
+    // loaded again each time). Checked on the arguments as the CPU sees them now; anything else
+    // is converted. TLG_METAL_QUAD_STRIPS=0: always convert.
+    bool quad_strip = false;
+    if (static const bool strips = [] {
+            const char* v = std::getenv("TLG_METAL_QUAD_STRIPS");
+            return !v || v[0] != '0';
+        }();
+        strips && indirect && is_indexed && regs.primitive_type == AmdGpu::PrimitiveType::QuadList &&
+        indirect->stride >= 20 && regs.num_indices >= 4) {
+        quad_strip = true;
+        for (u32 i = 0; i < indirect->max_count && quad_strip; ++i) {
+            const u32* a = reinterpret_cast<const u32*>(indirect->args + u64(i) * indirect->stride);
+            quad_strip = a[0] == 4 && a[2] == 0;
+        }
+        if (quad_strip) {
+            const bool is16 = index_type == MTLIndexTypeUInt16;
+            const u32 index_size = is16 ? 2 : 4;
+            const VAddr address = regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+            u32 strip[4];
+            u8 bytes[16]{};
+            for (u32 k = 0; k < 4; ++k) {
+                strip[k] = is16 ? u32(reinterpret_cast<const u16*>(address)[k]) : reinterpret_cast<const u32*>(address)[k];
+            }
+            const u32 order[4] = {strip[0], strip[1], strip[3], strip[2]};
+            for (u32 k = 0; k < 4; ++k) {
+                if (is16) {
+                    reinterpret_cast<u16*>(bytes)[k] = u16(order[k]);
+                } else {
+                    reinterpret_cast<u32*>(bytes)[k] = order[k];
+                }
+            }
+            auto& stream = buffer_cache.GetStreamBuffer();
+            index_buffer_offset = stream.Copy(bytes, 4 * index_size, 4);
+            index_buffer = (__bridge id<MTLBuffer>)Metal::Raw(stream.Handle());
+            primitive = MTLPrimitiveTypeTriangleStrip;
+            ++draw_state->quad_strips;
+        }
+    }
+    if (!quad_strip && indirect && regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
         const u32 max_count = indirect->max_count;
         const u32 max_quads = is_indexed ? std::max<u32>(regs.num_indices / 4, 1) : 65536;
         auto& stream = buffer_cache.GetStreamBuffer();
@@ -1815,7 +1865,8 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
                       (unsigned long long)pipeline->hash, cs.dim_x, cs.dim_y, cs.dim_z,
                       indirect_args ? " indirect" : "");
     }
-    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, label[0] ? label : "dispatch");
+    id<MTLComputeCommandEncoder> enc =
+        MetalScheduler::ComputeGuest(scheduler, label[0] ? label : "dispatch", std::exchange(dispatch_barrier, true));
     draw_state->impl->pass_open = false;
     [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)pipeline->pso];
     for (u32 i = 0; i < b.num_buffers; ++i) {
@@ -1841,7 +1892,9 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     }
     if (b.writes_memory) {
         MetalScheduler::NoteUntrackedWrite(scheduler);
+        NoteGuestWrite();
     }
+    last_cs_hash[lane_] = pipeline->hash;
     if (NanScan::Active()) {
         NanScan::AfterDispatch(scheduler, pipeline->hash, b.textures.data(), b.num_textures);
     }

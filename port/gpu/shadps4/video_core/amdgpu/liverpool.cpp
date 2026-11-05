@@ -422,11 +422,101 @@ bool PipelinedComputeOpcode(PM4ItOpcode opcode) {
     }
 }
 
+// tlg diagnosis: TLG_LOG_DISPATCH_BARRIERS=1: per queue, dispatches with a barrier-like packet
+// (EVENT_WRITE, ACQUIRE_MEM, RELEASE_MEM, WAIT_REG_MEM, EOS/EOP) since the previous dispatch, and
+// those without; the EVENT_WRITE types seen.
+namespace TlgBarrierStats {
+inline bool Enabled() {
+    static const bool on = std::getenv("TLG_LOG_DISPATCH_BARRIERS") != nullptr;
+    return on;
+}
+inline std::mutex mutex;
+inline bool pending[65]{};
+inline u64 with[2]{}, without[2]{};
+inline std::map<u32, u64> events[2];
+inline void Packet(int q, PM4ItOpcode op, const PM4Header* header) {
+    std::scoped_lock lk{mutex};
+    const int kind = q == 64 ? 0 : 1;
+    switch (op) {
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        ++(pending[q] ? with : without)[kind];
+        pending[q] = false;
+        break;
+    case PM4ItOpcode::EventWrite:
+        ++events[kind][u32(reinterpret_cast<const PM4CmdEventWrite*>(header)->event_type.Value())];
+        pending[q] = true;
+        break;
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::ReleaseMem:
+    case PM4ItOpcode::WaitRegMem:
+    case PM4ItOpcode::EventWriteEos:
+    case PM4ItOpcode::EventWriteEop:
+        ++events[kind][1000 + u32(op)];
+        pending[q] = true;
+        break;
+    default:
+        break;
+    }
+    static auto last = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+        last = std::chrono::steady_clock::now();
+        for (int k = 0; k < 2; ++k) {
+            std::string ev;
+            for (auto& [t, n] : events[k]) {
+                ev += " " + (t >= 1000 ? "op" + std::to_string(t - 1000) : "ev" + std::to_string(t)) + ":" + std::to_string(n);
+            }
+            std::printf("dispatch barriers (%s): %llu after a barrier packet, %llu without;%s\n",
+                        k ? "compute queues" : "graphics", (unsigned long long)with[k],
+                        (unsigned long long)without[k], ev.c_str());
+            with[k] = without[k] = 0;
+            events[k].clear();
+        }
+    }
+}
+} // namespace TlgBarrierStats
+
+#ifdef TLG_METAL
+// tlg: per guest queue (64 = graphics), a barrier-like packet since its last dispatch: that
+// dispatch waits for the earlier ones (TLG_METAL_CONCURRENT_DISPATCH); the others run
+// concurrently, as the GCN queue runs them.
+static bool tlg_queue_barrier[65] = {};
+static void TlgNoteQueuePacket(Vulkan::Rasterizer* rasterizer, int q, PM4ItOpcode op) {
+    switch (op) {
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        if (rasterizer) {
+            rasterizer->dispatch_barrier = std::exchange(tlg_queue_barrier[q], false);
+        }
+        break;
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::ReleaseMem:
+    case PM4ItOpcode::WaitRegMem:
+    case PM4ItOpcode::EventWriteEos:
+    case PM4ItOpcode::EventWriteEop:
+    case PM4ItOpcode::MemSemaphore:
+    case PM4ItOpcode::DmaData:
+        tlg_queue_barrier[q] = true;
+        break;
+    default:
+        break;
+    }
+}
+#endif
+
 struct ComputeReleaseMem {
     u32 packet[sizeof(PM4CmdReleaseMem) / sizeof(u32)];
     u32 pipe_id;
     std::atomic<bool>* written; // tlg (Metal): set once the GPU wrote the label (or null)
+    u64 noted_ns;               // tlg: when recorded (TLG_LOG_COMPUTE_RELEASE latency)
 };
+
+static u64 TlgNowNs() {
+    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count());
+}
 
 #ifdef TLG_METAL
 static bool TlgComputeFenceNow() {
@@ -456,9 +546,11 @@ static bool TlgComputeLabelNow(const PM4CmdReleaseMem& release_mem) {
         const VAddr hi = end && *end == ':' ? std::strtoull(end + 1, nullptr, 16) : 0;
         return std::pair<VAddr, VAddr>{lo, hi};
     }();
+    // Off by default since the sort label (TLG_METAL_CF_NOW_CS) was found to be the one that
+    // matters: TLG_METAL_CF_FLAGS_DEFER=0 writes the job flags when recorded.
     static const bool flags_defer = [] {
         const char* v = std::getenv("TLG_METAL_CF_FLAGS_DEFER");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     const VAddr address = release_mem.Address<VAddr>();
     if (address >= range.first && address < range.second) {
@@ -481,7 +573,61 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // Compute waits pass on the label's value meanwhile (DeferredComputeValue): a dependent
     // queue stalled until the GPU finished let graphics use its results before they were
     // recorded (inFAMOUS "Walk to Seattle": lighting missing, the frame gray).
-    if (!TlgComputeFenceNow() &&
+    // TLG_METAL_CF_GUEST_RULE (default 1): a label after compute work that wrote no guest memory
+    // is written when recorded: nothing the guest reads after it is still on the GPU, and the
+    // game takes a GPU job flag or timeline value that arrives late as work not done.
+    static const bool guest_rule = [] {
+        const char* v = std::getenv("TLG_METAL_CF_GUEST_RULE");
+        return v && v[0] == '1';
+    }();
+    const bool guest_writes = rasterizer.TakeGuestWrites(1);
+    // TLG_METAL_CF_NOW_CS=<hex>,...: labels after those compute shaders are written when
+    // recorded (default a16fa93a: inFAMOUS's GPU sort, whose label written once the GPU ran it
+    // leaves "Walk to Seattle" without lighting, gray: its output is wrong here and the game
+    // reads it then; written at once, the game reads the previous contents). "none": no shader.
+    // TLG_LOG_COMPUTE_RELEASE lists the shaders labels follow.
+    const u64 cs = rasterizer.last_cs_hash[1];
+    if (static const char* list = [] {
+            const char* v = std::getenv("TLG_METAL_CF_NOW_CS");
+            return v ? v : "a16fa93a";
+        }();
+        list) {
+        char want[24];
+        std::snprintf(want, sizeof(want), "%llx", (unsigned long long)cs);
+        if (std::strstr(list, want)) {
+            goto immediate;
+        }
+    }
+    // Diagnosis: TLG_METAL_CF_FINISH_CS=<hex>,...: after those shaders, wait for the GPU to
+    // finish, then write the label (the data is final, only the timing differs).
+    if (static const char* list = std::getenv("TLG_METAL_CF_FINISH_CS"); list) {
+        char want[24];
+        std::snprintf(want, sizeof(want), "%llx", (unsigned long long)cs);
+        if (std::strstr(list, want)) {
+            rasterizer.Finish();
+            goto immediate;
+        }
+    }
+    if (std::getenv("TLG_LOG_COMPUTE_RELEASE")) {
+        static std::mutex m;
+        static std::map<u64, u64> seen;
+        std::scoped_lock lk{m};
+        if (seen[cs]++ == 0) {
+            std::printf("compute label after cs %llx (guest writes %d)\n", (unsigned long long)cs,
+                        int(guest_writes));
+        }
+    }
+    static const bool log_rule = std::getenv("TLG_LOG_COMPUTE_RELEASE") != nullptr;
+    if (log_rule) {
+        static std::atomic<u64> deferred{0}, now{0}, last{0};
+        ++(guest_writes || !guest_rule ? deferred : now);
+        const u64 t = TlgNowNs();
+        if (u64 l = last.load(); t - l > 1000000000ull && last.compare_exchange_strong(l, t)) {
+            std::printf("compute labels: %llu after guest writes (wait for the GPU), %llu without\n",
+                        (unsigned long long)deferred.exchange(0), (unsigned long long)now.exchange(0));
+        }
+    }
+    if (!TlgComputeFenceNow() && (guest_writes || !guest_rule) &&
         !TlgComputeLabelNow(*reinterpret_cast<const PM4CmdReleaseMem*>(task.packet))) {
         rasterizer.WaitHostCopies();
         rasterizer.ProcessDownloadImages();
@@ -505,9 +651,25 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
             if (copy.written) {
                 copy.written->store(true, std::memory_order_release);
             }
+            // TLG_LOG_COMPUTE_RELEASE: time from recording to the label's write, per second.
+            if (static const bool log = std::getenv("TLG_LOG_COMPUTE_RELEASE") != nullptr; log) {
+                static std::atomic<u64> n{0}, sum{0}, max{0}, last{0};
+                const u64 now = TlgNowNs(), lat = now - copy.noted_ns;
+                ++n;
+                sum += lat;
+                for (u64 m = max.load(); lat > m && !max.compare_exchange_weak(m, lat);) {
+                }
+                if (u64 l = last.load(); now - l > 1000000000ull && last.compare_exchange_strong(l, now)) {
+                    const u64 cnt = n.exchange(0);
+                    std::printf("compute label latency: %llu labels, mean %.2f ms, max %.2f ms\n",
+                                (unsigned long long)cnt, cnt ? sum.exchange(0) / 1e6 / cnt : 0.0,
+                                max.exchange(0) / 1e6);
+                }
+            }
         });
         return;
     }
+immediate:
 #endif
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();
@@ -520,6 +682,9 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
         [&rasterizer](VAddr dst, u16 gds_index, u16 num_dwords) {
             rasterizer.CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
         });
+    if (task.written) {
+        task.written->store(true, std::memory_order_release); // in memory now
+    }
 }
 
 // tlg: TLG_OCCLUSION_MODE=4: a ZPASS_DONE dump, counted by Vulkan occlusion queries.
@@ -1089,6 +1254,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             if (Vulkan::FrameRecord::Active()) [[unlikely]] {
                 Vulkan::FrameRecord::Packet(-1, header, &regs);
             }
+            if (TlgBarrierStats::Enabled()) {
+                TlgBarrierStats::Packet(64, opcode, header);
+            }
+#ifdef TLG_METAL
+            TlgNoteQueuePacket(rasterizer, 64, opcode);
+#endif
+#ifdef TLG_METAL
+            // tlg: graphics work records on the graphics lane (TLG_METAL_ASYNC_COMPUTE).
+            if (rasterizer) {
+                rasterizer->SelectLane(0);
+            }
+#endif
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1926,6 +2103,30 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         if (Vulkan::FrameRecord::Active()) [[unlikely]] {
             Vulkan::FrameRecord::Packet(static_cast<int>(vqid), header, nullptr);
         }
+        if (TlgBarrierStats::Enabled()) {
+            TlgBarrierStats::Packet(int(vqid % 64), opcode, header);
+        }
+#ifdef TLG_METAL
+        TlgNoteQueuePacket(rasterizer, int(vqid % 64), opcode);
+#endif
+#ifdef TLG_METAL
+        // tlg: the compute queue's work records on the compute lane (TLG_METAL_ASYNC_COMPUTE),
+        // back to graphics after the packet (a graphics packet selects it again too, as a packet
+        // that waits lets the graphics queue run in between).
+        struct LaneScope {
+            Vulkan::Rasterizer* r;
+            explicit LaneScope(Vulkan::Rasterizer* r_) : r{r_} {
+                if (r) {
+                    r->SelectLane(1);
+                }
+            }
+            ~LaneScope() {
+                if (r) {
+                    r->SelectLane(0);
+                }
+            }
+        } const lane_scope{rasterizer};
+#endif
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -2192,6 +2393,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 #else
                 task.written = nullptr;
 #endif
+                task.noted_ns = TlgNowNs();
                 rasterizer->RunInOrder(&RunComputeReleaseMem, &task, sizeof(task));
                 break;
             }

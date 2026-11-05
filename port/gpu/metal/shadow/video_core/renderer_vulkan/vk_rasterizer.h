@@ -104,6 +104,25 @@ public:
                       VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
+    /// tlg: 0 graphics, 1 compute (Scheduler::SelectLane, TLG_METAL_ASYNC_COMPUTE).
+    void SelectLane(int lane) noexcept {
+        scheduler.SelectLane(lane);
+        lane_ = lane;
+    }
+    /// tlg: guest memory written by GPU work recorded on a lane (dispatches binding a written
+    /// buffer, copies and fills into guest memory) since the last call for that lane.
+    bool TakeGuestWrites(int lane) noexcept {
+        return std::exchange(guest_writes[lane], false);
+    }
+    void NoteGuestWrite() noexcept {
+        guest_writes[lane_] = true;
+    }
+    int lane_ = 0;
+    /// tlg: the guest queue of the next dispatch had a barrier packet since its last dispatch
+    /// (TLG_METAL_CONCURRENT_DISPATCH; true unless the command processor says otherwise).
+    bool dispatch_barrier = true;
+    bool guest_writes[2] = {false, false};
+    u64 last_cs_hash[2] = {0, 0}; ///< tlg: the last compute shader recorded on each lane
 
     void ScopeMarker(fmt::string_view, fmt::format_args, auto&& func) {
         func();

@@ -73,6 +73,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     texture_cache.InvalidateMemoryFromGPU(address, num_bytes);
     const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, num_bytes, true);
     runtime.FillBuffer(buffer, offset, num_bytes, value);
+    NoteGuestWrite();
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
@@ -99,6 +100,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     // its fires every few seconds. TLG_METAL_ORDERED_WRITES=1: on (DeferWriteAfterCopy).
     if (!dst_gds) {
         pending_guest_copy = true; // a WRITE_DATA after it waits for it (DeferWriteAfterCopy)
+        NoteGuestWrite();
     }
     // Diagnosis: TLG_GDS_LOG=1: the GDS counters copied to memory (the values the game reads
     // back), once a second per GDS offset: copies, min / max / last value.

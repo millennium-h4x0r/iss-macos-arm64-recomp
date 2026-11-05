@@ -44,6 +44,7 @@ struct Rasterizer::DrawState {
     std::unique_ptr<VideoCore::Buffer> gds; ///< the GPU's global data share (64 KB)
     u64 draws = 0;
     u64 skipped_draws = 0;
+    u64 quad_strips = 0; ///< indirect quads drawn as strips from the guest arguments
     u64 no_pipeline = 0;
     u64 unsupported_primitive = 0;
     u64 dispatches = 0;

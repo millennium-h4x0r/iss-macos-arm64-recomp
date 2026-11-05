@@ -12,6 +12,7 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,13 +30,34 @@ std::atomic<u32> g_gpu_errors{0};
 } // namespace
 
 struct Scheduler::Impl {
-    id<MTLCommandQueue> queue = nil;
+    // Lanes (TLG_METAL_ASYNC_COMPUTE): 0 graphics, 1 compute; one queue and untracked-write
+    // fence each (fences order encoders within one queue only).
+    id<MTLCommandQueue> queues[2] = {nil, nil};
+    id<MTLFence> fences[2] = {nil, nil};
+    bool fence_pendings[2] = {false, false}; ///< an earlier encoder of the lane updated its fence
+    int lane = 0;      ///< the lane recording goes to
+    int open_lane = 0; ///< the lane of cmdbuf
+    id<MTLSharedEvent> compute_event = nil;
+    u64 compute_signaled = 0; ///< the event value of the last committed compute command buffer
+    u64 graphics_waited = 0;  ///< the value the last graphics command buffer waits for
+    u64 graphics_signaled = 0; ///< TLG_METAL_ASYNC_COMPUTE_SERIAL: compute waits for graphics
+    id<MTLSharedEvent> graphics_event = nil;
+    std::set<u64> inflight; ///< committed ticks not completed (the lanes complete out of order)
+    u64 committed = 0;      ///< the last committed tick
+
     id<MTLCommandBuffer> cmdbuf = nil;
     id<MTLCommandEncoder> encoder = nil;
     EncoderKind kind = EncoderKind::None;
-    id<MTLFence> fence = nil;
     bool encoder_wrote_untracked = false; ///< the open encoder wrote guest memory
-    bool fence_pending = false;           ///< an earlier encoder updated the fence
+    bool encoder_has_dispatch = false;    ///< the open compute encoder ran a dispatch
+    bool internal_dispatch = false;       ///< the last dispatch was the renderer's own
+
+    id<MTLFence> Fence() const {
+        return fences[open_lane];
+    }
+    bool& FencePending() {
+        return fence_pendings[open_lane];
+    }
 
     std::mutex mutex; ///< completion
     std::condition_variable cv;
@@ -53,6 +75,38 @@ namespace MetalScheduler {
 
 void NoteUntrackedWrite(Scheduler& scheduler) {
     scheduler.impl_()->encoder_wrote_untracked = true;
+}
+
+bool ConcurrentDispatch() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_CONCURRENT_DISPATCH");
+        return !v || v[0] != '0';
+    }();
+    return on;
+}
+
+namespace {
+void Barrier(id<MTLComputeCommandEncoder> enc) {
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+}
+} // namespace
+
+void BeforeGuestDispatch(Scheduler& scheduler, id<MTLComputeCommandEncoder> enc, bool guest_barrier) {
+    auto* impl = scheduler.impl_();
+    if (ConcurrentDispatch() && impl->encoder_has_dispatch && (guest_barrier || impl->internal_dispatch)) {
+        Barrier(enc);
+    }
+    impl->encoder_has_dispatch = true;
+    impl->internal_dispatch = false;
+}
+
+void BeforeInternalDispatch(Scheduler& scheduler, id<MTLComputeCommandEncoder> enc) {
+    auto* impl = scheduler.impl_();
+    if (ConcurrentDispatch() && impl->encoder_has_dispatch) {
+        Barrier(enc);
+    }
+    impl->encoder_has_dispatch = true;
+    impl->internal_dispatch = true;
 }
 
 namespace {
@@ -99,23 +153,76 @@ std::string TakeRenderBreaks() {
 Scheduler::Scheduler(const Instance& instance, const char* name_)
     : impl{std::make_unique<Impl>()}, name{name_} {
     id<MTLDevice> device = (__bridge id<MTLDevice>)instance.MetalDevice();
-    impl->queue = [device newCommandQueueWithMaxCommandBufferCount:64];
-    impl->queue.label = [NSString stringWithUTF8String:name];
-    impl->fence = [device newFence];
+    impl->queues[0] = [device newCommandQueueWithMaxCommandBufferCount:64];
+    impl->queues[0].label = [NSString stringWithUTF8String:name];
+    impl->fences[0] = [device newFence];
+    if (AsyncCompute()) {
+        impl->queues[1] = [device newCommandQueueWithMaxCommandBufferCount:64];
+        impl->queues[1].label = [NSString stringWithFormat:@"%s compute", name];
+        impl->fences[1] = [device newFence];
+        impl->compute_event = [device newSharedEvent];
+        impl->graphics_event = [device newSharedEvent];
+        std::printf("GPU (Metal): async compute on (a second queue for the guest's compute queues)\n");
+    }
+}
+
+bool Scheduler::AsyncCompute() noexcept {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_ASYNC_COMPUTE");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+void Scheduler::SelectLane(int lane) noexcept {
+    if (impl->queues[1]) {
+        impl->lane = lane;
+    }
 }
 
 Scheduler::~Scheduler() {
     Finish();
 }
 
+namespace {
+/// Opens a command buffer on the selected lane (none may be open).
+void OpenCommandBuffer(Scheduler::Impl& impl);
+} // namespace
+
 void* Scheduler::CommandBuffer() {
+    if (impl->cmdbuf && impl->open_lane != impl->lane) {
+        Flush(); // the other lane's work goes to its queue now
+    }
     if (!impl->cmdbuf) {
-        MTLCommandBufferDescriptor* desc = [MTLCommandBufferDescriptor new];
-        desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
-        impl->cmdbuf = [impl->queue commandBufferWithDescriptor:desc];
+        OpenCommandBuffer(*impl);
     }
     return (__bridge void*)impl->cmdbuf;
 }
+
+namespace {
+void OpenCommandBuffer(Scheduler::Impl& impl_ref) {
+    Scheduler::Impl* const impl = &impl_ref;
+    {
+        MTLCommandBufferDescriptor* desc = [MTLCommandBufferDescriptor new];
+        desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+        impl->open_lane = impl->lane;
+        impl->cmdbuf = [impl->queues[impl->open_lane] commandBufferWithDescriptor:desc];
+        if (impl->queues[1]) {
+            static const bool serial = [] {
+                const char* v = std::getenv("TLG_METAL_ASYNC_COMPUTE_SERIAL");
+                return v && v[0] == '1';
+            }();
+            if (impl->open_lane == 0 && impl->compute_signaled > impl->graphics_waited) {
+                // Graphics after compute: everything the compute lane committed before it.
+                [impl->cmdbuf encodeWaitForEvent:impl->compute_event value:impl->compute_signaled];
+                impl->graphics_waited = impl->compute_signaled;
+            } else if (impl->open_lane == 1 && serial && impl->graphics_signaled) {
+                [impl->cmdbuf encodeWaitForEvent:impl->graphics_event value:impl->graphics_signaled];
+            }
+        }
+    }
+}
+} // namespace
 
 void Scheduler::EndEncoding() {
     if (!impl->encoder) {
@@ -123,14 +230,14 @@ void Scheduler::EndEncoding() {
     }
     if (impl->encoder_wrote_untracked) {
         if (impl->kind == EncoderKind::Render) {
-            [(id<MTLRenderCommandEncoder>)impl->encoder updateFence:impl->fence
+            [(id<MTLRenderCommandEncoder>)impl->encoder updateFence:impl->Fence()
                                                         afterStages:MTLRenderStageFragment];
         } else if (impl->kind == EncoderKind::Compute) {
-            [(id<MTLComputeCommandEncoder>)impl->encoder updateFence:impl->fence];
+            [(id<MTLComputeCommandEncoder>)impl->encoder updateFence:impl->Fence()];
         } else {
-            [(id<MTLBlitCommandEncoder>)impl->encoder updateFence:impl->fence];
+            [(id<MTLBlitCommandEncoder>)impl->encoder updateFence:impl->Fence()];
         }
-        impl->fence_pending = true;
+        impl->FencePending() = true;
         impl->encoder_wrote_untracked = false;
     }
     [impl->encoder endEncoding];
@@ -146,13 +253,15 @@ void Scheduler::EndRendering() {
 }
 
 void* Scheduler::ComputeEncoder() {
-    if (impl->kind != EncoderKind::Compute) {
+    if (impl->kind != EncoderKind::Compute || impl->open_lane != impl->lane) {
         EndEncoding();
         id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)CommandBuffer();
-        id<MTLComputeCommandEncoder> enc =
-            [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
-        if (impl->fence_pending) {
-            [enc waitForFence:impl->fence];
+        id<MTLComputeCommandEncoder> enc = [cb
+            computeCommandEncoderWithDispatchType:MetalScheduler::ConcurrentDispatch() ? MTLDispatchTypeConcurrent
+                                                                                        : MTLDispatchTypeSerial];
+        impl->encoder_has_dispatch = false;
+        if (impl->FencePending()) {
+            [enc waitForFence:impl->Fence()];
         }
         impl->encoder = enc;
         impl->kind = EncoderKind::Compute;
@@ -162,12 +271,12 @@ void* Scheduler::ComputeEncoder() {
 }
 
 void* Scheduler::BlitEncoder() {
-    if (impl->kind != EncoderKind::Blit) {
+    if (impl->kind != EncoderKind::Blit || impl->open_lane != impl->lane) {
         EndEncoding();
         id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)CommandBuffer();
         id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
-        if (impl->fence_pending) {
-            [enc waitForFence:impl->fence];
+        if (impl->FencePending()) {
+            [enc waitForFence:impl->Fence()];
         }
         impl->encoder = enc;
         impl->kind = EncoderKind::Blit;
@@ -177,14 +286,15 @@ void* Scheduler::BlitEncoder() {
 }
 
 void* Scheduler::CurrentRenderEncoder() const noexcept {
-    return impl->kind == EncoderKind::Render ? (__bridge void*)impl->encoder : nullptr;
+    return impl->kind == EncoderKind::Render && impl->open_lane == impl->lane ? (__bridge void*)impl->encoder
+                                                                              : nullptr;
 }
 
 void Scheduler::SetRenderEncoder(void* encoder, u64 pass_key) {
     EndEncoding();
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
-    if (impl->fence_pending) {
-        [enc waitForFence:impl->fence beforeStages:MTLRenderStageVertex];
+    if (impl->FencePending()) {
+        [enc waitForFence:impl->Fence() beforeStages:MTLRenderStageVertex];
     }
     impl->encoder = enc;
     impl->kind = EncoderKind::Render;
@@ -197,7 +307,10 @@ void Scheduler::Flush() {
         MetalScheduler::NoteRenderBreak(*this, "flush");
     }
     EndEncoding();
-    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)CommandBuffer();
+    if (!impl->cmdbuf) {
+        OpenCommandBuffer(*impl);
+    }
+    id<MTLCommandBuffer> cb = impl->cmdbuf;
     const u64 tick = current_tick.load(std::memory_order_relaxed);
     std::vector<std::function<void()>> signals;
     {
@@ -207,7 +320,55 @@ void Scheduler::Flush() {
     Impl* const state = impl.get();
     std::atomic<u64>* const completed = &completed_tick;
     const char* const queue_name = name;
+    if (impl->queues[1]) {
+        if (impl->open_lane == 1) {
+            [cb encodeSignalEvent:impl->compute_event value:++impl->compute_signaled];
+        } else {
+            [cb encodeSignalEvent:impl->graphics_event value:++impl->graphics_signaled];
+        }
+    }
+    {
+        std::scoped_lock lock{impl->mutex};
+        impl->inflight.insert(tick);
+        impl->committed = tick;
+    }
+    // TLG_METAL_LANE_STATS=1: per lane and second, the command buffers' wait before the GPU
+    // started them, their GPU time, and the delay of their completion handler.
+    static const bool lane_stats = std::getenv("TLG_METAL_LANE_STATS") != nullptr;
+    const int lane = impl->open_lane;
+    const double commit_time = lane_stats ? CACurrentMediaTime() : 0.0;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (lane_stats && done.GPUEndTime > 0) {
+            static std::mutex m;
+            static double sums[2][3]{}, maxs[2][3]{};
+            static u64 counts[2]{};
+            static double last = 0;
+            const double now = CACurrentMediaTime();
+            const double v[3] = {done.GPUStartTime - commit_time, done.GPUEndTime - done.GPUStartTime,
+                                 now - done.GPUEndTime};
+            std::scoped_lock lk{m};
+            ++counts[lane];
+            for (int i = 0; i < 3; ++i) {
+                sums[lane][i] += v[i];
+                maxs[lane][i] = std::max(maxs[lane][i], v[i]);
+            }
+            if (now - last > 1.0) {
+                last = now;
+                for (int l = 0; l < 2; ++l) {
+                    if (!counts[l]) {
+                        continue;
+                    }
+                    std::printf("lane %d: %llu cbs, queued %.2f/%.2f ms, gpu %.2f/%.2f ms, callback %.2f/%.2f ms (mean/max)\n",
+                                l, (unsigned long long)counts[l], sums[l][0] / counts[l] * 1e3, maxs[l][0] * 1e3,
+                                sums[l][1] / counts[l] * 1e3, maxs[l][1] * 1e3, sums[l][2] / counts[l] * 1e3,
+                                maxs[l][2] * 1e3);
+                    counts[l] = 0;
+                    for (int i = 0; i < 3; ++i) {
+                        sums[l][i] = maxs[l][i] = 0;
+                    }
+                }
+            }
+        }
         if (done.status == MTLCommandBufferStatusError) {
             if (g_gpu_errors.fetch_add(1) < 20) {
                 std::fprintf(stderr, "GPU: Metal command buffer %llu (%s) failed: %s\n",
@@ -230,9 +391,13 @@ void Scheduler::Flush() {
             signal();
         }
         {
+            // A tick is complete when it and every tick before it are (the two lanes'
+            // command buffers complete out of order).
             std::scoped_lock lock{state->mutex};
+            state->inflight.erase(tick);
+            const u64 done_to = state->inflight.empty() ? state->committed : *state->inflight.begin() - 1;
             u64 prev = completed->load(std::memory_order_relaxed);
-            while (prev < tick && !completed->compare_exchange_weak(prev, tick)) {
+            while (prev < done_to && !completed->compare_exchange_weak(prev, done_to)) {
             }
         }
         state->cv.notify_all();
@@ -295,6 +460,9 @@ void Scheduler::PopPendingOperations() {
 }
 
 void Scheduler::SignalOnCompletion(std::function<void()> func) {
+    if (impl->cmdbuf && impl->open_lane != impl->lane) {
+        Flush(); // the signal goes with the selected lane's work
+    }
     {
         std::scoped_lock lock{impl->signal_mutex};
         impl->signals.emplace_back(std::move(func));

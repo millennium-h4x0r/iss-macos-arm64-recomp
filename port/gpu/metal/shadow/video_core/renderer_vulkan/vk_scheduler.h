@@ -79,6 +79,14 @@ public:
         return render_pass_key != 0;
     }
 
+    /// tlg: TLG_METAL_ASYNC_COMPUTE=1: the guest's compute queues record into a second Metal
+    /// queue (lane 1) that runs beside the graphics one (lane 0), as on the console. Selecting a
+    /// lane takes effect at the next command buffer or encoder (the other lane's open command
+    /// buffer is committed then). Graphics command buffers wait for the compute work committed
+    /// before them; compute does not wait for graphics (the guest's label waits order that).
+    void SelectLane(int lane) noexcept;
+    [[nodiscard]] static bool AsyncCompute() noexcept;
+
     /// Encoders opened since the start (statistics).
     [[nodiscard]] u64 EncoderCount() const noexcept {
         return encoders;
