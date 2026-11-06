@@ -28,8 +28,11 @@
 
 #include "common/assert.h"
 #include "common/hash.h"
+#include "common/serdes.h"
+#include <span>
 #include "mtl_format.h"
 #include "mtl_objc.h"
+#include "mtl_scheduler_internal.h"
 #include "tlg_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/recompiler.h"
@@ -58,6 +61,11 @@ std::atomic<u32> g_async_skips{0}, g_async_queued{0}; // tlg: async shaders
 std::atomic<u64> g_stage_skips[16]{}; // tlg: draws dropped for their shader stages (GS/tess)
 std::atomic<u64> g_prog_stats[8]{}; // tlg diag: lookups, fast, miss user_data/flat/runtime/start/attribs/new
 std::atomic<u64> g_stage_ns[4]{}; // tlg: recompile+SPIR-V, SPIRV-Cross, MSL compile, render PSO
+// tlg: the same, never reset (TLG_METAL_HITCH_MS: a slow frame prints what it compiled).
+std::atomic<u64> g_stage_total_ns[4]{};
+std::atomic<u64> g_stage_total_count[4]{};
+std::atomic<u64> g_pso_build_ns{0}; // tlg: deferred pipelines' build time (GCD threads)
+std::atomic<u64> g_first_modules{0}, g_first_ns{0}; // tlg: of those, a program's first permutation
 inline u64 NsSince(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count();
 }
@@ -152,6 +160,7 @@ struct MslResult {
     u32 num_buffers = 0, num_textures = 0, num_samplers = 0;
     bool uses_buffer_sizes = false;
     bool cache_hit = false; ///< from the MSL disk cache: compiled in an earlier run
+    u64 key = 0;            ///< the MSL disk cache key (0: not cached)
 };
 
 MslResult TranslateStage(const std::vector<u32>& spirv, bool flip_y) {
@@ -516,6 +525,7 @@ public:
                 ++hits;
                 MslResult r = it->second;
                 r.cache_hit = true;
+                r.key = key;
                 return r;
             }
         }
@@ -523,6 +533,7 @@ public:
         if (!r.error.empty()) {
             return r;
         }
+        r.key = key;
         std::lock_guard lock{mutex};
         if (file) {
             const u32 head[6] = {u32(r.msl.size()), u32(r.entry.size()), r.num_buffers,
@@ -534,6 +545,23 @@ public:
             std::fflush(file);
         }
         entries.emplace(key, r);
+        return r;
+    }
+
+    /// tlg: the MSL of `key` (a key Translate returned in this or an earlier run).
+    std::optional<MslResult> Find(u64 key) {
+        if (!enabled) {
+            return std::nullopt;
+        }
+        std::lock_guard lock{mutex};
+        auto it = entries.find(key);
+        if (it == entries.end()) {
+            return std::nullopt;
+        }
+        ++hits;
+        MslResult r = it->second;
+        r.cache_hit = true;
+        r.key = key;
         return r;
     }
 
@@ -647,6 +675,166 @@ private:
     std::vector<u64> order; // file order
     FILE* file = nullptr;
     u32 hits = 0;
+};
+
+// tlg: the translation cache (TLG_METAL_XLAT_CACHE=0: off). A program's first permutation in a
+// run is translated GCN -> IR -> SPIR-V (~0.8 ms) on the command processor thread, before the
+// MSL cache can help: ~300 new programs when a cutscene cuts to a new shot stalled a frame for
+// ~0.5 s every run. This file keeps, per program (its code), the recompiler's Info, and per
+// permutation (program + stage specialization, as the in-run module reuse compares them) the
+// MSL cache key of its translation; a hit skips the recompiler and SPIRV-Cross. The salt is the
+// recompiler's source hash (TLG_SHADER_CACHE_KEY): a changed recompiler starts a fresh file.
+// TLG_METAL_XLAT_VERIFY=1: translate anyway and report hits that disagree.
+class XlatCache {
+public:
+    static XlatCache& Get() {
+        static XlatCache cache;
+        return cache;
+    }
+    bool Enabled() const {
+        return enabled;
+    }
+    bool Verify() const {
+        return verify;
+    }
+
+    u64 CodeKey(std::span<const u32> code, Shader::HwStage hw, Shader::SwStage sw) const {
+        return XXH3_64bits_withSeed(code.data(), code.size_bytes(),
+                                    salt ^ (u64(hw) << 8 | u64(sw)) * 0x9E3779B97F4A7C15ull);
+    }
+    u64 PermKey(u64 code_key, const Shader::StageSpecialization& spec) const {
+        Serialization::Archive ar;
+        spec.Serialize(ar);
+        const size_t n = ar.SizeBytes();
+        auto bytes = ar.TakeOff();
+        return XXH3_64bits_withSeed(bytes.data(), n, code_key);
+    }
+
+    /// The Info of the program `code_key` (stored by an earlier run): false when there is none.
+    bool LoadInfo(u64 code_key, Shader::Info& info) {
+        std::vector<u8> blob;
+        {
+            std::lock_guard lock{mutex};
+            auto it = infos.find(code_key);
+            if (it == infos.end()) {
+                return false;
+            }
+            blob = it->second;
+        }
+        Serialization::Archive ar{std::move(blob)};
+        return info.Deserialize(ar);
+    }
+    void StoreInfo(u64 code_key, const Shader::Info& info) {
+        Serialization::Archive ar;
+        info.Serialize(ar);
+        const size_t n = ar.SizeBytes();
+        std::vector<u8> blob = ar.TakeOff();
+        blob.resize(n);
+        std::lock_guard lock{mutex};
+        if (infos.contains(code_key)) {
+            return;
+        }
+        Append(kInfo, code_key, blob.data(), u32(blob.size()));
+        infos.emplace(code_key, std::move(blob));
+    }
+    /// The MSL cache key of permutation `perm_key`: 0 when there is none.
+    u64 FindPerm(u64 perm_key) {
+        std::lock_guard lock{mutex};
+        auto it = perms.find(perm_key);
+        return it == perms.end() ? 0 : it->second;
+    }
+    void StorePerm(u64 perm_key, u64 msl_key) {
+        if (!msl_key) {
+            return;
+        }
+        std::lock_guard lock{mutex};
+        if (auto [it, inserted] = perms.emplace(perm_key, msl_key); !inserted) {
+            if (it->second == msl_key) {
+                return;
+            }
+            it->second = msl_key;
+        }
+        Append(kPerm, perm_key, &msl_key, sizeof(msl_key));
+    }
+
+    std::atomic<u64> hits{0}, misses{0}, verify_bad{0};
+
+private:
+    static constexpr u64 kMagic = 0x31544c584d474c54ull; // "TLGMXLT1"
+    static constexpr u64 kVersion = 1;
+    static constexpr u8 kInfo = 1, kPerm = 2;
+
+    XlatCache() {
+        const char* off = std::getenv("TLG_METAL_XLAT_CACHE");
+        enabled = !(off && off[0] == '0') && !std::getenv("TLG_METAL_NO_MSL_CACHE");
+        const char* v = std::getenv("TLG_METAL_XLAT_VERIFY");
+        verify = v && v[0] == '1';
+        salt = XXH3_64bits(TLG_SHADER_CACHE_KEY, std::strlen(TLG_SHADER_CACHE_KEY)) ^ kVersion;
+        if (!enabled) {
+            return;
+        }
+        const std::string path = std::string(runtime_file_user_dir()) + "/metal-xlat-cache.bin";
+        size_t valid = 0;
+        if (FILE* in = std::fopen(path.c_str(), "rb")) {
+            u64 head[2]{};
+            if (std::fread(head, sizeof(head), 1, in) == 1 && head[0] == kMagic && head[1] == salt) {
+                valid = sizeof(head);
+                for (;;) {
+                    u8 type;
+                    u64 key;
+                    u32 size;
+                    if (std::fread(&type, 1, 1, in) != 1 || std::fread(&key, 8, 1, in) != 1 ||
+                        std::fread(&size, 4, 1, in) != 1 || size > (1u << 20)) {
+                        break;
+                    }
+                    std::vector<u8> data(size);
+                    if (size && std::fread(data.data(), 1, size, in) != size) {
+                        break;
+                    }
+                    if (type == kInfo) {
+                        infos[key] = std::move(data);
+                    } else if (type == kPerm && size == 8) {
+                        u64 msl;
+                        std::memcpy(&msl, data.data(), 8);
+                        perms[key] = msl;
+                    } else {
+                        break;
+                    }
+                    valid += 13 + size;
+                }
+            }
+            std::fclose(in);
+        }
+        if (valid) {
+            truncate(path.c_str(), off_t(valid)); // a torn last record
+            file = std::fopen(path.c_str(), "ab");
+        } else if ((file = std::fopen(path.c_str(), "wb"))) {
+            const u64 head[2] = {kMagic, salt};
+            std::fwrite(head, sizeof(head), 1, file);
+            std::fflush(file);
+        }
+        std::printf("GPU (Metal): translation cache %s: %zu programs, %zu permutations%s\n",
+                    path.c_str(), infos.size(), perms.size(), verify ? " (verify)" : "");
+    }
+
+    void Append(u8 type, u64 key, const void* data, u32 size) {
+        if (!file) {
+            return;
+        }
+        std::fwrite(&type, 1, 1, file);
+        std::fwrite(&key, 8, 1, file);
+        std::fwrite(&size, 4, 1, file);
+        std::fwrite(data, 1, size, file);
+        std::fflush(file);
+    }
+
+    bool enabled = false;
+    bool verify = false;
+    u64 salt = 0;
+    std::mutex mutex;
+    std::unordered_map<u64, std::vector<u8>> infos;
+    std::unordered_map<u64, u64> perms;
+    FILE* file = nullptr;
 };
 
 id<MTLFunction> CompileMsl(const MslResult& r, u64 hash, const char* stage) {
@@ -991,30 +1179,121 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
     // Compile a new permutation.
     const auto t0 = std::chrono::steady_clock::now();
     auto new_info = Shader::Info(hw_stage, sw_stage, params);
-    auto compile_runtime = runtime_info;
-    std::vector<u32> spirv;
-    try {
-        const auto ir = Shader::TranslateProgram(params.code, pools, new_info, compile_runtime,
-                                                 profile);
-        spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, compile_runtime, ir, binding);
-    } catch (const std::exception& e) {
-        if (g_failed.fetch_add(1) < 32) {
-            std::printf("GPU (Metal): shader %016llx refused: %s\n",
-                        (unsigned long long)params.hash, e.what());
+    // tlg: the translation cache (XlatCache): a permutation translated in an earlier run.
+    XlatCache& xlat = XlatCache::Get();
+    const bool tess_stage = sw_stage == SwStage::TessellationControl || sw_stage == SwStage::TessellationEval;
+    const bool use_xlat = xlat.Enabled() && !tess_stage;
+    u64 code_key = 0;
+    std::optional<MslResult> cached;
+    bool info_loaded = false;
+    if (use_xlat) {
+        code_key = xlat.CodeKey(params.code, hw_stage, sw_stage);
+        const Shader::Info* pinfo = &program.info;
+        if (program.modules.empty()) {
+            info_loaded = xlat.LoadInfo(code_key, new_info);
+            if (info_loaded) {
+                new_info.pgm_base = params.Base();
+                new_info.user_data = params.user_data;
+                new_info.RefreshFlatBuf();
+            }
+            pinfo = info_loaded ? &new_info : nullptr;
+        }
+        if (pinfo) {
+            const auto spec = Shader::StageSpecialization(*pinfo, runtime_info, profile, start);
+            if (const u64 msl_key = xlat.FindPerm(xlat.PermKey(code_key, spec))) {
+                cached = MslDiskCache::Get().Find(msl_key);
+            }
+        }
+        (cached ? xlat.hits : xlat.misses).fetch_add(1, std::memory_order_relaxed);
+    }
+    MslResult msl;
+    if (cached && !xlat.Verify()) {
+        msl = std::move(*cached);
+        (program.modules.empty() ? new_info : program.info).AddBindings(binding);
+    } else {
+        const auto binding_in = binding;
+        Shader::Info translated(hw_stage, sw_stage, params);
+        auto compile_runtime = runtime_info;
+        std::vector<u32> spirv;
+        try {
+            const auto ir = Shader::TranslateProgram(params.code, pools, translated, compile_runtime,
+                                                     profile);
+            spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, compile_runtime, ir, binding);
+        } catch (const std::exception& e) {
+            if (g_failed.fetch_add(1) < 32) {
+                std::printf("GPU (Metal): shader %016llx refused: %s\n",
+                            (unsigned long long)params.hash, e.what());
+            }
+            if (program.modules.empty()) {
+                program.failed = true;
+            }
+            return nullptr;
+        }
+        // No Y flip in the shader: the viewport maps Vulkan's clip space (see mtl_draw.mm).
+        { const u64 ns_ = NsSince(t0); g_stage_ns[0].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_ns[0].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_count[0].fetch_add(1, std::memory_order_relaxed); }
+        const auto t1 = std::chrono::steady_clock::now();
+        msl = MslDiskCache::Get().Translate(spirv, false);
+        { const u64 ns_ = NsSince(t1); g_stage_ns[1].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_ns[1].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_count[1].fetch_add(1, std::memory_order_relaxed); }
+        if (cached) {
+            // TLG_METAL_XLAT_VERIFY=1: the cached translation must be this one.
+            auto check = binding_in;
+            (program.modules.empty() ? new_info : program.info).AddBindings(check);
+            bool same_info = true;
+            if (info_loaded) {
+                // The fields the renderer and the specialization read (raw bytes differ: unused
+                // static_vector slots, the walker's address).
+                translated.pgm_base = params.Base();
+                translated.user_data = params.user_data;
+                translated.RefreshFlatBuf();
+                const auto& x = new_info;
+                const auto& y = translated;
+                same_info = x.buffers.size() == y.buffers.size() && x.images.size() == y.images.size() &&
+                            x.samplers.size() == y.samplers.size() && x.fmasks.size() == y.fmasks.size() &&
+                            x.ud_mask.mask == y.ud_mask.mask && x.mrt_mask == y.mrt_mask &&
+                            x.fetch_shader_sgpr_base == y.fetch_shader_sgpr_base &&
+                            x.has_fetch_shader == y.has_fetch_shader &&
+                            x.shared_memory_scratch_size == y.shared_memory_scratch_size &&
+                            x.srt_info.walker_func_size == y.srt_info.walker_func_size &&
+                            (!x.srt_info.walker_func_size ||
+                             std::memcmp(reinterpret_cast<const void*>(x.srt_info.walker_func),
+                                         reinterpret_cast<const void*>(y.srt_info.walker_func),
+                                         x.srt_info.walker_func_size) == 0) &&
+                            std::ranges::equal(x.FlatUserData(), y.FlatUserData()) &&
+                            Shader::StageSpecialization(x, runtime_info, profile, start) ==
+                                Shader::StageSpecialization(y, runtime_info, profile, start);
+            }
+            // The SPIR-V (the MSL cache key) can differ between runs for the same MSL.
+            const bool same_msl = cached->msl == msl.msl && cached->entry == msl.entry &&
+                                  cached->num_buffers == msl.num_buffers &&
+                                  cached->num_textures == msl.num_textures &&
+                                  cached->num_samplers == msl.num_samplers &&
+                                  cached->uses_buffer_sizes == msl.uses_buffer_sizes;
+            if ((!same_msl || !(check == binding) || !same_info) &&
+                xlat.verify_bad.fetch_add(1) < 32) {
+                std::printf("GPU (Metal): translation cache disagrees on %016llx stage %u: msl %s, "
+                            "bindings %s, info %s\n",
+                            (unsigned long long)params.hash, u32(sw_stage),
+                            same_msl ? "same" : "DIFFERENT",
+                            check == binding ? "same" : "DIFFERENT", same_info ? "same" : "DIFFERENT");
+                if (const char* dir = std::getenv("TLG_METAL_XLAT_VERIFY_DIR"); dir && !same_msl) {
+                    for (int k = 0; k < 2; ++k) {
+                        char path[512];
+                        std::snprintf(path, sizeof(path), "%s/%016llx_%u_%s.metal", dir,
+                                      (unsigned long long)params.hash, u32(sw_stage), k ? "new" : "cached");
+                        if (FILE* f = std::fopen(path, "w")) {
+                            const std::string& t = k ? msl.msl : cached->msl;
+                            std::fwrite(t.data(), 1, t.size(), f);
+                            std::fclose(f);
+                        }
+                    }
+                }
+            }
         }
         if (program.modules.empty()) {
-            program.failed = true;
+            new_info = std::move(translated);
+            info_loaded = false;
         }
-        return nullptr;
     }
-    const bool is_vertex_like = sw_stage == SwStage::Vertex || sw_stage == SwStage::TessellationEval ||
-                                sw_stage == SwStage::Geometry;
-    // No Y flip in the shader: the viewport maps Vulkan's clip space (see mtl_draw.mm).
-    (void)is_vertex_like;
-    g_stage_ns[0].fetch_add(NsSince(t0), std::memory_order_relaxed);
-    const auto t1 = std::chrono::steady_clock::now();
-    MslResult msl = MslDiskCache::Get().Translate(spirv, false);
-    g_stage_ns[1].fetch_add(NsSince(t1), std::memory_order_relaxed);
     if (!msl.error.empty()) {
         if (g_failed.fetch_add(1) < 32) {
             std::printf("GPU (Metal): shader %016llx: SPIR-V -> MSL failed: %s\n",
@@ -1092,7 +1371,7 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         }
     }
     id<MTLFunction> fn = CompileMsl(msl, params.hash, sw_stage == SwStage::Compute ? "compute" : "graphics");
-    g_stage_ns[2].fetch_add(NsSince(t2), std::memory_order_relaxed);
+    { const u64 ns_ = NsSince(t2); g_stage_ns[2].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_ns[2].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_count[2].fetch_add(1, std::memory_order_relaxed); }
     if (!fn) {
         if (program.modules.empty()) {
             program.failed = true;
@@ -1100,12 +1379,20 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         return nullptr;
     }
     if (program.modules.empty()) {
+        g_first_modules.fetch_add(1, std::memory_order_relaxed);
+        g_first_ns.fetch_add(NsSince(t0), std::memory_order_relaxed);
         program.info = new_info;
         program.info.pgm_base = params.Base();
         program.info.user_data = params.user_data;
         program.info.RefreshFlatBuf();
     }
     auto spec = Shader::StageSpecialization(program.info, runtime_info, profile, start);
+    if (use_xlat && !(cached && !xlat.Verify())) {
+        if (program.modules.empty() && !info_loaded) {
+            xlat.StoreInfo(code_key, program.info);
+        }
+        xlat.StorePerm(xlat.PermKey(code_key, spec), msl.key);
+    }
     Module module{std::move(spec), fn, {}};
     module.meta.function = (__bridge void*)fn;
     module.meta.num_buffers = msl.num_buffers;
@@ -1422,11 +1709,40 @@ GraphicsPipeline* PipelineCache::Impl::CreateGraphics() {
         graphics[hash] = std::move(pipeline);
         return nullptr;
     }
+    // tlg: deferred pipelines (TLG_METAL_DEFERRED_PSO=0: off): built on GCD's threads, the
+    // encoder thread waits for them (DeferredPso). Needs the encoder thread.
+    static const bool deferred_pso = [] {
+        const char* v = std::getenv("TLG_METAL_DEFERRED_PSO");
+        return MetalScheduler::EncoderThreadEnabled() && !(v && v[0] == '0');
+    }();
+    if (deferred_pso) {
+        auto deferred = std::make_shared<DeferredPso>();
+        const u64 vs_hash = vs.info ? vs.info->pgm_hash : 0, fs_hash = fs.info ? fs.info->pgm_hash : 0;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            NSError* err = nil;
+            const auto tp = std::chrono::steady_clock::now();
+            id<MTLRenderPipelineState> state =
+                [Metal::Device() newRenderPipelineStateWithDescriptor:desc error:&err];
+            g_pso_build_ns.fetch_add(NsSince(tp), std::memory_order_relaxed);
+            if (!state && g_failed.fetch_add(1) < 32) {
+                std::printf("GPU (Metal): render pipeline (vs %016llx ps %016llx) failed: %s\n",
+                            (unsigned long long)vs_hash, (unsigned long long)fs_hash,
+                            err.localizedDescription.UTF8String);
+            }
+            deferred->Set(state ? (__bridge_retained void*)state : nullptr);
+        });
+        g_stage_total_count[3].fetch_add(1, std::memory_order_relaxed);
+        pipeline->deferred = std::move(deferred);
+        g_pipelines.fetch_add(1, std::memory_order_relaxed);
+        auto* raw = pipeline.get();
+        graphics[hash] = std::move(pipeline);
+        return raw;
+    }
     NSError* error = nil;
     const auto tp = std::chrono::steady_clock::now();
     id<MTLRenderPipelineState> pso = [Metal::Device() newRenderPipelineStateWithDescriptor:desc
                                                                                      error:&error];
-    g_stage_ns[3].fetch_add(NsSince(tp), std::memory_order_relaxed);
+    { const u64 ns_ = NsSince(tp); g_stage_ns[3].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_ns[3].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_count[3].fetch_add(1, std::memory_order_relaxed); }
     if (!pso) {
         if (g_failed.fetch_add(1) < 32) {
             std::printf("GPU (Metal): render pipeline (vs %016llx ps %016llx) failed: %s\n",
@@ -1528,6 +1844,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(IndirectParams params
         for (u32 i = 0; i < MaxShaderStages; ++i) {
             pipeline->stages[i].info = impl->infos[i];
         }
+        if (!pipeline->pso && pipeline->deferred) {
+            if (!pipeline->deferred->Ready()) {
+                return pipeline; // the encoder thread waits for it
+            }
+            pipeline->pso = pipeline->deferred->pso; // null: failed, skipped from now on
+            pipeline->deferred.reset();
+            return pipeline->pso ? pipeline : nullptr;
+        }
         if (!pipeline->pso && !impl->pending_psos.empty()) {
             if (const auto p = impl->pending_psos.find(hash); p != impl->pending_psos.end()) {
                 if (!p->second->done.load(std::memory_order_acquire)) {
@@ -1573,8 +1897,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         slot->hash = found->hash;
         slot->stage = module->meta;
         NSError* error = nil;
+        const auto tc = std::chrono::steady_clock::now();
         id<MTLComputePipelineState> pso =
             [Metal::Device() newComputePipelineStateWithFunction:module->function error:&error];
+        g_stage_total_ns[3].fetch_add(NsSince(tc), std::memory_order_relaxed);
+        g_stage_total_count[3].fetch_add(1, std::memory_order_relaxed);
         if (!pso) {
             if (g_failed.fetch_add(1) < 32) {
                 std::printf("GPU (Metal): compute pipeline %016llx failed: %s\n",
@@ -1623,7 +1950,24 @@ void PipelineCache::ReportCompilerStats() {
                     compiles, g_compile_ns.exchange(0) / 1e6, g_stage_ns[0].exchange(0) / 1e6,
                     g_stage_ns[1].exchange(0) / 1e6, g_stage_ns[2].exchange(0) / 1e6,
                     MslDiskCache::Get().TakeHits(), g_pipelines.exchange(0), g_stage_ns[3].exchange(0) / 1e6, g_failed.load());
+        if (const u64 h = XlatCache::Get().hits.exchange(0), m = XlatCache::Get().misses.exchange(0); h + m) {
+            std::printf("GPU (Metal): translation cache: %llu hits, %llu misses%s\n",
+                        (unsigned long long)h, (unsigned long long)m,
+                        XlatCache::Get().verify_bad.load() ? " (verify: disagreements)" : "");
+        }
     }
+}
+
+/// tlg: compile time and count per stage since the start (recompile, SPIRV-Cross, MSL, PSO).
+void TlgCompileTotals(u64 ns[4], u64 count[4]) {
+    for (int i = 0; i < 4; ++i) {
+        ns[i] = g_stage_total_ns[i].load(std::memory_order_relaxed);
+        count[i] = g_stage_total_count[i].load(std::memory_order_relaxed);
+    }
+}
+void TlgFirstModules(u64& count, u64& ns) {
+    count = g_first_modules.load(std::memory_order_relaxed);
+    ns = g_first_ns.load(std::memory_order_relaxed);
 }
 
 } // namespace Vulkan

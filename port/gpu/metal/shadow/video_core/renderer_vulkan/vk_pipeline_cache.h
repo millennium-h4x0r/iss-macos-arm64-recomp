@@ -9,6 +9,8 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -70,12 +72,41 @@ struct GraphicsPipelineKey {
     }
 };
 
+/// tlg: a render pipeline Metal builds on another thread (encoder thread on): the command
+/// processor records its draws meanwhile and the encoder thread waits for it (Wait) when it sets
+/// the pipeline, so a burst of new pipelines builds in parallel instead of one by one.
+struct DeferredPso {
+    void* Wait() {
+        std::unique_lock lock{mutex};
+        cv.wait(lock, [this] { return done; });
+        return pso;
+    }
+    bool Ready() {
+        std::lock_guard lock{mutex};
+        return done;
+    }
+    void Set(void* p) {
+        {
+            std::lock_guard lock{mutex};
+            pso = p;
+            done = true;
+        }
+        cv.notify_all();
+    }
+    void* pso = nullptr; ///< retained (null: failed); the pipeline takes it once Ready
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+};
+
 class GraphicsPipeline {
 public:
     GraphicsPipelineKey key;
     std::array<MetalStage, MaxShaderStages> stages{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
     void* pso = nullptr; ///< id<MTLRenderPipelineState>, retained
+    std::shared_ptr<DeferredPso> deferred; ///< building (pso null meanwhile)
     /// Vertex attribute i reads buffer (vertex_buffer_base + i).
     u32 vertex_buffer_base = 0;
 

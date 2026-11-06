@@ -356,6 +356,15 @@ kernel void copy_bytes(const device uchar* src [[buffer(0)]], device uchar* dst 
 )";
 } // namespace
 
+void TlgCompileTotals(u64 ns[4], u64 count[4]);
+/// tlg: the encoder thread's time waiting for deferred pipelines (DeferredPso).
+std::atomic<u64> g_tlg_pso_wait_ns{0};
+namespace {
+/// tlg: the render pipeline the encoder thread set last failed to build: its draws are skipped.
+thread_local bool tls_skip_draws = false;
+} // namespace
+void TlgFirstModules(u64& count, u64& ns);
+
 namespace FrameLog {
 u64 g_draws = 0;
 namespace {
@@ -378,6 +387,42 @@ void NoteDispatch(u64 hash, u64 groups, bool indirect) {
 }
 } // namespace
 void EndFrame(bool dumped) {
+    // tlg: TLG_METAL_HITCH_MS=<ms>: a frame (present to present on this thread) slower than that
+    // prints the shader work compiled on this thread during it.
+    static const double hitch_ms = [] {
+        const char* v = std::getenv("TLG_METAL_HITCH_MS");
+        return v ? std::atof(v) : 0.0;
+    }();
+    if (hitch_ms > 0) {
+        static auto last = std::chrono::steady_clock::now();
+        static u64 last_ns[4]{}, last_n[4]{};
+        static u64 frame = 0, last_fm = 0, last_fns = 0, last_wait = 0;
+        const u64 wait = g_tlg_pso_wait_ns.load(std::memory_order_relaxed);
+        u64 fm, fns;
+        TlgFirstModules(fm, fns);
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+        u64 ns[4], n[4];
+        TlgCompileTotals(ns, n);
+        if (ms > hitch_ms) {
+            std::printf("hitch: frame %llu %.0f ms; compiled recompile %llu/%.0f ms, cross %llu/%.0f "
+                        "ms, msl %llu/%.0f ms, pso %llu/%.0f ms (encoder waited %.0f ms); new programs %llu/%.0f ms\n",
+                        (unsigned long long)frame, ms, (unsigned long long)(n[0] - last_n[0]),
+                        (ns[0] - last_ns[0]) / 1e6, (unsigned long long)(n[1] - last_n[1]),
+                        (ns[1] - last_ns[1]) / 1e6, (unsigned long long)(n[2] - last_n[2]),
+                        (ns[2] - last_ns[2]) / 1e6, (unsigned long long)(n[3] - last_n[3]),
+                        (ns[3] - last_ns[3]) / 1e6, (wait - last_wait) / 1e6,
+                        (unsigned long long)(fm - last_fm),
+                        (fns - last_fns) / 1e6);
+        }
+        last_fm = fm;
+        last_fns = fns;
+        last_wait = wait;
+        std::copy(ns, ns + 4, last_ns);
+        std::copy(n, n + 4, last_n);
+        last = now;
+        ++frame;
+    }
     if (!Enabled()) {
         return;
     }
@@ -1618,9 +1663,29 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         ec = {};
         ec.count = scheduler.EncoderCount();
     }
-    if (ec.pso != pipeline->pso) {
+    if (!pipeline->pso && pipeline->deferred) {
+        // A pipeline still building (DeferredPso): the encoder thread waits for it; when it
+        // failed, the draws that use it are skipped (tls_skip_draws).
+        void* const key = pipeline->deferred.get();
+        if (ec.pso != key) {
+            auto deferred = pipeline->deferred;
+            MetalScheduler::RecordRender(scheduler, [deferred](id<MTLRenderCommandEncoder> enc) {
+                const auto t = std::chrono::steady_clock::now();
+                void* const pso = deferred->Wait();
+                g_tlg_pso_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - t).count(),
+                                            std::memory_order_relaxed);
+                tls_skip_draws = pso == nullptr;
+                if (pso) {
+                    [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
+                }
+            });
+            ec.pso = key;
+        }
+    } else if (ec.pso != pipeline->pso) {
         void* const pso = pipeline->pso;
         MetalScheduler::RecordRender(scheduler, [pso](id<MTLRenderCommandEncoder> enc) {
+            tls_skip_draws = false;
             [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
         });
         ec.pso = pipeline->pso;
@@ -2126,6 +2191,9 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         const bool indexed_args = is_indexed || quad_indirect;
         const u64 first = args_offset;
         MetalScheduler::RecordRender(scheduler, [=](id<MTLRenderCommandEncoder> enc) {
+            if (tls_skip_draws) {
+                return;
+            }
             id<MTLBuffer> args = (__bridge id<MTLBuffer>)args_raw;
             for (u32 i = 0; i < count; ++i) {
                 const u64 at = first + u64(i) * step;
@@ -2144,6 +2212,9 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
     } else if (num_indices && !skip_calls) {
         if (draw_indexed) {
             MetalScheduler::RecordRender(scheduler, [=](id<MTLRenderCommandEncoder> enc) {
+                if (tls_skip_draws) {
+                    return;
+                }
                 [enc drawIndexedPrimitives:prim
                                 indexCount:num_indices
                                  indexType:itype
@@ -2155,6 +2226,9 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             });
         } else {
             MetalScheduler::RecordRender(scheduler, [=](id<MTLRenderCommandEncoder> enc) {
+                if (tls_skip_draws) {
+                    return;
+                }
                 [enc drawPrimitives:prim
                         vertexStart:vertex_offset
                         vertexCount:num_indices

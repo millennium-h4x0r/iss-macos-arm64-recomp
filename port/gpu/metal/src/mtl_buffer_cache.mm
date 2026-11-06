@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // tlg Metal renderer: guest memory as MTLBuffers (see buffer_cache.h in metal/shadow).
 
+#include <atomic>
+#include <cerrno>
+#include <sys/mman.h>
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
@@ -137,6 +140,24 @@ std::unique_ptr<Buffer> BufferCache::Wrap(VAddr addr, u64 size, const char* what
         return {};
     }
     mtl.label = [NSString stringWithUTF8String:what];
+    // tlg: TLG_METAL_MLOCK=1: the imported guest memory is wired (mlock), so macOS never
+    // compresses or swaps the pages the GPU reads (a GPU access to a compressed page waits for
+    // the kernel; suspected multi-second command buffers under memory pressure).
+    if (static const bool lock_pages = [] {
+            const char* v = std::getenv("TLG_METAL_MLOCK");
+            return v && v[0] == '1';
+        }();
+        lock_pages) {
+        static std::atomic<u64> locked{0};
+        if (::mlock(reinterpret_cast<void*>(start), end - start) == 0) {
+            locked += end - start;
+            std::printf("GPU: wired %s (%.1f MB, %.1f MB in all)\n", what,
+                        double(end - start) / (1 << 20), double(locked.load()) / (1 << 20));
+        } else {
+            std::printf("GPU: could not wire %s (%.1f MB): %s\n", what,
+                        double(end - start) / (1 << 20), std::strerror(errno));
+        }
+    }
     auto buffer = std::make_unique<Buffer>(instance, start, 16, MemoryType::DeviceLocal);
     buffer->buffer.Destroy();
     buffer->buffer.buffer = Metal::MtlOwn<vk::Buffer>(mtl);
