@@ -6,6 +6,7 @@
 #include <utility>
 #include <map>
 #include <tuple>
+#include <unordered_set>
 #include <pthread.h>
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -555,13 +556,15 @@ static bool TlgComputeFenceNow() {
 // its job system). Here every queue runs in one GPU stream, so a compute job finishes behind the
 // whole frame of graphics before it (on the console it runs beside it); a job flag written that
 // late made the game drop work it took as late (Walk to Seattle: no lighting, the frame gray).
-// The flags are written when recorded (as before 2026-11-04), the counters wait for the GPU.
-// With the encoder thread (2026-11-06) the GPU finishes sooner after recording and the frame
-// rate rose: flags written once the GPU ran the job left Walk to Seattle gray in most frames
-// again (the sort label alone no longer covered it). "When recorded" is when the encoder
-// thread gets there, after the labels before it (Rasterizer::RunAtEncode).
+// Both are written "when recorded": when the encoder thread gets there (Rasterizer::RunAtEncode),
+// a flag at once, a counter after the labels queued before it (so it never goes back, and
+// the GDS store of the particle count before it has landed: the fire). Waiting for the GPU,
+// which runs compute behind the whole frame of graphics, the game saw them late whenever the
+// GPU ran a frame behind (Walk to Seattle, 2026-11-06): with the flags it dropped GPU jobs
+// (a16fa93a and the others of the lighting), with the counters frames came out without
+// lighting, gray, a few times a minute. GDS stores still wait for the GPU.
 // TLG_METAL_CF_NOW_RANGE=<lo>:<hi> (hex): labels in that range are written when recorded too;
-// TLG_METAL_CF_FLAGS_DEFER=1: job flags wait for the GPU as well.
+// TLG_METAL_CF_FLAGS_DEFER=1 / TLG_METAL_CF_COUNTERS_DEFER=1: flags / counters wait for the GPU.
 static bool TlgComputeLabelNow(const PM4CmdReleaseMem& release_mem) {
     static const std::pair<VAddr, VAddr> range = [] {
         const char* v = std::getenv("TLG_METAL_CF_NOW_RANGE");
@@ -577,12 +580,33 @@ static bool TlgComputeLabelNow(const PM4CmdReleaseMem& release_mem) {
         const char* v = std::getenv("TLG_METAL_CF_FLAGS_DEFER");
         return v && v[0] == '1';
     }();
+    // TLG_METAL_CF_COUNTERS_DEFER=1: timeline counters wait for the GPU (before 2026-11-06).
+    static const bool counters_defer = [] {
+        const char* v = std::getenv("TLG_METAL_CF_COUNTERS_DEFER");
+        return v && v[0] == '1';
+    }();
     const VAddr address = release_mem.Address<VAddr>();
     if (address >= range.first && address < range.second) {
         return true;
     }
-    return !flags_defer && release_mem.data_sel.Value() == DataSelect::Data32Low &&
-           release_mem.DataDWord() == 1;
+    const auto sel = release_mem.data_sel.Value();
+    const bool flag = sel == DataSelect::Data32Low && release_mem.DataDWord() == 1;
+    if (flag) {
+        return !flags_defer;
+    }
+    return !counters_defer && (sel == DataSelect::Data32Low || sel == DataSelect::Data64);
+}
+#endif
+
+#ifdef TLG_METAL
+// tlg: addresses compute labels wrote a value other than 1 to (timeline counters): a 1 written
+// there is a counter's value, not a job flag (the command processor thread only).
+static std::unordered_set<VAddr>& TlgCounters() {
+    static std::unordered_set<VAddr> set;
+    return set;
+}
+static bool TlgIsCounter(VAddr address) {
+    return TlgCounters().contains(address);
 }
 #endif
 
@@ -590,6 +614,10 @@ static bool TlgComputeLabelNow(const PM4CmdReleaseMem& release_mem) {
 void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto& task = *reinterpret_cast<const ComputeReleaseMem*>(data);
 #ifdef TLG_METAL
+    if (const auto* p = reinterpret_cast<const PM4CmdReleaseMem*>(task.packet);
+        p->data_sel.Value() == DataSelect::Data32Low && p->DataDWord() != 1) {
+        TlgCounters().insert(p->Address<VAddr>());
+    }
     // tlg: the label (and its interrupt) when the GPU has run the dispatches before it, as the
     // graphics end-of-pipe fences (DeferUnifiedFence). Written when recorded, the game saw its
     // compute work done before it ran and read a stale GPU particle count (inFAMOUS: GDS 0x404,
@@ -706,12 +734,17 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
     }
 immediate:
     // A label written "when recorded" (not a GDS store, which records a GPU copy): when the
-    // encoder thread gets there, as before the encoder thread (Rasterizer::RunAtEncode).
+    // encoder thread gets there, as before the encoder thread (Rasterizer::RunAtEncode). A job
+    // flag goes out at once; anything else (a timeline counter, e.g. the one after the
+    // a16fa93a sort) after the labels before it, so a counter never goes back.
     if (reinterpret_cast<const PM4CmdReleaseMem*>(task.packet)->data_sel.Value() != DataSelect::GdsMemStore) {
         rasterizer.WaitHostCopies();
         rasterizer.ProcessDownloadImages();
         rasterizer.EagerCopyAtFence();
         ComputeReleaseMem copy = task;
+        const auto* packet = reinterpret_cast<const PM4CmdReleaseMem*>(task.packet);
+        const bool flag = packet->data_sel.Value() == DataSelect::Data32Low &&
+                          packet->DataDWord() == 1 && !TlgIsCounter(packet->Address<VAddr>());
         rasterizer.RunAtEncode([copy] {
             reinterpret_cast<const PM4CmdReleaseMem*>(copy.packet)->SignalFence(
                 [pipe_id = copy.pipe_id] {
@@ -721,7 +754,7 @@ immediate:
             if (copy.written) {
                 copy.written->store(true, std::memory_order_release);
             }
-        });
+        }, !flag);
         return;
     }
 #endif

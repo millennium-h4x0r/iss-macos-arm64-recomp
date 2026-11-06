@@ -184,10 +184,13 @@ public:
     /// console's command processor orders them. False when nothing is pending (write at once).
     bool DeferWriteAfterCopy(Common::UniqueFunction<void>&& write);
     /// tlg: runs `write` (a guest label written "when recorded") once the encoder thread has
-    /// encoded the work recorded before it, and after the labels queued before it (on the
-    /// completion thread when they are still pending; never waiting). Unordered (written here,
-    /// TLG_METAL_LABEL_NOW_MODE=record) the game stalls while loading.
-    void RunAtEncode(Common::UniqueFunction<void>&& write);
+    /// encoded the work recorded before it. `ordered`: also after the labels queued before it
+    /// (on the completion thread when they are still pending; never waiting): a timeline
+    /// counter written ahead of an older value still pending went back to it when that one
+    /// landed (inFAMOUS 0x7048000010 stuck at n-1: the game waited for n forever, while
+    /// loading). Unordered: a job flag (a fresh address set to 1), which the game must see
+    /// soon (a flag behind a frame's labels dropped its jobs: Walk to Seattle gray frames).
+    void RunAtEncode(Common::UniqueFunction<void>&& write, bool ordered = true);
     /// tlg: a WRITE_DATA to guest memory as GPU work, in order with the work recorded before and
     /// after it (as the console's command processor runs it). False: not GPU memory.
     bool WriteDataGpu(VAddr address, const u32* data, u32 bytes);

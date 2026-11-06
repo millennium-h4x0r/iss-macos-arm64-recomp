@@ -287,21 +287,23 @@ bool Rasterizer::DeferUnifiedFence(Common::UniqueFunction<void>&& write) {
     return true;
 }
 
-void Rasterizer::RunAtEncode(Common::UniqueFunction<void>&& write) {
-    // TLG_METAL_LABEL_NOW_MODE: block (the encoder thread waits for the labels queued before it,
-    // then writes), after (written after them on the completion thread, never waiting), encode
-    // (when encoded, not ordered with them), record (here and now, not ordered).
-    enum class Mode { Block, After, Encode, Record };
-    static const Mode mode = [] {
+void Rasterizer::RunAtEncode(Common::UniqueFunction<void>&& write, bool ordered) {
+    // TLG_METAL_LABEL_NOW_MODE (diagnosis, every label alike): block (the encoder thread waits
+    // for the labels queued before it, then writes), after (written after them on the
+    // completion thread, never waiting), encode (when encoded, not ordered with them), record
+    // (here and now, not ordered). Default: after when `ordered`, else encode.
+    enum class Mode { Default, Block, After, Encode, Record };
+    static const Mode forced = [] {
         const char* v = std::getenv("TLG_METAL_LABEL_NOW_MODE");
         if (!v) {
-            return Mode::After;
+            return Mode::Default;
         }
         return std::strcmp(v, "block") == 0    ? Mode::Block
                : std::strcmp(v, "encode") == 0 ? Mode::Encode
                : std::strcmp(v, "record") == 0 ? Mode::Record
                                                : Mode::After;
     }();
+    const Mode mode = forced != Mode::Default ? forced : ordered ? Mode::After : Mode::Encode;
     if (mode == Mode::Record) {
         write();
         return;
@@ -309,7 +311,7 @@ void Rasterizer::RunAtEncode(Common::UniqueFunction<void>&& write) {
     auto shared = std::make_shared<Common::UniqueFunction<void>>(std::move(write));
     const u64 target = scheduler.SignalsQueued();
     Scheduler* const s = &scheduler;
-    MetalScheduler::Record(scheduler, [s, shared, target] {
+    MetalScheduler::Record(scheduler, [s, shared, target, mode] {
         if (mode == Mode::Block) {
             s->WaitSignalsUpTo(target);
             (*shared)();

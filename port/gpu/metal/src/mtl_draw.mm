@@ -388,12 +388,17 @@ void EndFrame(bool dumped) {
         std::string line;
         for (const auto& [h, c] : g_cs) {
             char b[64];
-            std::snprintf(b, sizeof(b), " %llx:%u/%llu%s", (unsigned long long)h, c.count,
+            std::snprintf(b, sizeof(b), " %s%llx:%u/%llu%s", h >> 63 ? "p" : "",
+                          (unsigned long long)(h & ~(1ull << 63)), c.count,
                           (unsigned long long)c.groups, c.indirect ? "i" : "");
             line += b;
         }
-        std::printf("frame %llu%s: %llu draws, cs%s\n", (unsigned long long)g_frame, dumped ? " DUMPED" : "",
-                    (unsigned long long)g_draws, line.c_str());
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+        std::printf("frame %llu%s: %.1f ms %llu draws, cs%s\n", (unsigned long long)g_frame,
+                    dumped ? " DUMPED" : "", ms, (unsigned long long)g_draws, line.c_str());
     }
     ++g_frame;
     g_cs.clear();
@@ -2027,6 +2032,10 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             counts.clear();
             last_sec = sec;
         }
+    }
+    if (FrameLog::Enabled() && pipeline->Stage(SwStage::Fragment)) {
+        // Draws count under the pixel shader's hash with a "p" prefix (dispatches: none).
+        FrameLog::NoteDispatch(pipeline->Stage(SwStage::Fragment)->pgm_hash | (1ull << 63), 0, false);
     }
     if (NanScan::Active() && pipeline->Stage(SwStage::Fragment)) {
         const u64 vs_hash = pipeline->Stage(SwStage::Vertex) ? pipeline->Stage(SwStage::Vertex)->pgm_hash : 0;
