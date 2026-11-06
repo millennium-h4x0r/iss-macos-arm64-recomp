@@ -2382,9 +2382,33 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
         const u32* flat = reinterpret_cast<const u32*>(ptr(5));
         const u32 stride_a = (flat[1] >> 16) & 0x3FFF, stride_b = (flat[5] >> 16) & 0x3FFF;
         const u32 grid = cs.dim_x;
+        {
+            // The inputs as recorded (CPU view): a width of 0, or a maximum the doubling width
+            // never exceeds, loops until the shader's loop guard (~1 s on the GPU per dispatch).
+            const u32 count = *reinterpret_cast<const u32*>(count_p);
+            const u32 w = reinterpret_cast<const u32*>(widths)[0], maxw = reinterpret_cast<const u32*>(widths)[1];
+            u32 phases = 0;
+            for (u64 x = w; x && x <= maxw && phases < 64; x *= 2) {
+                ++phases;
+            }
+            static std::atomic<u32> logged{0};
+            const bool odd = w == 0 || phases >= 32 || int(maxw) < 0;
+            if (odd || logged.fetch_add(1) < 60) {
+                std::printf("sort in: grid %u count %u w %u maxw %u (%#x) phases %u%s\n", grid, count, w, maxw, maxw,
+                            phases, odd ? " <-- would not terminate" : "");
+            }
+        }
+        const u32 rec_count = *reinterpret_cast<const u32*>(count_p);
+        const u32 rec_w = reinterpret_cast<const u32*>(widths)[0], rec_maxw = reinterpret_cast<const u32*>(widths)[1];
         scheduler.SignalOnCompletion([=] {
             const u32 count = *reinterpret_cast<const u32*>(count_p);
             const u32 w = reinterpret_cast<const u32*>(widths)[0], maxw = reinterpret_cast<const u32*>(widths)[1];
+            if (w != rec_w || maxw != rec_maxw || count != rec_count) {
+                // The game changed the inputs between recording and completion: the GPU may have
+                // read either (a width of 0 loops until the guard).
+                std::printf("sort inputs changed before completion: grid %u count %u->%u w %u->%u maxw %u->%u\n",
+                            grid, rec_count, count, rec_w, w, rec_maxw, maxw);
+            }
             // The last phase: A -> B for w, then B -> A for 2w, ... up to maxw.
             u32 phases = 0;
             for (u64 x = w; x <= maxw && phases < 64; x *= 2) {
@@ -2415,10 +2439,27 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     if (FrameLog::Enabled()) {
         FrameLog::NoteDispatch(pipeline->hash, u64(cs.dim_x) * cs.dim_y * cs.dim_z, indirect_args != 0);
     }
+    // tlg: inFAMOUS's GPU merge sort (a16fa93a) reads its merge widths from a small parameter
+    // buffer the game recycles as soon as it sees the job's label, which is written when the
+    // dispatch is recorded (TlgComputeLabelNow: written at GPU completion the game drops the
+    // job as late and the frame comes out gray). The GPU, a frame behind, then reads a width of
+    // 0 and the shader loops until its loop guard: the ~1 s whole-game stalls of Seattle, one
+    // per dispatch (TLG_METAL_ENC_TIMES=1 shows them). The widths are what the game had in place
+    // at submit time, so the dispatch gets a copy of that buffer taken here instead.
+    // TLG_METAL_SORT_SNAPSHOT=0: off.
+    constexpr u32 SnapshotMax = 512;
+    u32 snap_len = 0;
+    if (static const bool snapshot = [] {
+            const char* v = std::getenv("TLG_METAL_SORT_SNAPSHOT");
+            return !v || v[0] != '0';
+        }();
+        snapshot && pipeline->hash == 0xa16fa93aull && b.num_buffers >= 3 && b.buffers[2] && b.sizes[2]) {
+        snap_len = std::min(b.sizes[2], SnapshotMax);
+    }
     // The bindings travel as one block: buffers, offsets, textures, samplers, sizes, push data.
     const u32 nb = b.num_buffers, nt = b.num_textures, ns = b.num_samplers;
     alignas(16) u8 block[sizeof(void*) * 32 + 8 * 32 + sizeof(void*) * 128 + sizeof(void*) * 16 +
-                         4 * 32 + sizeof(Shader::PushData)];
+                         4 * 32 + sizeof(Shader::PushData) + SnapshotMax];
     size_t at = 0;
     const auto put = [&](const void* src, size_t n) {
         std::memcpy(block + at, src, n);
@@ -2430,6 +2471,9 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     put(b.samplers.data(), sizeof(void*) * ns);
     put(b.sizes.data(), 4 * 32);
     put(&push_data, sizeof(push_data));
+    if (snap_len) {
+        put(static_cast<const u8*>(b.buffers[2].contents) + b.offsets[2], snap_len);
+    }
     const MTLSize groups = MTLSizeMake(cs.dim_x, cs.dim_y, cs.dim_z);
     void* const ready_pso = pipeline->pso;
     // tlg: a pipeline still compiling (DeferredCompute): the encoder thread waits for it here.
@@ -2438,7 +2482,7 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     Scheduler::Impl* const si = scheduler.impl_();
     const bool barrier = std::exchange(dispatch_barrier, true);
     si->RecordWith(block, at, [si, barrier, nb, nt, ns, threads, groups, ready_pso, deferred = std::move(deferred),
-                               indirect_raw, indirect_offset,
+                               indirect_raw, indirect_offset, snap_len,
                                name = MetalScheduler::LabelMode() ? std::string(label) : std::string()](const void* copy) {
         void* pso = ready_pso;
         if (!pso) {
@@ -2475,6 +2519,10 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
         [enc setBytes:p length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
         p += 4 * 32;
         [enc setBytes:p length:sizeof(Shader::PushData) atIndex:PushDataBufferIndex];
+        p += sizeof(Shader::PushData);
+        if (snap_len) {
+            [enc setBytes:p length:snap_len atIndex:2]; // the sort's parameter buffer as recorded
+        }
         if (indirect_raw) {
             [enc dispatchThreadgroupsWithIndirectBuffer:(__bridge id<MTLBuffer>)indirect_raw
                                    indirectBufferOffset:indirect_offset

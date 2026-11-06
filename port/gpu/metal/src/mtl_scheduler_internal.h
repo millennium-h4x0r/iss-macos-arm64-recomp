@@ -116,6 +116,23 @@ struct Scheduler::Impl {
     u64 signals_queued = 0;
     u64 signals_done = 0;
     std::deque<std::pair<u64, std::function<void()>>> after_signals; ///< RunAfterSignals, by target
+
+    // ---- Diagnosis: TLG_METAL_ENC_TIMES=1 (encoding side) ----
+    // GPU timestamps at the start and end of each encoder of the command buffer being recorded;
+    // a command buffer that runs long on the GPU reports its slow encoders and the gaps.
+    struct EncSample {
+        char kind; ///< R render, C compute, B blit
+        std::string what;
+    };
+    struct EncTimes {
+        id<MTLCounterSampleBuffer> sb = nil;
+        std::vector<EncSample> encs;
+    };
+    std::shared_ptr<EncTimes> enc_times; ///< for cmdbuf
+    bool enc_sampled = false;            ///< the open encoder has samples (its label is taken at its end)
+    /// The first of two sample indices for a new encoder of `kind`, or NSNotFound.
+    NSUInteger SampleIndex(char kind, std::string what = {});
+    void SampleRender(MTLRenderPassDescriptor* rp);
 };
 #endif
 
@@ -230,6 +247,7 @@ inline void BeginRender(Scheduler& s, u64 pass_key, F&& make) {
     impl->Record([impl, make = std::forward<F>(make)]() mutable {
         MTLRenderPassDescriptor* rp = make();
         impl->EndEncoding();
+        impl->SampleRender(rp);
         impl->SetRenderEncoder([impl->CommandBuffer() renderCommandEncoderWithDescriptor:rp]);
     });
 }

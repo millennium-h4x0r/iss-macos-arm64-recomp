@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <mach/mach_time.h>
 #include <pthread.h>
 #include <cstdio>
 #include <algorithm>
@@ -29,7 +30,185 @@ namespace Vulkan {
 
 namespace {
 std::atomic<u32> g_gpu_errors{0};
+
+// ---- TLG_METAL_ENC_TIMES=1: per-encoder GPU timestamps (diagnosis of long command buffers) ----
+constexpr NSUInteger EncSamples = 4096; ///< per command buffer (2 per encoder)
+
+bool EncTimesEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_ENC_TIMES");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+/// Command buffers longer than this report their encoders (TLG_METAL_ENC_TIMES_MS, default 300).
+double EncTimesThreshold() {
+    static const double s = [] {
+        const char* v = std::getenv("TLG_METAL_ENC_TIMES_MS");
+        return (v ? std::atof(v) : 300.0) / 1e3;
+    }();
+    return s;
+}
+
+std::mutex g_sb_mutex;
+std::vector<id<MTLCounterSampleBuffer>> g_sb_pool;
+id<MTLCounterSet> g_timestamp_set = nil;
+bool g_sb_failed = false;
+MTLTimestamp g_cal_cpu = 0, g_cal_gpu = 0; ///< a CPU/GPU timestamp pair from the start
+
+id<MTLCounterSampleBuffer> TakeSampleBuffer(id<MTLDevice> device) {
+    std::scoped_lock lock{g_sb_mutex};
+    if (!g_sb_pool.empty()) {
+        id<MTLCounterSampleBuffer> sb = g_sb_pool.back();
+        g_sb_pool.pop_back();
+        return sb;
+    }
+    if (g_sb_failed) {
+        return nil;
+    }
+    if (!g_timestamp_set) {
+        if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            std::printf("GPU (Metal): encoder times: no stage-boundary counter sampling on this GPU\n");
+            g_sb_failed = true;
+            return nil;
+        }
+        for (id<MTLCounterSet> set in device.counterSets) {
+            if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+                g_timestamp_set = set;
+            }
+        }
+        if (!g_timestamp_set) {
+            std::printf("GPU (Metal): encoder times: no timestamp counter set\n");
+            g_sb_failed = true;
+            return nil;
+        }
+        [device sampleTimestamps:&g_cal_cpu gpuTimestamp:&g_cal_gpu];
+        std::printf("GPU (Metal): encoder times on (command buffers over %.0f ms report their encoders)\n",
+                    EncTimesThreshold() * 1e3);
+    }
+    MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
+    d.counterSet = g_timestamp_set;
+    d.storageMode = MTLStorageModeShared;
+    d.sampleCount = EncSamples;
+    NSError* err = nil;
+    id<MTLCounterSampleBuffer> sb = [device newCounterSampleBufferWithDescriptor:d error:&err];
+    if (!sb) {
+        std::printf("GPU (Metal): encoder times: no sample buffer: %s\n",
+                    err.localizedDescription.UTF8String ?: "?");
+        g_sb_failed = true;
+    }
+    return sb;
+}
+
+void GiveSampleBuffer(id<MTLCounterSampleBuffer> sb) {
+    if (sb) {
+        std::scoped_lock lock{g_sb_mutex};
+        g_sb_pool.push_back(sb);
+    }
+}
+
+/// The encoders of a long command buffer: offsets from its GPU start, durations, and the gaps
+/// between encoders (the GPU idle or blocked inside the command buffer).
+void ReportEncoders(id<MTLCommandBuffer> done, const Scheduler::Impl::EncTimes& et, u64 tick) {
+    const NSUInteger n = et.encs.size();
+    if (!n) {
+        return;
+    }
+    NSData* data = [et.sb resolveCounterRange:NSMakeRange(0, n * 2)];
+    if (!data || data.length < n * 2 * sizeof(MTLCounterResultTimestamp)) {
+        std::fprintf(stderr, "GPU:   encoder times: could not resolve the samples\n");
+        return;
+    }
+    const auto* ts = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
+    // GPU ticks to host seconds (CACurrentMediaTime, as GPUStartTime).
+    MTLTimestamp cpu = 0, gpu = 0;
+    [done.device sampleTimestamps:&cpu gpuTimestamp:&gpu];
+    static std::mutex m;
+    std::scoped_lock lock{m};
+    // GPU ticks per host second, from the calibration pair taken with the first sample buffer
+    // (Apple GPUs count nanoseconds; that is the fallback).
+    double gpu_ns_per_tick = 1.0;
+    if (g_cal_gpu && gpu > g_cal_gpu + 1000000) {
+        const double host_ns = double(cpu - g_cal_cpu); // sampleTimestamps: CPU in nanoseconds
+        gpu_ns_per_tick = host_ns / double(gpu - g_cal_gpu);
+    }
+    const double now_host = CACurrentMediaTime();
+    auto host = [&](u64 g) { return now_host + (double(g) - double(gpu)) * gpu_ns_per_tick / 1e9; };
+    const double t0 = done.GPUStartTime;
+    std::fprintf(stderr, "GPU:   cb %llu: %zu encoders (GPU %.1f ms; start..end in ms from its GPU start):\n",
+                 (unsigned long long)tick, size_t(n), (done.GPUEndTime - t0) * 1e3);
+    double prev_end = t0;
+    int shown = 0;
+    int counted[3] = {0, 0, 0};
+    double kind_ms[3] = {0, 0, 0};
+    double gaps = 0;
+    for (NSUInteger i = 0; i < n; ++i) {
+        const u64 a = ts[i * 2].timestamp, b = ts[i * 2 + 1].timestamp;
+        const int k = et.encs[i].kind == 'R' ? 0 : et.encs[i].kind == 'C' ? 1 : 2;
+        if (a == MTLCounterErrorValue || b == MTLCounterErrorValue || !a || !b || b < a) {
+            if (shown < 40) {
+                ++shown;
+                std::fprintf(stderr, "GPU:     #%zu %c %s: no sample\n", size_t(i), et.encs[i].kind,
+                             et.encs[i].what.c_str());
+            }
+            continue;
+        }
+        const double s = host(a), e = host(b);
+        const double gap = s - prev_end, dur = e - s;
+        ++counted[k];
+        kind_ms[k] += dur * 1e3;
+        if (gap > 0) {
+            gaps += gap;
+        }
+        if ((dur > 0.010 || gap > 0.010) && shown < 40) {
+            ++shown;
+            std::fprintf(stderr, "GPU:     #%zu %c %8.1f..%8.1f (%7.1f ms, gap before %7.1f ms) %s\n", size_t(i),
+                         et.encs[i].kind, (s - t0) * 1e3, (e - t0) * 1e3, dur * 1e3, gap * 1e3,
+                         et.encs[i].what.c_str());
+        }
+        prev_end = std::max(prev_end, e);
+    }
+    std::fprintf(stderr, "GPU:   render %d/%.1f ms, compute %d/%.1f ms, blit %d/%.1f ms, gaps %.1f ms, "
+                 "after the last %.1f ms\n",
+                 counted[0], kind_ms[0], counted[1], kind_ms[1], counted[2], kind_ms[2], gaps * 1e3,
+                 (done.GPUEndTime - prev_end) * 1e3);
+}
 } // namespace
+
+NSUInteger Scheduler::Impl::SampleIndex(char kind, std::string what) {
+    enc_sampled = false;
+    if (!enc_times || !enc_times->sb || (enc_times->encs.size() + 1) * 2 > EncSamples) {
+        return NSNotFound;
+    }
+    enc_times->encs.push_back({kind, std::move(what)});
+    enc_sampled = true;
+    return (enc_times->encs.size() - 1) * 2;
+}
+
+void Scheduler::Impl::SampleRender(MTLRenderPassDescriptor* rp) {
+    if (!EncTimesEnabled() || !rp) {
+        return;
+    }
+    CommandBuffer();
+    id<MTLTexture> t = rp.colorAttachments[0].texture ?: rp.depthAttachment.texture;
+    char what[160] = "";
+    if (t) {
+        std::snprintf(what, sizeof(what), "%lux%lu fmt %lu %s", (unsigned long)t.width, (unsigned long)t.height,
+                      (unsigned long)t.pixelFormat, t.label.UTF8String ?: "");
+    }
+    MTLRenderPassSampleBufferAttachmentDescriptor* a = rp.sampleBufferAttachments[0];
+    const NSUInteger idx = SampleIndex('R', what);
+    if (idx == NSNotFound) {
+        a.sampleBuffer = nil;
+        return;
+    }
+    a.sampleBuffer = enc_times->sb;
+    a.startOfVertexSampleIndex = idx;
+    a.endOfVertexSampleIndex = MTLCounterDontSample;
+    a.startOfFragmentSampleIndex = MTLCounterDontSample;
+    a.endOfFragmentSampleIndex = idx + 1;
+}
 
 namespace MetalScheduler {
 
@@ -235,6 +414,10 @@ id<MTLCommandBuffer> Scheduler::Impl::CommandBuffer() {
         desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
         open_lane = lane;
         cmdbuf = [queues[open_lane] commandBufferWithDescriptor:desc];
+        if (EncTimesEnabled()) {
+            enc_times = std::make_shared<EncTimes>();
+            enc_times->sb = TakeSampleBuffer(queues[open_lane].device);
+        }
         if (queues[1]) {
             static const bool serial = [] {
                 const char* v = std::getenv("TLG_METAL_ASYNC_COMPUTE_SERIAL");
@@ -268,6 +451,13 @@ void Scheduler::Impl::EndEncoding() {
         FencePending() = true;
         encoder_wrote_untracked = false;
     }
+    if (enc_sampled && enc_times && !enc_times->encs.empty()) {
+        enc_sampled = false;
+        if (NSString* label = encoder.label) {
+            auto& what = enc_times->encs.back().what;
+            what = what.empty() ? std::string(label.UTF8String) : what + " " + label.UTF8String;
+        }
+    }
     [encoder endEncoding];
     encoder = nil;
     kind = Kind::None;
@@ -276,9 +466,20 @@ void Scheduler::Impl::EndEncoding() {
 id<MTLComputeCommandEncoder> Scheduler::Impl::ComputeEncoder() {
     if (kind != Kind::Compute || !encoder || open_lane != lane) {
         EndEncoding();
-        id<MTLComputeCommandEncoder> enc = [CommandBuffer()
-            computeCommandEncoderWithDispatchType:MetalScheduler::ConcurrentDispatch() ? MTLDispatchTypeConcurrent
-                                                                                        : MTLDispatchTypeSerial];
+        id<MTLCommandBuffer> cb = CommandBuffer();
+        const MTLDispatchType type =
+            MetalScheduler::ConcurrentDispatch() ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+        id<MTLComputeCommandEncoder> enc;
+        if (const NSUInteger idx = EncTimesEnabled() ? SampleIndex('C') : NSNotFound; idx != NSNotFound) {
+            MTLComputePassDescriptor* d = [MTLComputePassDescriptor computePassDescriptor];
+            d.dispatchType = type;
+            d.sampleBufferAttachments[0].sampleBuffer = enc_times->sb;
+            d.sampleBufferAttachments[0].startOfEncoderSampleIndex = idx;
+            d.sampleBufferAttachments[0].endOfEncoderSampleIndex = idx + 1;
+            enc = [cb computeCommandEncoderWithDescriptor:d];
+        } else {
+            enc = [cb computeCommandEncoderWithDispatchType:type];
+        }
         encoder_has_dispatch = false;
         if (FencePending()) {
             [enc waitForFence:Fence()];
@@ -292,7 +493,17 @@ id<MTLComputeCommandEncoder> Scheduler::Impl::ComputeEncoder() {
 id<MTLBlitCommandEncoder> Scheduler::Impl::BlitEncoder() {
     if (kind != Kind::Blit || !encoder || open_lane != lane) {
         EndEncoding();
-        id<MTLBlitCommandEncoder> enc = [CommandBuffer() blitCommandEncoder];
+        id<MTLCommandBuffer> cb = CommandBuffer();
+        id<MTLBlitCommandEncoder> enc;
+        if (const NSUInteger idx = EncTimesEnabled() ? SampleIndex('B') : NSNotFound; idx != NSNotFound) {
+            MTLBlitPassDescriptor* d = [MTLBlitPassDescriptor blitPassDescriptor];
+            d.sampleBufferAttachments[0].sampleBuffer = enc_times->sb;
+            d.sampleBufferAttachments[0].startOfEncoderSampleIndex = idx;
+            d.sampleBufferAttachments[0].endOfEncoderSampleIndex = idx + 1;
+            enc = [cb blitCommandEncoderWithDescriptor:d];
+        } else {
+            enc = [cb blitCommandEncoder];
+        }
         if (FencePending()) {
             [enc waitForFence:Fence()];
         }
@@ -337,7 +548,18 @@ void Scheduler::Impl::Commit(u64 tick, std::vector<std::function<void()>>&& sign
     static const bool lane_stats = std::getenv("TLG_METAL_LANE_STATS") != nullptr;
     const int lane = open_lane;
     const double commit_time = lane_stats ? CACurrentMediaTime() : 0.0;
+    std::shared_ptr<EncTimes> et = std::move(enc_times);
+    enc_sampled = false;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (et) {
+            if (et->sb && done.status != MTLCommandBufferStatusError &&
+                done.GPUEndTime - done.GPUStartTime > EncTimesThreshold()) {
+                std::fprintf(stderr, "GPU: Metal command buffer %llu (%s) ran %.0f ms on the GPU (encoder times)\n",
+                             (unsigned long long)tick, queue_name, (done.GPUEndTime - done.GPUStartTime) * 1e3);
+                ReportEncoders(done, *et, tick);
+            }
+            GiveSampleBuffer(et->sb);
+        }
         if (lane_stats && done.GPUEndTime > 0) {
             static std::mutex m;
             static double sums[2][3]{}, maxs[2][3]{};
