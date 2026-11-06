@@ -23,6 +23,7 @@
 #include "mtl_objc.h"
 #include "mtl_scheduler_internal.h"
 #include "mtl_stencil.h"
+#include "tlg_settings.h"
 #include "shader_recompiler/info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -362,6 +363,41 @@ std::atomic<u64> g_tlg_pso_wait_ns{0};
 namespace {
 /// tlg: the render pipeline the encoder thread set last failed to build: its draws are skipped.
 thread_local bool tls_skip_draws = false;
+
+// tlg: how long the encoder thread waits for a pipeline still compiling (DeferredPso: new
+// shaders compile on GCD) before it skips that pipeline's draws for now. A token bucket on the
+// encoder thread: up to TLG_METAL_SHADER_WAIT_MS (default 100) at once, refilled at that much
+// per second. One new shader (a flame, the smoke dash) is waited for, not skipped (blinking);
+// a burst of hundreds costs one bounded hitch, the rest pop in when ready. With the in-game
+// "compile shaders in the background" setting off, it always waits.
+namespace ShaderWait {
+std::atomic<u64> g_skipped{0};
+void* Wait(DeferredPso& deferred, std::chrono::steady_clock::time_point now) {
+    if (deferred.Ready()) {
+        return deferred.Wait();
+    }
+    if (!TlgSettings::Get().async_shaders.load(std::memory_order_relaxed)) {
+        return deferred.Wait();
+    }
+    static const double cap_ms = [] {
+        const char* v = std::getenv("TLG_METAL_SHADER_WAIT_MS");
+        return v ? std::max(0.0, std::atof(v)) : 100.0;
+    }();
+    thread_local double tokens_ms = cap_ms;
+    thread_local auto last = now;
+    tokens_ms = std::min(cap_ms, tokens_ms + std::chrono::duration<double>(now - last).count() * cap_ms);
+    last = now;
+    const bool ready = deferred.WaitFor(std::chrono::nanoseconds(static_cast<long long>(tokens_ms * 1e6)));
+    const auto end = std::chrono::steady_clock::now();
+    tokens_ms = std::max(0.0, tokens_ms - std::chrono::duration<double, std::milli>(end - now).count());
+    last = end;
+    if (!ready) {
+        g_skipped.fetch_add(1, std::memory_order_relaxed);
+        return nullptr; // skipped for now: the next frame's pipeline set waits again
+    }
+    return deferred.Wait();
+}
+} // namespace ShaderWait
 } // namespace
 void TlgFirstModules(u64& count, u64& ns);
 void TlgComputeTotals(u64& count, u64& ns);
@@ -409,7 +445,7 @@ void EndFrame(bool dumped) {
         TlgCompileTotals(ns, n);
         if (ms > hitch_ms) {
             std::printf("hitch: frame %llu %.0f ms; compiled recompile %llu/%.0f ms, cross %llu/%.0f "
-                        "ms, msl %llu/%.0f ms, pso %llu/%.0f ms (encoder waited %.0f ms); new programs %llu/%.0f ms; compute %llu/%.0f ms\n",
+                        "ms, msl %llu/%.0f ms, pso %llu/%.0f ms (encoder waited %.0f ms); new programs %llu/%.0f ms; compute %llu/%.0f ms; budget skips %llu\n",
                         (unsigned long long)frame, ms, (unsigned long long)(n[0] - last_n[0]),
                         (ns[0] - last_ns[0]) / 1e6, (unsigned long long)(n[1] - last_n[1]),
                         (ns[1] - last_ns[1]) / 1e6, (unsigned long long)(n[2] - last_n[2]),
@@ -417,7 +453,8 @@ void EndFrame(bool dumped) {
                         (ns[3] - last_ns[3]) / 1e6, (wait - last_wait) / 1e6,
                         (unsigned long long)(fm - last_fm),
                         (fns - last_fns) / 1e6, (unsigned long long)(cn - last_cn),
-                        (cns - last_cns) / 1e6);
+                        (cns - last_cns) / 1e6,
+                        (unsigned long long)ShaderWait::g_skipped.exchange(0));
         }
         last_cn = cn;
         last_cns = cns;
@@ -1677,7 +1714,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             auto deferred = pipeline->deferred;
             MetalScheduler::RecordRender(scheduler, [deferred](id<MTLRenderCommandEncoder> enc) {
                 const auto t = std::chrono::steady_clock::now();
-                void* const pso = deferred->Wait();
+                void* const pso = ShaderWait::Wait(*deferred, t);
                 g_tlg_pso_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                 std::chrono::steady_clock::now() - t).count(),
                                             std::memory_order_relaxed);

@@ -9,7 +9,9 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -85,19 +87,41 @@ struct DeferredPso {
         std::lock_guard lock{mutex};
         return done;
     }
+    /// Waits up to `ns`; false when it is still not ready.
+    bool WaitFor(std::chrono::nanoseconds ns) {
+        std::unique_lock lock{mutex};
+        return cv.wait_for(lock, ns, [this] { return done; });
+    }
     void Set(void* p) {
+        std::vector<std::function<void()>> run;
         {
             std::lock_guard lock{mutex};
             pso = p;
             done = true;
+            run.swap(then);
         }
         cv.notify_all();
+        for (auto& f : run) {
+            f();
+        }
+    }
+    /// Runs `f` once it is set (at once when it already is), on the thread that sets it.
+    void Then(std::function<void()> f) {
+        {
+            std::lock_guard lock{mutex};
+            if (!done) {
+                then.push_back(std::move(f));
+                return;
+            }
+        }
+        f();
     }
     void* pso = nullptr; ///< retained (null: failed); the pipeline takes it once Ready
 private:
     std::mutex mutex;
     std::condition_variable cv;
     bool done = false;
+    std::vector<std::function<void()>> then;
 };
 
 class GraphicsPipeline {

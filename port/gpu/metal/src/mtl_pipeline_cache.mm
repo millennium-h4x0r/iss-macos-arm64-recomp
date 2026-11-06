@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -125,6 +126,9 @@ struct Module {
     /// tlg: compute: the MSL compile and the pipeline build run on GCD's threads (function nil);
     /// the dispatch waits for them on the encoder thread (DeferredCompute).
     std::shared_ptr<DeferredPso> cs_deferred;
+    /// tlg: graphics: the MSL compile (and SPIRV-Cross) on GCD's threads (DeferredShaders);
+    /// the pipeline build waits for it there, the encoder thread waits for the pipeline.
+    std::shared_ptr<DeferredPso> fn_future; ///< pso = the id<MTLFunction>, retained
 };
 
 // tlg: deferred compute pipelines (TLG_METAL_DEFERRED_COMPUTE=0: off). A new compute shader is
@@ -137,6 +141,24 @@ bool DeferredCompute() {
     static const bool on = [] {
         const char* v = std::getenv("TLG_METAL_DEFERRED_COMPUTE");
         return MetalScheduler::EncoderThreadEnabled() && !(v && v[0] == '0');
+    }();
+    return on;
+}
+// tlg: deferred graphics shaders (TLG_METAL_DEFERRED_SHADERS=0: off, back to skipping draws
+// while a shader compiles with async shaders). A new graphics shader compiles on GCD's threads
+// and the encoder thread waits for its pipeline within a time budget (mtl_draw.mm): skipping
+// draws made flames blink and the smoke dash lose its particles. Needs deferred pipelines.
+bool DeferredPsoEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_DEFERRED_PSO");
+        return MetalScheduler::EncoderThreadEnabled() && !(v && v[0] == '0');
+    }();
+    return on;
+}
+bool DeferredShaders() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_DEFERRED_SHADERS");
+        return DeferredPsoEnabled() && !(v && v[0] == '0');
     }();
     return on;
 }
@@ -360,6 +382,10 @@ std::string MslSource(const std::string& msl) {
 // knows the shaders of earlier runs, so worker threads compile them all at startup in
 // parallel; CompileMsl takes a finished library, waits for one in progress, or compiles itself
 // one not reached yet. TLG_METAL_PREWARM=<threads> (0 = off; default: performance cores - 2).
+// tlg: compiles the game is waiting for (deferred compute and graphics shaders on GCD): the
+// startup precompile pauses while any are in flight, so they get every core.
+std::atomic<int> g_urgent_compiles{0};
+
 class MslPrewarm {
 public:
     static MslPrewarm& Get() {
@@ -414,6 +440,16 @@ public:
             return v ? (v[0] == '1' ? 1 : 0) : -1;
         }();
         return force >= 0 ? force == 1 : startup_ms.load(std::memory_order_relaxed) > 8.f;
+    }
+
+    /// tlg: runs `job` on a worker before any shader in the queues (deferred graphics shaders:
+    /// at most one compile per worker, so they cannot crowd out the compute shaders on GCD).
+    void Submit(std::function<void()> job) {
+        {
+            std::lock_guard lock{mutex};
+            jobs.push_back(std::move(job));
+        }
+        work_cv.notify_one();
     }
 
     // Async shaders: the finished library for this source without taking it, or nil with
@@ -495,10 +531,16 @@ private:
             u64 key;
             std::string source;
             bool got = false; // an urgent item (a draw waits for it), not a startup precompile
+            std::function<void()> job;
             {
                 std::unique_lock lock{mutex};
                 // tlg: shaders a draw waits for (async) go before the startup precompile queue.
                 for (;;) {
+                    if (!jobs.empty()) {
+                        job = std::move(jobs.front());
+                        jobs.pop_front();
+                        break;
+                    }
                     while (!urgent.empty()) {
                         auto item = std::move(urgent.front());
                         urgent.pop_front();
@@ -512,6 +554,10 @@ private:
                     if (got) {
                         break;
                     }
+                    if (g_urgent_compiles.load(std::memory_order_relaxed) > 0 && next < queue.size()) {
+                        work_cv.wait_for(lock, std::chrono::milliseconds(5));
+                        continue; // urgent items first; the startup queue waits
+                    }
                     while (next < queue.size() && slots[queue[next].first].state != State::Queued) {
                         ++next;
                     }
@@ -524,6 +570,16 @@ private:
                     // Workers stay for async shaders (Poll queues more).
                     work_cv.wait(lock);
                 }
+                if (job) {
+                    SetQos(QOS_CLASS_USER_INITIATED);
+                }
+            }
+            if (job) {
+                job();
+                continue;
+            }
+            {
+                std::lock_guard lock{mutex};
                 slots[key].state = State::Compiling;
                 // tlg: priorities: a compute shader the frame waits for (GCD, user-interactive)
                 // > a draw's shader (skipped meanwhile) > the startup precompile queue.
@@ -573,6 +629,7 @@ private:
     std::unordered_map<u64, Slot> slots;
     std::vector<std::pair<u64, std::string>> queue;
     std::deque<std::pair<u64, std::string>> urgent;
+    std::deque<std::function<void()>> jobs;
     size_t next = 0;
     u32 compiled = 0, taken = 0;
     std::atomic<float> startup_ms{0.f}; ///< moving average of startup precompile times
@@ -1253,7 +1310,8 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
     // tlg: async shaders (the in-game setting, as on Vulkan): a new graphics permutation's MSL
     // compiles on the prewarm workers and its draws are skipped until it is ready; compute
     // stays synchronous (game logic). A pending permutation costs one lookup per draw.
-    const bool async = sw_stage != SwStage::Compute &&
+    const bool defer_fn = sw_stage != SwStage::Compute && DeferredShaders();
+    const bool async = sw_stage != SwStage::Compute && !defer_fn &&
                        TlgSettings::Get().async_shaders.load(std::memory_order_relaxed) &&
                        MslPrewarm::Get().Running();
     std::optional<Shader::StageSpecialization> pending_key;
@@ -1342,7 +1400,7 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
             spirv, false,
             defer_cross && !cached &&
                 (sw_stage == SwStage::Compute ? DeferredCompute()
-                                              : async && MslDiskCache::Get().Enabled()));
+                                              : defer_fn || (async && MslDiskCache::Get().Enabled())));
         { const u64 ns_ = NsSince(t1); g_stage_ns[1].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_ns[1].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_count[1].fetch_add(1, std::memory_order_relaxed); }
         if (cached) {
             // TLG_METAL_XLAT_VERIFY=1: the cached translation must be this one.
@@ -1488,7 +1546,7 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         g_async_queued.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
-    if (async && (!msl.earlier_run || MslPrewarm::Get().MetalCacheCold())) {
+    if (async && !msl.cache_hit) {
         std::string source = MslSource(msl.msl);
         bool still = false;
         MslPrewarm::Get().Poll(source, still);
@@ -1501,7 +1559,7 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
             return nullptr;
         }
     }
-    std::shared_ptr<DeferredPso> cs_deferred;
+    std::shared_ptr<DeferredPso> cs_deferred, fn_future;
     id<MTLFunction> fn = nil;
     if (sw_stage == SwStage::Compute && DeferredCompute()) {
         cs_deferred = std::make_shared<DeferredPso>();
@@ -1509,6 +1567,7 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         const u64 shader_hash = params.hash;
         auto deferred = cs_deferred;
         g_cs_deferred.fetch_add(1, std::memory_order_relaxed);
+        g_urgent_compiles.fetch_add(1, std::memory_order_relaxed);
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
             void* state = nullptr;
             @autoreleasepool {
@@ -1539,13 +1598,48 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
             if (!state) {
                 g_cs_deferred_failed.fetch_add(1, std::memory_order_relaxed);
             }
+            g_urgent_compiles.fetch_sub(1, std::memory_order_relaxed);
             deferred->Set(state);
         });
+    } else if (defer_fn && (msl.pending_spirv || !msl.earlier_run ||
+                            MslPrewarm::Get().MetalCacheCold())) {
+        // Not known to Metal's own cache (~1 ms then): compile on GCD (DeferredShaders).
+        fn_future = std::make_shared<DeferredPso>();
+        auto job = std::make_shared<MslResult>(msl);
+        const u64 shader_hash = params.hash;
+        auto future = fn_future;
+        g_urgent_compiles.fetch_add(1, std::memory_order_relaxed);
+        // On the prewarm workers, below compute (the frame always waits for those; draws can
+        // be skipped). Without workers (TLG_METAL_PREWARM=0): GCD.
+        auto run = [job, shader_hash, future] {
+            void* function = nullptr;
+            @autoreleasepool {
+                if (job->pending_spirv) {
+                    MslResult full = MslDiskCache::Get().Translate(*job->pending_spirv, false);
+                    if (!full.error.empty() && g_failed.fetch_add(1) < 32) {
+                        std::printf("GPU (Metal): shader %016llx: SPIRV-Cross failed: %s\n",
+                                    (unsigned long long)shader_hash, full.error.c_str());
+                    }
+                    *job = std::move(full);
+                }
+                id<MTLFunction> f = job->msl.empty() ? nil : CompileMsl(*job, shader_hash, "graphics");
+                function = f ? (__bridge_retained void*)f : nullptr;
+            }
+            g_urgent_compiles.fetch_sub(1, std::memory_order_relaxed);
+            future->Set(function);
+        };
+        if (MslPrewarm::Get().Running()) {
+            MslPrewarm::Get().Submit(std::move(run));
+        } else {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                run();
+            });
+        }
     } else {
         fn = CompileMsl(msl, params.hash, sw_stage == SwStage::Compute ? "compute" : "graphics");
     }
     { const u64 ns_ = NsSince(t2); g_stage_ns[2].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_ns[2].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_count[2].fetch_add(1, std::memory_order_relaxed); }
-    if (!fn && !cs_deferred) {
+    if (!fn && !cs_deferred && !fn_future) {
         if (program.modules.empty()) {
             program.failed = true;
         }
@@ -1574,6 +1668,7 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
     module.meta.uses_buffer_sizes = msl.uses_buffer_sizes;
     module.cold = !msl.cache_hit;
     module.cs_deferred = std::move(cs_deferred);
+    module.fn_future = std::move(fn_future);
     program.modules.push_back(std::move(module));
     program.last_used = program.modules.size() - 1;
     remember(program.last_used);
@@ -1864,7 +1959,8 @@ GraphicsPipeline* PipelineCache::Impl::CreateGraphics() {
     // Only pipelines with a shader new to this run (not in the MSL cache): Metal's pipeline
     // cache has the others, created at once (skipping their draws made flames blink).
     const bool cold_stage = std::ranges::any_of(modules, [](const Module* m) { return m && m->cold; });
-    if (cold_stage && TlgSettings::Get().async_shaders.load(std::memory_order_relaxed)) {
+    if (cold_stage && !DeferredShaders() &&
+        TlgSettings::Get().async_shaders.load(std::memory_order_relaxed)) {
         auto pending = std::make_shared<PendingPso>();
         const u64 vs_hash = vs.info ? vs.info->pgm_hash : 0, fs_hash = fs.info ? fs.info->pgm_hash : 0;
         // A blocking create on GCD's concurrent queue: Metal's completionHandler variant was
@@ -1889,26 +1985,62 @@ GraphicsPipeline* PipelineCache::Impl::CreateGraphics() {
     }
     // tlg: deferred pipelines (TLG_METAL_DEFERRED_PSO=0: off): built on GCD's threads, the
     // encoder thread waits for them (DeferredPso). Needs the encoder thread.
-    static const bool deferred_pso = [] {
-        const char* v = std::getenv("TLG_METAL_DEFERRED_PSO");
-        return MetalScheduler::EncoderThreadEnabled() && !(v && v[0] == '0');
-    }();
-    if (deferred_pso) {
+    const Module* vs_module = modules[static_cast<u32>(SwStage::Vertex)];
+    const Module* fs_module = modules[static_cast<u32>(SwStage::Fragment)];
+    std::shared_ptr<DeferredPso> vs_future = vs_module ? vs_module->fn_future : nullptr;
+    std::shared_ptr<DeferredPso> fs_future = fs_module ? fs_module->fn_future : nullptr;
+    if (DeferredPsoEnabled()) {
         auto deferred = std::make_shared<DeferredPso>();
         const u64 vs_hash = vs.info ? vs.info->pgm_hash : 0, fs_hash = fs.info ? fs.info->pgm_hash : 0;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-            NSError* err = nil;
-            const auto tp = std::chrono::steady_clock::now();
-            id<MTLRenderPipelineState> state =
-                [Metal::Device() newRenderPipelineStateWithDescriptor:desc error:&err];
-            g_pso_build_ns.fetch_add(NsSince(tp), std::memory_order_relaxed);
-            if (!state && g_failed.fetch_add(1) < 32) {
-                std::printf("GPU (Metal): render pipeline (vs %016llx ps %016llx) failed: %s\n",
-                            (unsigned long long)vs_hash, (unsigned long long)fs_hash,
-                            err.localizedDescription.UTF8String);
+        // Built on GCD once its shaders are compiled (DeferredShaders: Then, so no GCD thread
+        // blocks waiting for them: hundreds of new pipelines at a cut starved the compute
+        // shaders the frame needs).
+        auto build = [desc, deferred, vs_future, fs_future, vs_hash, fs_hash] {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                if (vs_future) {
+                    void* f = vs_future->Wait(); // set already
+                    if (!f) {
+                        deferred->Set(nullptr);
+                        return;
+                    }
+                    desc.vertexFunction = (__bridge id<MTLFunction>)f;
+                }
+                if (fs_future) {
+                    void* f = fs_future->Wait();
+                    if (!f) {
+                        deferred->Set(nullptr);
+                        return;
+                    }
+                    desc.fragmentFunction = (__bridge id<MTLFunction>)f;
+                }
+                NSError* err = nil;
+                const auto tp = std::chrono::steady_clock::now();
+                id<MTLRenderPipelineState> state =
+                    [Metal::Device() newRenderPipelineStateWithDescriptor:desc error:&err];
+                g_pso_build_ns.fetch_add(NsSince(tp), std::memory_order_relaxed);
+                if (!state && g_failed.fetch_add(1) < 32) {
+                    std::printf("GPU (Metal): render pipeline (vs %016llx ps %016llx) failed: %s\n",
+                                (unsigned long long)vs_hash, (unsigned long long)fs_hash,
+                                err.localizedDescription.UTF8String);
+                }
+                deferred->Set(state ? (__bridge_retained void*)state : nullptr);
+            });
+        };
+        const int waits = (vs_future ? 1 : 0) + (fs_future ? 1 : 0);
+        if (waits == 0) {
+            build();
+        } else {
+            auto left = std::make_shared<std::atomic<int>>(waits);
+            for (const auto& future : {vs_future, fs_future}) {
+                if (future) {
+                    future->Then([left, build] {
+                        if (left->fetch_sub(1) == 1) {
+                            build();
+                        }
+                    });
+                }
             }
-            deferred->Set(state ? (__bridge_retained void*)state : nullptr);
-        });
+        }
         g_stage_total_count[3].fetch_add(1, std::memory_order_relaxed);
         pipeline->deferred = std::move(deferred);
         g_pipelines.fetch_add(1, std::memory_order_relaxed);
