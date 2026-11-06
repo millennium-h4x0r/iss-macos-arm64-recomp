@@ -61,6 +61,12 @@ struct Rasterizer::DrawState {
 
 /// Debugging (TLG_METAL_NAN_SCAN=1): on the frames after a frame dump, counts the NaN and Inf
 /// texels each pass and dispatch leaves in its float targets and prints the ones that have any.
+/// Diagnosis (TLG_METAL_FRAME_CS=<first frame>): per frame, the compute shaders dispatched
+/// (count, grid groups, indirect) and the frame's draw count, one line per frame for 200 frames.
+namespace FrameLog {
+void EndFrame(bool dumped);
+}
+
 namespace NanScan {
 bool Enabled();
 /// Called by the presenter at the end of a frame: prints the frame's results (once the GPU has

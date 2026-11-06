@@ -183,6 +183,14 @@ public:
     /// memory (DMA_DATA) is still pending: run on the GPU's completion, after the copy, as the
     /// console's command processor orders them. False when nothing is pending (write at once).
     bool DeferWriteAfterCopy(Common::UniqueFunction<void>&& write);
+    /// tlg: runs `write` (a guest label written "when recorded") once the encoder thread has
+    /// encoded the work recorded before it, and after the labels queued before it (on the
+    /// completion thread when they are still pending; never waiting). Unordered (written here,
+    /// TLG_METAL_LABEL_NOW_MODE=record) the game stalls while loading.
+    void RunAtEncode(Common::UniqueFunction<void>&& write);
+    /// tlg: a WRITE_DATA to guest memory as GPU work, in order with the work recorded before and
+    /// after it (as the console's command processor runs it). False: not GPU memory.
+    bool WriteDataGpu(VAddr address, const u32* data, u32 bytes);
     bool pending_guest_copy = false;
     void SyncUnifiedRead(VAddr address, u64 size);
     void WaitDeferredSignals() {

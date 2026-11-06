@@ -292,15 +292,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             return v && *v == '2';
         }();
         if (debug_red) {
+            id<MTLTexture> red_target = source;
+            MetalScheduler::BeginRender(draw_scheduler, ~0ull - 2, [red_target] {
+                MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = red_target;
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                return rp;
+            });
             draw_scheduler.EndEncoding();
-            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-            rp.colorAttachments[0].texture = source;
-            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-            rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
-            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-            id<MTLRenderCommandEncoder> e =
-                [MetalScheduler::CommandBuffer(draw_scheduler) renderCommandEncoderWithDescriptor:rp];
-            [e endEncoding];
         }
         // The display format says how the buffer's bytes are ordered (the Vulkan renderer views
         // it as GetFrameViewFormat does): A8R8G8B8 / A2R10G10B10 are BGRA in memory, so an image
@@ -325,26 +326,29 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                                          MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)
                                                    : MTLTextureSwizzleChannelsDefault];
         }
-        draw_scheduler.EndEncoding();
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = target;
         static const bool debug_green = [] {
             const char* v = std::getenv("TLG_METAL_DEBUG_PRESENT");
             return v && *v == '1';
         }();
-        pass.colorAttachments[0].loadAction = debug_green ? MTLLoadActionClear : MTLLoadActionDontCare;
-        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 1, 0, 1);
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLCommandBuffer> cb = MetalScheduler::CommandBuffer(draw_scheduler);
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
-        enc.label = @"Display copy";
-        draw_scheduler.SetRenderEncoder((__bridge void*)enc, ~0ull - 1);
-        [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)copy_pipeline];
-        [enc setFragmentTexture:source atIndex:0];
-        [enc setFragmentSamplerState:(__bridge id<MTLSamplerState>)sampler atIndex:0];
-        if (!debug_green) {
-            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-        }
+        MetalScheduler::BeginRender(draw_scheduler, ~0ull - 1, [target] {
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = target;
+            pass.colorAttachments[0].loadAction = debug_green ? MTLLoadActionClear : MTLLoadActionDontCare;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 1, 0, 1);
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            return pass;
+        });
+        void* const pso = copy_pipeline;
+        void* const smp = sampler;
+        MetalScheduler::RecordRender(draw_scheduler, [source, pso, smp](id<MTLRenderCommandEncoder> enc) {
+            enc.label = @"Display copy";
+            [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
+            [enc setFragmentTexture:source atIndex:0];
+            [enc setFragmentSamplerState:(__bridge id<MTLSamplerState>)smp atIndex:0];
+            if (!debug_green) {
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            }
+        });
         draw_scheduler.EndEncoding();
         // TLG_METAL_CONTENT_STATS=1: whether each flipped frame shows a new picture (8 rows of
         // the frame are read back and hashed), as runs of repeats every 5 s. Flip timing alone
@@ -354,18 +358,20 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             const u32 w = frame->width, rows = 8;
             id<MTLBuffer> buffer = [Metal::Device() newBufferWithLength:size_t(w) * rows * 4
                                                                 options:MTLResourceStorageModeShared];
-            id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(draw_scheduler);
-            for (u32 r = 0; r < rows; ++r) {
-                [blit copyFromTexture:target
-                                 sourceSlice:0
-                                 sourceLevel:0
-                                sourceOrigin:MTLOriginMake(0, (frame->height * (2 * r + 1)) / (2 * rows), 0)
-                                  sourceSize:MTLSizeMake(w, 1, 1)
-                                    toBuffer:buffer
-                           destinationOffset:size_t(r) * w * 4
-                      destinationBytesPerRow:w * 4
-                    destinationBytesPerImage:w * 4];
-            }
+            const u32 fh = frame->height;
+            MetalScheduler::RecordBlit(draw_scheduler, "content_stats", [=](id<MTLBlitCommandEncoder> blit) {
+                for (u32 r = 0; r < rows; ++r) {
+                    [blit copyFromTexture:target
+                                     sourceSlice:0
+                                     sourceLevel:0
+                                    sourceOrigin:MTLOriginMake(0, (fh * (2 * r + 1)) / (2 * rows), 0)
+                                      sourceSize:MTLSizeMake(w, 1, 1)
+                                        toBuffer:buffer
+                               destinationOffset:size_t(r) * w * 4
+                          destinationBytesPerRow:w * 4
+                        destinationBytesPerImage:w * 4];
+                }
+            });
             draw_scheduler.EndEncoding();
             draw_scheduler.SignalOnCompletion([buffer, w, rows] {
                 static u64 last_hash = 0;
@@ -401,18 +407,19 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             id<MTLBuffer> buffer =
                 [Metal::Device() newBufferWithLength:size_t(frame->width) * frame->height * 4
                                              options:MTLResourceStorageModeShared];
-            id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(draw_scheduler);
-            [blit copyFromTexture:target
-                             sourceSlice:0
-                             sourceLevel:0
-                            sourceOrigin:MTLOriginMake(0, 0, 0)
-                              sourceSize:MTLSizeMake(frame->width, frame->height, 1)
-                                toBuffer:buffer
-                       destinationOffset:0
-                  destinationBytesPerRow:frame->width * 4
-                destinationBytesPerImage:size_t(frame->width) * frame->height * 4];
-            draw_scheduler.EndEncoding();
             const u32 w = frame->width, h = frame->height;
+            MetalScheduler::RecordBlit(draw_scheduler, "dump", [=](id<MTLBlitCommandEncoder> blit) {
+                [blit copyFromTexture:target
+                                 sourceSlice:0
+                                 sourceLevel:0
+                                sourceOrigin:MTLOriginMake(0, 0, 0)
+                                  sourceSize:MTLSizeMake(w, h, 1)
+                                    toBuffer:buffer
+                           destinationOffset:0
+                      destinationBytesPerRow:w * 4
+                    destinationBytesPerImage:size_t(w) * h * 4];
+            });
+            draw_scheduler.EndEncoding();
             const int index = dump_index++;
             draw_scheduler.SignalOnCompletion([buffer, w, h, index] { WriteDump(buffer, w, h, index); });
         }
@@ -422,6 +429,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         const char* v = std::getenv("TLG_METAL_DUMP_TARGETS");
         return v && *v == '1';
     }();
+    FrameLog::EndFrame(dump);
     if (NanScan::Enabled()) {
         NanScan::EndFrame(draw_scheduler, dump);
     }
@@ -447,24 +455,29 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             td.storageMode = MTLStorageModePrivate;
             id<MTLTexture> conv = [Metal::Device() newTextureWithDescriptor:td];
+            MetalScheduler::BeginRender(draw_scheduler, ~0ull - 2, [conv] {
+                MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = conv;
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                return rp;
+            });
+            void* const pso = copy_pipeline;
+            void* const smp = sampler;
+            MetalScheduler::RecordRender(draw_scheduler, [tex, pso, smp](id<MTLRenderCommandEncoder> e) {
+                [e setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
+                [e setFragmentTexture:tex atIndex:0];
+                [e setFragmentSamplerState:(__bridge id<MTLSamplerState>)smp atIndex:0];
+                [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            });
             draw_scheduler.EndEncoding();
-            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-            rp.colorAttachments[0].texture = conv;
-            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-            id<MTLRenderCommandEncoder> e =
-                [MetalScheduler::CommandBuffer(draw_scheduler) renderCommandEncoderWithDescriptor:rp];
-            [e setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)copy_pipeline];
-            [e setFragmentTexture:tex atIndex:0];
-            [e setFragmentSamplerState:(__bridge id<MTLSamplerState>)sampler atIndex:0];
-            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-            [e endEncoding];
             id<MTLBuffer> buffer = [Metal::Device() newBufferWithLength:size_t(w) * h * 4
                                                                 options:MTLResourceStorageModeShared];
-            id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(draw_scheduler);
-            [blit copyFromTexture:conv sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                       sourceSize:MTLSizeMake(w, h, 1) toBuffer:buffer destinationOffset:0
-                  destinationBytesPerRow:w * 4 destinationBytesPerImage:size_t(w) * h * 4];
+            MetalScheduler::RecordBlit(draw_scheduler, "dump", [=](id<MTLBlitCommandEncoder> blit) {
+                [blit copyFromTexture:conv sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(w, h, 1) toBuffer:buffer destinationOffset:0
+                      destinationBytesPerRow:w * 4 destinationBytesPerImage:size_t(w) * h * 4];
+            });
             draw_scheduler.EndEncoding();
             const std::string name = target.label;
             const int index = n++;
@@ -572,16 +585,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool) {
         TlgSettings::Get().window_width = int(dw);
         TlgSettings::Get().window_height = int(dh);
 
+        // The present scheduler has no encoder thread: the closures run here, at once.
         Scheduler& scheduler = present_scheduler;
-        id<MTLCommandBuffer> cb = MetalScheduler::CommandBuffer(scheduler);
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = target;
-        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
-        enc.label = @"Present";
-        scheduler.SetRenderEncoder((__bridge void*)enc, ~0ull - 3);
+        MetalScheduler::BeginRender(scheduler, ~0ull - 3, [target] {
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = target;
+            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            return pass;
+        });
         if (frame->texture && !frame->blank) {
             // Aspect-preserving fit.
             const double fa = double(frame->width) / frame->height;
@@ -592,16 +605,18 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool) {
             } else {
                 vh = dw / fa;
             }
-            [enc setViewport:MTLViewport{(dw - vw) / 2, (dh - vh) / 2, vw, vh, 0, 1}];
-            [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)blit_pipeline];
-            [enc setFragmentTexture:(__bridge id<MTLTexture>)frame->texture atIndex:0];
-            [enc setFragmentSamplerState:(__bridge id<MTLSamplerState>)sampler atIndex:0];
-            const float pp[2] = {pp_settings.gamma, TlgSettings::Get().brightness.load()};
-            [enc setFragmentBytes:pp length:sizeof(pp) atIndex:0];
-            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            MetalScheduler::RecordRender(scheduler, [&](id<MTLRenderCommandEncoder> enc) {
+                enc.label = @"Present";
+                [enc setViewport:MTLViewport{(dw - vw) / 2, (dh - vh) / 2, vw, vh, 0, 1}];
+                [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)blit_pipeline];
+                [enc setFragmentTexture:(__bridge id<MTLTexture>)frame->texture atIndex:0];
+                [enc setFragmentSamplerState:(__bridge id<MTLSamplerState>)sampler atIndex:0];
+                const float pp[2] = {pp_settings.gamma, TlgSettings::Get().brightness.load()};
+                [enc setFragmentBytes:pp length:sizeof(pp) atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            });
         }
         scheduler.EndEncoding();
-        TlgOverlay::Render((__bridge void*)cb, (__bridge void*)target, dw, dh);
         // tlg: on a ProMotion (120 Hz) display a frame presented "now" lands on whichever 8.3 ms
         // refresh comes next, so the game's 60 FPS showed as a mix of 8, 17 and 25 ms frames
         // (judder, and frames shown for one refresh look like hitches). Holding each drawable on
@@ -611,11 +626,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool) {
             const char* v = std::getenv("TLG_METAL_PRESENT_MIN_MS");
             return (v && *v ? std::atof(v) : 0.0) / 1000.0;
         }();
-        if (vsync && min_s > 0 && !is_reusing_frame) {
-            [cb presentDrawable:drawable afterMinimumDuration:min_s];
-        } else {
-            [cb presentDrawable:drawable];
-        }
+        MetalScheduler::RecordCommandBuffer(scheduler, [&](id<MTLCommandBuffer> cb) {
+            TlgOverlay::Render((__bridge void*)cb, (__bridge void*)target, dw, dh);
+            if (vsync && min_s > 0 && !is_reusing_frame) {
+                [cb presentDrawable:drawable afterMinimumDuration:min_s];
+            } else {
+                [cb presentDrawable:drawable];
+            }
+        });
     }
     if (is_reusing_frame) {
         present_scheduler.Flush();

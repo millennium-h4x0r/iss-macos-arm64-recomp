@@ -7,6 +7,9 @@
 #include <map>
 #include <tuple>
 #include <pthread.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -154,6 +157,13 @@ void Liverpool::Process(std::stop_token stoken) {
     gpu_id = std::this_thread::get_id();
 #if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
     gpu_tid = gettid();
+#endif
+#ifdef __APPLE__
+    // tlg: TLG_GPU_THREAD_QOS=ui: the command processor at user-interactive QoS (it paces the
+    // frame; at the default QoS macOS may run it on an efficiency core when many threads are busy).
+    if (const char* qos = std::getenv("TLG_GPU_THREAD_QOS"); qos && std::strcmp(qos, "ui") == 0) {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
 #endif
 
     while (!stoken.stop_requested()) {
@@ -374,6 +384,19 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* header = reinterpret_cast<const PM4Header*>(data);
     const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(data);
 #ifdef TLG_METAL
+    // tlg: TLG_METAL_WRITE_DATA_GPU=1: guest GPU memory is written by the GPU, in order with
+    // the work around it (written here, the work recorded before it and not yet run read the new
+    // value).
+    if (static const bool gpu_writes = [] {
+            const char* v = std::getenv("TLG_METAL_WRITE_DATA_GPU");
+            return v && v[0] == '1';
+        }();
+        gpu_writes) {
+        const u32 bytes = (header->type3.count.Value() - 2) * sizeof(u32);
+        if (rasterizer.WriteDataGpu(write_data->Address<u64>(), write_data->data, bytes)) {
+            return;
+        }
+    }
     // tlg: after a DMA_DATA the GPU has not run yet: written when it has (in order).
     {
         const u32 bytes = (header->type3.count.Value() - 2) * sizeof(u32);
@@ -533,6 +556,10 @@ static bool TlgComputeFenceNow() {
 // whole frame of graphics before it (on the console it runs beside it); a job flag written that
 // late made the game drop work it took as late (Walk to Seattle: no lighting, the frame gray).
 // The flags are written when recorded (as before 2026-11-04), the counters wait for the GPU.
+// With the encoder thread (2026-11-06) the GPU finishes sooner after recording and the frame
+// rate rose: flags written once the GPU ran the job left Walk to Seattle gray in most frames
+// again (the sort label alone no longer covered it). "When recorded" is when the encoder
+// thread gets there, after the labels before it (Rasterizer::RunAtEncode).
 // TLG_METAL_CF_NOW_RANGE=<lo>:<hi> (hex): labels in that range are written when recorded too;
 // TLG_METAL_CF_FLAGS_DEFER=1: job flags wait for the GPU as well.
 static bool TlgComputeLabelNow(const PM4CmdReleaseMem& release_mem) {
@@ -546,11 +573,9 @@ static bool TlgComputeLabelNow(const PM4CmdReleaseMem& release_mem) {
         const VAddr hi = end && *end == ':' ? std::strtoull(end + 1, nullptr, 16) : 0;
         return std::pair<VAddr, VAddr>{lo, hi};
     }();
-    // Off by default since the sort label (TLG_METAL_CF_NOW_CS) was found to be the one that
-    // matters: TLG_METAL_CF_FLAGS_DEFER=0 writes the job flags when recorded.
     static const bool flags_defer = [] {
         const char* v = std::getenv("TLG_METAL_CF_FLAGS_DEFER");
-        return !v || v[0] != '0';
+        return v && v[0] == '1';
     }();
     const VAddr address = release_mem.Address<VAddr>();
     if (address >= range.first && address < range.second) {
@@ -582,31 +607,41 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
     }();
     const bool guest_writes = rasterizer.TakeGuestWrites(1);
     // TLG_METAL_CF_NOW_CS=<hex>,...: labels after those compute shaders are written when
-    // recorded (default a16fa93a: inFAMOUS's GPU sort, whose label written once the GPU ran it
-    // leaves "Walk to Seattle" without lighting, gray: its output is wrong here and the game
-    // reads it then; written at once, the game reads the previous contents). "none": no shader.
+    // recorded (default a16fa93a: inFAMOUS's GPU merge sort, whose label written once the GPU
+    // ran it left "Walk to Seattle" without lighting, gray. Its output is correct
+    // (TLG_METAL_CHECK_SORT=1 checks it): the game drops work whose GPU jobs it sees finish
+    // late, see TlgComputeLabelNow). "none": no shader.
     // TLG_LOG_COMPUTE_RELEASE lists the shaders labels follow.
     const u64 cs = rasterizer.last_cs_hash[1];
+    // Whether `list` (comma-separated hex hashes, as TLG_LOG_COMPUTE_RELEASE prints them) names cs.
+    const auto listed = [cs](const char* list) {
+        char want[24];
+        const int n = std::snprintf(want, sizeof(want), "%llx", (unsigned long long)cs);
+        for (const char* p = list; *p;) {
+            const char* end = std::strchr(p, ',');
+            const size_t len = end ? size_t(end - p) : std::strlen(p);
+            if (len == size_t(n) && std::strncmp(p, want, len) == 0) {
+                return true;
+            }
+            if (!end) {
+                break;
+            }
+            p = end + 1;
+        }
+        return false;
+    };
     if (static const char* list = [] {
             const char* v = std::getenv("TLG_METAL_CF_NOW_CS");
             return v ? v : "a16fa93a";
         }();
-        list) {
-        char want[24];
-        std::snprintf(want, sizeof(want), "%llx", (unsigned long long)cs);
-        if (std::strstr(list, want)) {
-            goto immediate;
-        }
+        list && listed(list)) {
+        goto immediate;
     }
     // Diagnosis: TLG_METAL_CF_FINISH_CS=<hex>,...: after those shaders, wait for the GPU to
     // finish, then write the label (the data is final, only the timing differs).
-    if (static const char* list = std::getenv("TLG_METAL_CF_FINISH_CS"); list) {
-        char want[24];
-        std::snprintf(want, sizeof(want), "%llx", (unsigned long long)cs);
-        if (std::strstr(list, want)) {
-            rasterizer.Finish();
-            goto immediate;
-        }
+    if (static const char* list = std::getenv("TLG_METAL_CF_FINISH_CS"); list && listed(list)) {
+        rasterizer.Finish();
+        goto immediate;
     }
     if (std::getenv("TLG_LOG_COMPUTE_RELEASE")) {
         static std::mutex m;
@@ -670,6 +705,25 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
         return;
     }
 immediate:
+    // A label written "when recorded" (not a GDS store, which records a GPU copy): when the
+    // encoder thread gets there, as before the encoder thread (Rasterizer::RunAtEncode).
+    if (reinterpret_cast<const PM4CmdReleaseMem*>(task.packet)->data_sel.Value() != DataSelect::GdsMemStore) {
+        rasterizer.WaitHostCopies();
+        rasterizer.ProcessDownloadImages();
+        rasterizer.EagerCopyAtFence();
+        ComputeReleaseMem copy = task;
+        rasterizer.RunAtEncode([copy] {
+            reinterpret_cast<const PM4CmdReleaseMem*>(copy.packet)->SignalFence(
+                [pipe_id = copy.pipe_id] {
+                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+                },
+                [](VAddr, u16, u16) {});
+            if (copy.written) {
+                copy.written->store(true, std::memory_order_release);
+            }
+        });
+        return;
+    }
 #endif
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();

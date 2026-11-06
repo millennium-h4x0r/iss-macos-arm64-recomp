@@ -5,6 +5,7 @@
 // written by shaders orders later encoders through the scheduler's fence.
 
 #include <algorithm>
+#include <map>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -89,6 +90,73 @@ struct AttachmentKey {
 
 } // namespace
 
+/// A render pass's attachments: the recording side fills it, the encoding side builds the
+/// MTLRenderPassDescriptor (textures unretained: the texture cache frees them only once the
+/// tick has completed).
+struct PassDesc {
+    struct Color {
+        void* texture = nullptr;
+        u32 level = 0, slice = 0;
+        bool is_3d = false, clear = false;
+        float clear_color[4]{};
+    };
+    std::array<Color, 8> colors{};
+    void* depth = nullptr;
+    u32 depth_slice = 0;
+    bool has_depth = false, has_stencil = false, depth_clear = false, stencil_clear = false;
+    float clear_depth = 0;
+    u32 clear_stencil = 0;
+    bool no_attachments = false;
+    u32 width = 1, height = 1, samples = 1;
+
+    MTLRenderPassDescriptor* Build() const {
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        for (u32 cb = 0; cb < colors.size(); ++cb) {
+            const Color& c = colors[cb];
+            if (!c.texture) {
+                continue;
+            }
+            auto* att = rp.colorAttachments[cb];
+            att.texture = (__bridge id<MTLTexture>)c.texture;
+            att.level = c.level;
+            if (c.is_3d) {
+                att.depthPlane = c.slice;
+            } else {
+                att.slice = c.slice;
+            }
+            att.loadAction = c.clear ? MTLLoadActionClear : MTLLoadActionLoad;
+            if (c.clear) {
+                att.clearColor = MTLClearColorMake(c.clear_color[0], c.clear_color[1], c.clear_color[2],
+                                                   c.clear_color[3]);
+            }
+            att.storeAction = MTLStoreActionStore;
+        }
+        if (depth) {
+            id<MTLTexture> t = (__bridge id<MTLTexture>)depth;
+            if (has_depth) {
+                rp.depthAttachment.texture = t;
+                rp.depthAttachment.slice = depth_slice;
+                rp.depthAttachment.loadAction = depth_clear ? MTLLoadActionClear : MTLLoadActionLoad;
+                rp.depthAttachment.clearDepth = clear_depth;
+                rp.depthAttachment.storeAction = MTLStoreActionStore;
+            }
+            if (has_stencil) {
+                rp.stencilAttachment.texture = t;
+                rp.stencilAttachment.slice = depth_slice;
+                rp.stencilAttachment.loadAction = stencil_clear ? MTLLoadActionClear : MTLLoadActionLoad;
+                rp.stencilAttachment.clearStencil = clear_stencil;
+                rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
+        }
+        if (no_attachments) {
+            rp.renderTargetWidth = width;
+            rp.renderTargetHeight = height;
+            rp.defaultRasterSampleCount = samples;
+        }
+        return rp;
+    }
+};
+
 struct Rasterizer::DrawState::Impl {
     id<MTLTexture> dummy_2d = nil;
     id<MTLTexture> dummy_2d_array = nil;
@@ -110,7 +178,6 @@ struct Rasterizer::DrawState::Impl {
     /// (every draw set ~20 states: a third of the command processor thread is in Metal). Valid
     /// for one encoder (pointer and the scheduler's encoder count). TLG_METAL_STATE_CACHE=0: off.
     struct EncCache {
-        void* enc = nullptr;
         u64 count = ~0ull;
         void* pso = nullptr;
         void* buf[2][32]{};
@@ -260,15 +327,20 @@ void Rasterizer::DrawState::ConvertQuadIndirect(Scheduler& scheduler, id<MTLBuff
             newComputePipelineStateWithFunction:[lib newFunctionWithName:@"quad_args"]
                                           error:&error];
     }
-    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "quad_args");
-    [enc setComputePipelineState:impl->quad_pipeline];
-    [enc setBuffer:args offset:args_offset atIndex:0];
-    [enc setBuffer:out_args offset:out_args_offset atIndex:1];
-    [enc setBuffer:(indices ? indices : impl->dummy_buffer) offset:(indices ? indices_offset : 0) atIndex:2];
-    [enc setBuffer:out_indices offset:(indexed ? out_indices_offset : 0) atIndex:3];
-    const u32 p[5] = {stride, max_count, indexed ? 1u : 0u, is16 ? 1u : 0u, max_quads};
-    [enc setBytes:p length:sizeof(p) atIndex:4];
-    [enc dispatchThreads:MTLSizeMake(max_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    id<MTLComputePipelineState> pso = impl->quad_pipeline;
+    id<MTLBuffer> in_indices = indices ? indices : impl->dummy_buffer;
+    const u64 in_indices_offset = indices ? indices_offset : 0;
+    const u64 out_idx_offset = indexed ? out_indices_offset : 0;
+    const std::array<u32, 5> p = {stride, max_count, indexed ? 1u : 0u, is16 ? 1u : 0u, max_quads};
+    MetalScheduler::RecordCompute(scheduler, "quad_args", [=](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:args offset:args_offset atIndex:0];
+        [enc setBuffer:out_args offset:out_args_offset atIndex:1];
+        [enc setBuffer:in_indices offset:in_indices_offset atIndex:2];
+        [enc setBuffer:out_indices offset:out_idx_offset atIndex:3];
+        [enc setBytes:p.data() length:sizeof(p) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(max_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    });
 }
 
 namespace {
@@ -283,6 +355,51 @@ kernel void copy_bytes(const device uchar* src [[buffer(0)]], device uchar* dst 
 }
 )";
 } // namespace
+
+namespace FrameLog {
+u64 g_draws = 0;
+namespace {
+struct Cs {
+    u32 count = 0;
+    u64 groups = 0;
+    u32 indirect = 0;
+};
+std::map<u64, Cs> g_cs;
+u64 g_frame = 0;
+bool Enabled() {
+    static const bool on = std::getenv("TLG_METAL_FRAME_CS") != nullptr;
+    return on;
+}
+void NoteDispatch(u64 hash, u64 groups, bool indirect) {
+    auto& c = g_cs[hash];
+    ++c.count;
+    c.groups += groups;
+    c.indirect += indirect;
+}
+} // namespace
+void EndFrame(bool dumped) {
+    if (!Enabled()) {
+        return;
+    }
+    // "d": the dumped frames only.
+    static const bool dumped_only = std::getenv("TLG_METAL_FRAME_CS")[0] == 'd';
+    static const u64 first = std::strtoull(std::getenv("TLG_METAL_FRAME_CS"), nullptr, 0);
+    if (dumped_only ? dumped : (g_frame >= first && g_frame < first + 200)) {
+        std::string line;
+        for (const auto& [h, c] : g_cs) {
+            char b[64];
+            std::snprintf(b, sizeof(b), " %llx:%u/%llu%s", (unsigned long long)h, c.count,
+                          (unsigned long long)c.groups, c.indirect ? "i" : "");
+            line += b;
+        }
+        std::printf("frame %llu%s: %llu draws, cs%s\n", (unsigned long long)g_frame, dumped ? " DUMPED" : "",
+                    (unsigned long long)g_draws, line.c_str());
+    }
+    ++g_frame;
+    g_cs.clear();
+    g_draws = 0;
+}
+} // namespace FrameLog
 
 namespace NanScan {
 namespace {
@@ -356,12 +473,15 @@ void Scan(Scheduler& scheduler, id<MTLTexture> tex, const std::string& label) {
     }
     const u32 slot = u32(g.labels.size());
     g.labels.push_back(label);
-    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "nan_scan");
-    [enc setComputePipelineState:g.pso];
-    [enc setTexture:tex atIndex:0];
-    [enc setBuffer:g.counts offset:0 atIndex:0];
-    [enc setBytes:&slot length:sizeof(slot) atIndex:1];
-    [enc dispatchThreads:MTLSizeMake(tex.width, tex.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    id<MTLComputePipelineState> pso = g.pso;
+    id<MTLBuffer> counts = g.counts;
+    MetalScheduler::RecordCompute(scheduler, "nan_scan", [=](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:pso];
+        [enc setTexture:tex atIndex:0];
+        [enc setBuffer:counts offset:0 atIndex:0];
+        [enc setBytes:&slot length:sizeof(slot) atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(tex.width, tex.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    });
 }
 
 /// Scans the targets of the pass that just ended.
@@ -495,13 +615,15 @@ void Rasterizer::DrawState::CopyBytes(Scheduler& scheduler, id<MTLBuffer> src, u
             newComputePipelineStateWithFunction:[lib newFunctionWithName:@"copy_bytes"]
                                           error:&error];
     }
-    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "copy_bytes");
-    [enc setComputePipelineState:impl->copy_pipeline];
-    [enc setBuffer:src offset:src_offset atIndex:0];
-    [enc setBuffer:dst offset:dst_offset atIndex:1];
+    id<MTLComputePipelineState> pso = impl->copy_pipeline;
     const u32 n = u32(size);
-    [enc setBytes:&n length:sizeof(n) atIndex:2];
-    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    MetalScheduler::RecordCompute(scheduler, "copy_bytes", [=](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:src offset:src_offset atIndex:0];
+        [enc setBuffer:dst offset:dst_offset atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    });
 }
 
 void Rasterizer::DrawState::ClampIndirect(Scheduler& scheduler, id<MTLBuffer> src, u64 src_offset,
@@ -516,15 +638,17 @@ void Rasterizer::DrawState::ClampIndirect(Scheduler& scheduler, id<MTLBuffer> sr
             newComputePipelineStateWithFunction:[lib newFunctionWithName:@"clamp_args"]
                                           error:&error];
     }
-    id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "clamp_args");
-    [enc setComputePipelineState:impl->clamp_pipeline];
-    [enc setBuffer:src offset:src_offset atIndex:0];
-    [enc setBuffer:count offset:count_offset atIndex:1];
-    [enc setBuffer:dst offset:dst_offset atIndex:2];
-    const u32 p[2] = {stride, max_count};
-    [enc setBytes:p length:sizeof(p) atIndex:3];
+    id<MTLComputePipelineState> pso = impl->clamp_pipeline;
+    const std::array<u32, 2> p = {stride, max_count};
     const u32 n = stride / 4 * max_count;
-    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    MetalScheduler::RecordCompute(scheduler, "clamp_args", [=](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:src offset:src_offset atIndex:0];
+        [enc setBuffer:count offset:count_offset atIndex:1];
+        [enc setBuffer:dst offset:dst_offset atIndex:2];
+        [enc setBytes:p.data() length:sizeof(p) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    });
 }
 
 void Rasterizer::DrawState::OnSubmit() {
@@ -891,6 +1015,17 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
     static const bool debug_clear = DebugFlag("TLG_METAL_DEBUG_CLEAR");
     static const bool skip_calls = DebugFlag("TLG_METAL_SKIP_CALLS");
     ++draw_state->draws;
+    ++FrameLog::g_draws;
+    // Diagnosis: TLG_METAL_DRAW_DELAY_NS: busy-waits that long per draw (a slower command processor).
+    if (static const long delay_ns = [] {
+            const char* v = std::getenv("TLG_METAL_DRAW_DELAY_NS");
+            return v ? std::atol(v) : 0L;
+        }();
+        delay_ns > 0) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(delay_ns);
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
     scheduler.PopPendingOperations();
     const auto& regs = liverpool->regs;
     using Mode = AmdGpu::ColorControl::OperationMode;
@@ -1273,8 +1408,9 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         ResetBindings();
         return;
     }
-    id<MTLRenderCommandEncoder> enc = MetalScheduler::Render(scheduler);
-    const bool same_pass = enc && d.pass_open && !any_clear &&
+    // The open render encoder is this draw path's (key 1), as recorded.
+    const bool pass_is_open = scheduler.OpenKind() == Scheduler::Kind::Render && scheduler.RenderPassKey() == 1;
+    const bool same_pass = pass_is_open && d.pass_open && !any_clear &&
                            std::memcmp(pass.data(), d.pass.data(), sizeof(pass)) == 0;
     // tlg: commit at a pass boundary once enough draws were recorded, so the GPU starts on
     // them while the command processor records the rest of the frame (the game waits for each
@@ -1289,7 +1425,7 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         d.since_commit = 0;
     }
     ++d.since_commit;
-    if (!same_pass && enc && MetalScheduler::PassStatsEnabled()) {
+    if (!same_pass && pass_is_open && MetalScheduler::PassStatsEnabled()) {
         if (any_clear) {
             MetalScheduler::NoteRenderBreak(scheduler, "draw_clear");
         } else {
@@ -1389,12 +1525,14 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
                 id<MTLTexture> src = (__bridge_transfer id<MTLTexture>)p.src;
                 id<MTLTexture> snap = (__bridge id<MTLTexture>)p.snap;
                 scheduler.EndEncoding();
-                [MetalScheduler::Blit(scheduler) copyFromTexture:src sourceSlice:0 sourceLevel:0
-                                                     sourceOrigin:MTLOriginMake(0, 0, 0)
-                                                       sourceSize:MTLSizeMake(src.width, src.height, 1)
-                                                        toTexture:snap destinationSlice:0
-                                                 destinationLevel:0
-                                                destinationOrigin:MTLOriginMake(0, 0, 0)];
+                MetalScheduler::RecordBlit(scheduler, "snapshot", [src, snap](id<MTLBlitCommandEncoder> blit) {
+                    [blit copyFromTexture:src sourceSlice:0 sourceLevel:0
+                             sourceOrigin:MTLOriginMake(0, 0, 0)
+                               sourceSize:MTLSizeMake(src.width, src.height, 1)
+                                toTexture:snap destinationSlice:0
+                         destinationLevel:0
+                        destinationOrigin:MTLOriginMake(0, 0, 0)];
+                });
                 char label[96];
                 std::snprintf(label, sizeof(label), "pass%llu_cb%u_%u", (unsigned long long)p.draw, p.cb,
                               u32(src.pixelFormat));
@@ -1404,63 +1542,45 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             std::erase_if(snapshots_pending, [](const PendingSnap& p) { return p.src == nullptr; });
             scheduler.EndEncoding();
         }
-        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        for (u32 cb = 0; cb < colors.size(); ++cb) {
+        PassDesc pd{};
+        for (u32 cb = 0; cb < colors.size() && cb < pd.colors.size(); ++cb) {
             const auto& t = colors[cb];
             if (!t.texture) {
                 continue;
             }
-            auto* att = rp.colorAttachments[cb];
-            att.texture = t.texture;
-            att.level = t.level;
-            if (t.texture.textureType == MTLTextureType3D) {
-                att.depthPlane = t.slice;
-            } else {
-                att.slice = t.slice;
-            }
-            att.loadAction = (t.clear || debug_clear) ? MTLLoadActionClear : MTLLoadActionLoad;
+            auto& c = pd.colors[cb];
+            c.texture = (__bridge void*)t.texture;
+            c.level = t.level;
+            c.slice = t.slice;
+            c.is_3d = t.texture.textureType == MTLTextureType3D;
+            c.clear = t.clear || debug_clear;
             if (debug_clear) {
-                att.clearColor = MTLClearColorMake(1, 0, 1, 1);
+                c.clear_color[0] = 1, c.clear_color[1] = 0, c.clear_color[2] = 1, c.clear_color[3] = 1;
             } else if (t.clear) {
-                const auto& c = t.clear_value.color.float32;
-                att.clearColor = MTLClearColorMake(c[0], c[1], c[2], c[3]);
+                const auto& v = t.clear_value.color.float32;
+                c.clear_color[0] = v[0], c.clear_color[1] = v[1], c.clear_color[2] = v[2], c.clear_color[3] = v[3];
             }
-            att.storeAction = MTLStoreActionStore;
         }
         if (depth.texture) {
             const MTLPixelFormat pf = depth.texture.pixelFormat;
-            const bool has_stencil = pf == MTLPixelFormatDepth32Float_Stencil8 ||
-                                     pf == MTLPixelFormatStencil8;
-            if (pf != MTLPixelFormatStencil8) {
-                rp.depthAttachment.texture = depth.texture;
-                rp.depthAttachment.slice = depth.slice;
-                rp.depthAttachment.loadAction = depth_clear ? MTLLoadActionClear : MTLLoadActionLoad;
-                rp.depthAttachment.clearDepth = regs.depth_clear;
-                rp.depthAttachment.storeAction = MTLStoreActionStore;
-            }
-            if (has_stencil) {
-                rp.stencilAttachment.texture = depth.texture;
-                rp.stencilAttachment.slice = depth.slice;
-                rp.stencilAttachment.loadAction = stencil_clear ? MTLLoadActionClear : MTLLoadActionLoad;
-                rp.stencilAttachment.clearStencil = regs.stencil_clear;
-                rp.stencilAttachment.storeAction = MTLStoreActionStore;
-            }
+            pd.depth = (__bridge void*)depth.texture;
+            pd.depth_slice = depth.slice;
+            pd.has_depth = pf != MTLPixelFormatStencil8;
+            pd.has_stencil = pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatStencil8;
+            pd.depth_clear = depth_clear;
+            pd.stencil_clear = stencil_clear;
+            pd.clear_depth = regs.depth_clear;
+            pd.clear_stencil = regs.stencil_clear;
         }
         if (!depth.texture && std::none_of(colors.begin(), colors.end(),
                                            [](const Target& t) { return t.texture != nil; })) {
             // No attachments (pixel shader side effects only).
-            rp.renderTargetWidth = width == 16384 ? 1 : width;
-            rp.renderTargetHeight = height == 16384 ? 1 : height;
-            rp.defaultRasterSampleCount = std::max<u32>(key.num_samples, 1);
+            pd.no_attachments = true;
+            pd.width = width == 16384 ? 1 : width;
+            pd.height = height == 16384 ? 1 : height;
+            pd.samples = std::max<u32>(key.num_samples, 1);
         }
-        scheduler.EndEncoding();
-        enc = [MetalScheduler::CommandBuffer(scheduler) renderCommandEncoderWithDescriptor:rp];
-        if (!enc) {
-            ++draw_state->skipped_draws;
-            ResetBindings();
-            return;
-        }
-        scheduler.SetRenderEncoder((__bridge void*)enc, 1);
+        MetalScheduler::BeginRender(scheduler, 1, [pd] { return pd.Build(); });
         d.pass = pass;
         d.pass_open = true;
         d.pass_width = width == 16384 ? 1 : width;
@@ -1478,7 +1598,9 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
                       d.pass_height, colors[0].texture ? u32(colors[0].texture.pixelFormat) : 0,
                       depth.texture ? u32(depth.texture.pixelFormat) : 0, label_pass_draws,
                       (unsigned long long)label_pass_verts);
-        enc.label = [NSString stringWithUTF8String:label];
+        MetalScheduler::RecordRender(scheduler, [name = std::string(label)](id<MTLRenderCommandEncoder> enc) {
+            enc.label = [NSString stringWithUTF8String:name.c_str()];
+        });
     }
 
     // State (only what changed on this encoder: d.ec).
@@ -1487,23 +1609,30 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         return !v || v[0] != '0';
     }();
     auto& ec = d.ec;
-    if (!state_cache || ec.enc != (__bridge void*)enc || ec.count != scheduler.EncoderCount()) {
+    if (!state_cache || ec.count != scheduler.EncoderCount()) {
         ec = {};
-        ec.enc = (__bridge void*)enc;
         ec.count = scheduler.EncoderCount();
     }
     if (ec.pso != pipeline->pso) {
-        [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pipeline->pso];
+        void* const pso = pipeline->pso;
+        MetalScheduler::RecordRender(scheduler, [pso](id<MTLRenderCommandEncoder> enc) {
+            [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
+        });
         ec.pso = pipeline->pso;
     }
     const auto set_buffer = [&](int st, __unsafe_unretained id<MTLBuffer> buffer, u64 offset, u32 index) {
         if (index < 32 && ec.buf[st][index] == (__bridge void*)buffer && ec.off[st][index] == offset) {
             return;
         }
+        void* const raw = (__bridge void*)buffer;
         if (st == 0) {
-            [enc setVertexBuffer:buffer offset:offset atIndex:index];
+            MetalScheduler::RecordRender(scheduler, [raw, offset, index](id<MTLRenderCommandEncoder> enc) {
+                [enc setVertexBuffer:(__bridge id<MTLBuffer>)raw offset:offset atIndex:index];
+            });
         } else {
-            [enc setFragmentBuffer:buffer offset:offset atIndex:index];
+            MetalScheduler::RecordRender(scheduler, [raw, offset, index](id<MTLRenderCommandEncoder> enc) {
+                [enc setFragmentBuffer:(__bridge id<MTLBuffer>)raw offset:offset atIndex:index];
+            });
         }
         if (index < 32) {
             ec.buf[st][index] = (__bridge void*)buffer;
@@ -1522,38 +1651,54 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         }
         if (b.num_textures &&
             std::memcmp(ec.tex[st], b.textures.data(), sizeof(void*) * b.num_textures) != 0) {
-            if (vertex) {
-                [enc setVertexTextures:b.textures.data() withRange:NSMakeRange(0, b.num_textures)];
-            } else {
-                [enc setFragmentTextures:b.textures.data() withRange:NSMakeRange(0, b.num_textures)];
-            }
+            const u32 n = b.num_textures;
+            MetalScheduler::RecordRenderWith(scheduler, b.textures.data(), sizeof(void*) * n,
+                                             [vertex, n](id<MTLRenderCommandEncoder> enc, const void* copy) {
+                const auto* textures = static_cast<__unsafe_unretained id<MTLTexture> const*>(copy);
+                if (vertex) {
+                    [enc setVertexTextures:textures withRange:NSMakeRange(0, n)];
+                } else {
+                    [enc setFragmentTextures:textures withRange:NSMakeRange(0, n)];
+                }
+            });
             std::memcpy(ec.tex[st], b.textures.data(), sizeof(void*) * b.num_textures);
         }
         if (b.num_samplers &&
             std::memcmp(ec.smp[st], b.samplers.data(), sizeof(void*) * b.num_samplers) != 0) {
-            if (vertex) {
-                [enc setVertexSamplerStates:b.samplers.data() withRange:NSMakeRange(0, b.num_samplers)];
-            } else {
-                [enc setFragmentSamplerStates:b.samplers.data() withRange:NSMakeRange(0, b.num_samplers)];
-            }
+            const u32 n = b.num_samplers;
+            MetalScheduler::RecordRenderWith(scheduler, b.samplers.data(), sizeof(void*) * n,
+                                             [vertex, n](id<MTLRenderCommandEncoder> enc, const void* copy) {
+                const auto* samplers = static_cast<__unsafe_unretained id<MTLSamplerState> const*>(copy);
+                if (vertex) {
+                    [enc setVertexSamplerStates:samplers withRange:NSMakeRange(0, n)];
+                } else {
+                    [enc setFragmentSamplerStates:samplers withRange:NSMakeRange(0, n)];
+                }
+            });
             std::memcpy(ec.smp[st], b.samplers.data(), sizeof(void*) * b.num_samplers);
         }
         if (!ec.sizes_valid[st] || std::memcmp(ec.sizes[st], b.sizes.data(), sizeof(u32) * 32) != 0) {
-            if (vertex) {
-                [enc setVertexBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
-            } else {
-                [enc setFragmentBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
-            }
+            MetalScheduler::RecordRenderWith(scheduler, b.sizes.data(), sizeof(u32) * 32,
+                                             [vertex](id<MTLRenderCommandEncoder> enc, const void* copy) {
+                if (vertex) {
+                    [enc setVertexBytes:copy length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
+                } else {
+                    [enc setFragmentBytes:copy length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
+                }
+            });
             std::memcpy(ec.sizes[st], b.sizes.data(), sizeof(u32) * 32);
             ec.sizes_valid[st] = true;
             ec.buf[st][BufferSizesBufferIndex] = nullptr;
         }
         if (!ec.push_valid[st] || std::memcmp(&ec.push[st], &push_data, sizeof(push_data)) != 0) {
-            if (vertex) {
-                [enc setVertexBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
-            } else {
-                [enc setFragmentBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
-            }
+            MetalScheduler::RecordRenderWith(scheduler, &push_data, sizeof(push_data),
+                                             [vertex](id<MTLRenderCommandEncoder> enc, const void* copy) {
+                if (vertex) {
+                    [enc setVertexBytes:copy length:sizeof(Shader::PushData) atIndex:PushDataBufferIndex];
+                } else {
+                    [enc setFragmentBytes:copy length:sizeof(Shader::PushData) atIndex:PushDataBufferIndex];
+                }
+            });
             std::memcpy(&ec.push[st], &push_data, sizeof(push_data));
             ec.push_valid[st] = true;
             ec.buf[st][PushDataBufferIndex] = nullptr;
@@ -1606,7 +1751,9 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             viewport.height = -vh;
         }
         if (!ec.viewport_valid || std::memcmp(&ec.viewport, &viewport, sizeof(viewport)) != 0) {
-            [enc setViewport:viewport];
+            MetalScheduler::RecordRender(scheduler, [viewport](id<MTLRenderCommandEncoder> enc) {
+                [enc setViewport:viewport];
+            });
             ec.viewport = viewport;
             ec.viewport_valid = true;
         }
@@ -1659,7 +1806,9 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         const MTLScissorRect scissor{NSUInteger(x0), NSUInteger(y0), NSUInteger(x1 - x0),
                                      NSUInteger(y1 - y0)};
         if (!ec.scissor_valid || std::memcmp(&ec.scissor, &scissor, sizeof(scissor)) != 0) {
-            [enc setScissorRect:scissor];
+            MetalScheduler::RecordRender(scheduler, [scissor](id<MTLRenderCommandEncoder> enc) {
+                [enc setScissorRect:scissor];
+            });
             ec.scissor = scissor;
             ec.scissor_valid = true;
         }
@@ -1678,7 +1827,9 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
                                   : cull == vk::CullModeFlagBits::eBack ? MTLCullModeBack
                                                                          : MTLCullModeNone;
     if (ec.cull != int(cull_mode)) {
-        [enc setCullMode:cull_mode];
+        MetalScheduler::RecordRender(scheduler, [cull_mode](id<MTLRenderCommandEncoder> enc) {
+            [enc setCullMode:cull_mode];
+        });
         ec.cull = int(cull_mode);
     }
     // Window positions match Vulkan's (viewport above), so does the winding.
@@ -1687,21 +1838,27 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
                                    ? MTLWindingClockwise
                                    : MTLWindingCounterClockwise;
     if (ec.winding != int(winding)) {
-        [enc setFrontFacingWinding:winding];
+        MetalScheduler::RecordRender(scheduler, [winding](id<MTLRenderCommandEncoder> enc) {
+            [enc setFrontFacingWinding:winding];
+        });
         ec.winding = int(winding);
     }
     const MTLTriangleFillMode fill = regs.polygon_control.PolyMode() == AmdGpu::PolygonMode::Fill
                                          ? MTLTriangleFillModeFill
                                          : MTLTriangleFillModeLines;
     if (ec.fill != int(fill)) {
-        [enc setTriangleFillMode:fill];
+        MetalScheduler::RecordRender(scheduler, [fill](id<MTLRenderCommandEncoder> enc) {
+            [enc setTriangleFillMode:fill];
+        });
         ec.fill = int(fill);
     }
     const bool clamp = !regs.depth_render_override.disable_viewport_clamp;
     const MTLDepthClipMode clip = (!regs.clipper_control.ZclipEnable() && clamp) ? MTLDepthClipModeClamp
                                                                                  : MTLDepthClipModeClip;
     if (ec.clip != int(clip)) {
-        [enc setDepthClipMode:clip];
+        MetalScheduler::RecordRender(scheduler, [clip](id<MTLRenderCommandEncoder> enc) {
+            [enc setDepthClipMode:clip];
+        });
         ec.clip = int(clip);
     }
     float bias[3] = {0, 0, 0};
@@ -1714,14 +1871,20 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         bias[2] = regs.poly_offset.depth_bias;
     }
     if (!ec.bias_valid || std::memcmp(ec.bias, bias, sizeof(bias)) != 0) {
-        [enc setDepthBias:bias[0] slopeScale:bias[1] clamp:bias[2]];
+        const std::array<float, 3> bv = {bias[0], bias[1], bias[2]};
+        MetalScheduler::RecordRender(scheduler, [bv](id<MTLRenderCommandEncoder> enc) {
+            [enc setDepthBias:bv[0] slopeScale:bv[1] clamp:bv[2]];
+        });
         std::memcpy(ec.bias, bias, sizeof(bias));
         ec.bias_valid = true;
     }
     const float blend[4] = {regs.blend_constants[0], regs.blend_constants[1],
                             regs.blend_constants[2], regs.blend_constants[3]};
     if (!ec.blend_valid || std::memcmp(ec.blend, blend, sizeof(blend)) != 0) {
-        [enc setBlendColorRed:blend[0] green:blend[1] blue:blend[2] alpha:blend[3]];
+        const std::array<float, 4> bc = {blend[0], blend[1], blend[2], blend[3]};
+        MetalScheduler::RecordRender(scheduler, [bc](id<MTLRenderCommandEncoder> enc) {
+            [enc setBlendColorRed:bc[0] green:bc[1] blue:bc[2] alpha:bc[3]];
+        });
         std::memcpy(ec.blend, blend, sizeof(blend));
         ec.blend_valid = true;
     }
@@ -1814,11 +1977,17 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             ds = [Metal::Device() newDepthStencilStateWithDescriptor:dd];
         }
         if (ec.ds != (__bridge void*)ds) {
-            [enc setDepthStencilState:ds];
+            void* const raw = (__bridge void*)ds;
+            MetalScheduler::RecordRender(scheduler, [raw](id<MTLRenderCommandEncoder> enc) {
+                [enc setDepthStencilState:(__bridge id<MTLDepthStencilState>)raw];
+            });
             ec.ds = (__bridge void*)ds;
         }
         if (stencil && (!ec.sref_valid || ec.sref[0] != ff.reference || ec.sref[1] != bf.reference)) {
-            [enc setStencilFrontReferenceValue:ff.reference backReferenceValue:bf.reference];
+            const u32 fr = ff.reference, br = bf.reference;
+            MetalScheduler::RecordRender(scheduler, [fr, br](id<MTLRenderCommandEncoder> enc) {
+                [enc setStencilFrontReferenceValue:fr backReferenceValue:br];
+            });
             ec.sref[0] = ff.reference;
             ec.sref[1] = bf.reference;
             ec.sref_valid = true;
@@ -1937,36 +2106,52 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             instance_offset = vs_info->UserData()[fs.instance_offset_sgpr];
         }
     }
+    void* const index_raw = (__bridge void*)index_buffer;
+    const u64 ib_offset = index_buffer_offset;
+    const MTLIndexType itype = index_type;
+    const MTLPrimitiveType prim = primitive;
     if (indirect && !skip_calls) {
-        for (u32 i = 0; i < indirect->max_count; ++i) {
-            const u64 at = args_offset + u64(i) * (quad_indirect ? 20 : indirect->stride);
-            if (is_indexed || quad_indirect) {
-                [enc drawIndexedPrimitives:primitive
-                                 indexType:index_type
-                               indexBuffer:index_buffer
-                         indexBufferOffset:index_buffer_offset
-                            indirectBuffer:args_buffer
-                      indirectBufferOffset:at];
-            } else {
-                [enc drawPrimitives:primitive indirectBuffer:args_buffer indirectBufferOffset:at];
+        void* const args_raw = (__bridge void*)args_buffer;
+        const u64 step = quad_indirect ? 20 : indirect->stride;
+        const u32 count = indirect->max_count;
+        const bool indexed_args = is_indexed || quad_indirect;
+        const u64 first = args_offset;
+        MetalScheduler::RecordRender(scheduler, [=](id<MTLRenderCommandEncoder> enc) {
+            id<MTLBuffer> args = (__bridge id<MTLBuffer>)args_raw;
+            for (u32 i = 0; i < count; ++i) {
+                const u64 at = first + u64(i) * step;
+                if (indexed_args) {
+                    [enc drawIndexedPrimitives:prim
+                                     indexType:itype
+                                   indexBuffer:(__bridge id<MTLBuffer>)index_raw
+                             indexBufferOffset:ib_offset
+                                indirectBuffer:args
+                          indirectBufferOffset:at];
+                } else {
+                    [enc drawPrimitives:prim indirectBuffer:args indirectBufferOffset:at];
+                }
             }
-        }
+        });
     } else if (num_indices && !skip_calls) {
         if (draw_indexed) {
-            [enc drawIndexedPrimitives:primitive
-                            indexCount:num_indices
-                             indexType:index_type
-                           indexBuffer:index_buffer
-                     indexBufferOffset:index_buffer_offset
-                         instanceCount:num_instances
-                            baseVertex:s32(vertex_offset)
-                          baseInstance:instance_offset];
+            MetalScheduler::RecordRender(scheduler, [=](id<MTLRenderCommandEncoder> enc) {
+                [enc drawIndexedPrimitives:prim
+                                indexCount:num_indices
+                                 indexType:itype
+                               indexBuffer:(__bridge id<MTLBuffer>)index_raw
+                         indexBufferOffset:ib_offset
+                             instanceCount:num_instances
+                                baseVertex:s32(vertex_offset)
+                              baseInstance:instance_offset];
+            });
         } else {
-            [enc drawPrimitives:primitive
-                    vertexStart:vertex_offset
-                    vertexCount:num_indices
-                  instanceCount:num_instances
-                   baseInstance:instance_offset];
+            MetalScheduler::RecordRender(scheduler, [=](id<MTLRenderCommandEncoder> enc) {
+                [enc drawPrimitives:prim
+                        vertexStart:vertex_offset
+                        vertexCount:num_indices
+                      instanceCount:num_instances
+                       baseInstance:instance_offset];
+            });
         }
     }
     if (writes_memory) {
@@ -1979,9 +2164,11 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
             return !(env && env[0] == '0');
         }();
         if (draw_barrier) {
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers
-                            afterStages:MTLRenderStageVertex | MTLRenderStageFragment
-                           beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+            MetalScheduler::RecordRender(scheduler, [](id<MTLRenderCommandEncoder> enc) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers
+                                afterStages:MTLRenderStageVertex | MTLRenderStageFragment
+                               beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+            });
             ++draw_state->draw_barriers;
         }
     }
@@ -2019,31 +2206,143 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
                       (unsigned long long)pipeline->hash, cs.dim_x, cs.dim_y, cs.dim_z,
                       indirect_args ? " indirect" : "");
     }
-    id<MTLComputeCommandEncoder> enc =
-        MetalScheduler::ComputeGuest(scheduler, label[0] ? label : "dispatch", std::exchange(dispatch_barrier, true));
     draw_state->impl->pass_open = false;
-    [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)pipeline->pso];
-    for (u32 i = 0; i < b.num_buffers; ++i) {
-        [enc setBuffer:b.buffers[i] offset:b.offsets[i] atIndex:i];
-    }
-    if (b.num_textures) {
-        [enc setTextures:b.textures.data() withRange:NSMakeRange(0, b.num_textures)];
-    }
-    if (b.num_samplers) {
-        [enc setSamplerStates:b.samplers.data() withRange:NSMakeRange(0, b.num_samplers)];
-    }
-    [enc setBytes:b.sizes.data() length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
-    [enc setBytes:&push_data length:sizeof(push_data) atIndex:PushDataBufferIndex];
     const auto& wg = pipeline->workgroup_size;
     const MTLSize threads = MTLSizeMake(std::max(wg[0], 1u), std::max(wg[1], 1u), std::max(wg[2], 1u));
+    void* indirect_raw = nullptr;
+    u64 indirect_offset = 0;
     if (indirect_args) {
         const auto [buffer, offset] = buffer_cache.ObtainBuffer(indirect_args, 12, false);
-        [enc dispatchThreadgroupsWithIndirectBuffer:Metal::Buffer(buffer->Handle())
-                               indirectBufferOffset:offset
-                              threadsPerThreadgroup:threads];
-    } else {
-        [enc dispatchThreadgroups:MTLSizeMake(cs.dim_x, cs.dim_y, cs.dim_z) threadsPerThreadgroup:threads];
+        indirect_raw = Metal::Raw(buffer->Handle());
+        indirect_offset = offset;
     }
+    // Diagnosis: TLG_METAL_LOG_CS=<hex>[,...]: those compute shaders' dispatches (the first 40,
+    // then one a second): grid, workgroup size and the first dwords of each buffer as recorded.
+    if (static const char* log_cs = std::getenv("TLG_METAL_LOG_CS"); log_cs) {
+        char want[24];
+        std::snprintf(want, sizeof(want), "%llx", (unsigned long long)pipeline->hash);
+        static u32 logged = 0;
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (std::strstr(log_cs, want) && (logged < 40 || now - last > std::chrono::seconds(1))) {
+            ++logged;
+            last = now;
+            std::string line;
+            for (u32 i = 0; i < b.num_buffers && i < 6; ++i) {
+                const u8* base = static_cast<const u8*>(b.buffers[i].contents);
+                char t[96];
+                if (base && b.sizes[i] >= 8) {
+                    const u32* w = reinterpret_cast<const u32*>(base + b.offsets[i]);
+                    std::snprintf(t, sizeof(t), " b%u[%u]=%u,%u", i, b.sizes[i], w[0], w[1]);
+                } else {
+                    std::snprintf(t, sizeof(t), " b%u[%u]", i, b.sizes[i]);
+                }
+                line += t;
+            }
+            std::printf("cs %s: grid %ux%ux%u%s wg %ux%ux%u%s\n", want, cs.dim_x, cs.dim_y, cs.dim_z,
+                        indirect_args ? " (indirect)" : "", pipeline->workgroup_size[0],
+                        pipeline->workgroup_size[1], pipeline->workgroup_size[2], line.c_str());
+        }
+    }
+    // Diagnosis: TLG_METAL_CHECK_SORT=1: after each dispatch of inFAMOUS's merge sort (a16fa93a),
+    // once the GPU has run it, whether its output (key, value pairs) is sorted.
+    if (static const bool check_sort = std::getenv("TLG_METAL_CHECK_SORT") != nullptr;
+        check_sort && pipeline->hash == 0xa16fa93aull && b.num_buffers >= 6) {
+        const auto ptr = [&](u32 i) { return static_cast<const u8*>(b.buffers[i].contents) + b.offsets[i]; };
+        const u8* count_p = ptr(0);
+        const u8* widths = ptr(2);
+        const u8* a = ptr(3);
+        const u8* bb = ptr(4);
+        const u32* flat = reinterpret_cast<const u32*>(ptr(5));
+        const u32 stride_a = (flat[1] >> 16) & 0x3FFF, stride_b = (flat[5] >> 16) & 0x3FFF;
+        const u32 grid = cs.dim_x;
+        scheduler.SignalOnCompletion([=] {
+            const u32 count = *reinterpret_cast<const u32*>(count_p);
+            const u32 w = reinterpret_cast<const u32*>(widths)[0], maxw = reinterpret_cast<const u32*>(widths)[1];
+            // The last phase: A -> B for w, then B -> A for 2w, ... up to maxw.
+            u32 phases = 0;
+            for (u64 x = w; x <= maxw && phases < 64; x *= 2) {
+                ++phases;
+            }
+            const bool in_b = phases % 2 == 1;
+            const u8* out = in_b ? bb : a;
+            const u32 stride = in_b ? stride_b : stride_a;
+            const u64 block = std::min<u64>(u64(maxw), count); // sorted runs of maxw elements
+            u32 bad = 0, asc = 0, desc = 0;
+            for (u32 i = 1; i < count && stride >= 4; ++i) {
+                if (block && i % block == 0) {
+                    continue;
+                }
+                const float k0 = *reinterpret_cast<const float*>(out + u64(i - 1) * stride);
+                const float k1 = *reinterpret_cast<const float*>(out + u64(i) * stride);
+                asc += k1 >= k0;
+                desc += k1 <= k0;
+            }
+            bad = std::min(count > 1 ? count - 1 - asc : 0u, count > 1 ? count - 1 - desc : 0u);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1) < 200) {
+                std::printf("sort check: grid %u count %u w %u..%u phases %u out %c stride %u: %u ascending, %u descending pairs, %u out of order\n",
+                            grid, count, w, maxw, phases, in_b ? 'B' : 'A', stride, asc, desc, bad);
+            }
+        });
+    }
+    if (FrameLog::Enabled()) {
+        FrameLog::NoteDispatch(pipeline->hash, u64(cs.dim_x) * cs.dim_y * cs.dim_z, indirect_args != 0);
+    }
+    // The bindings travel as one block: buffers, offsets, textures, samplers, sizes, push data.
+    const u32 nb = b.num_buffers, nt = b.num_textures, ns = b.num_samplers;
+    alignas(16) u8 block[sizeof(void*) * 32 + 8 * 32 + sizeof(void*) * 128 + sizeof(void*) * 16 +
+                         4 * 32 + sizeof(Shader::PushData)];
+    size_t at = 0;
+    const auto put = [&](const void* src, size_t n) {
+        std::memcpy(block + at, src, n);
+        at += n;
+    };
+    put(b.buffers.data(), sizeof(void*) * nb);
+    put(b.offsets.data(), 8 * nb);
+    put(b.textures.data(), sizeof(void*) * nt);
+    put(b.samplers.data(), sizeof(void*) * ns);
+    put(b.sizes.data(), 4 * 32);
+    put(&push_data, sizeof(push_data));
+    const MTLSize groups = MTLSizeMake(cs.dim_x, cs.dim_y, cs.dim_z);
+    void* const pso = pipeline->pso;
+    MetalScheduler::detail::UseCompute(scheduler, label[0] ? label : "dispatch");
+    Scheduler::Impl* const si = scheduler.impl_();
+    const bool barrier = std::exchange(dispatch_barrier, true);
+    si->RecordWith(block, at, [si, barrier, nb, nt, ns, threads, groups, pso, indirect_raw, indirect_offset,
+                               name = MetalScheduler::LabelMode() ? std::string(label) : std::string()](const void* copy) {
+        id<MTLComputeCommandEncoder> enc = MetalScheduler::detail::ComputeFor(*si, name);
+        MetalScheduler::BeforeGuestDispatch(*si, enc, barrier);
+        const u8* p = static_cast<const u8*>(copy);
+        const auto* buffers = reinterpret_cast<__unsafe_unretained id<MTLBuffer> const*>(p);
+        p += sizeof(void*) * nb;
+        const auto* offsets = reinterpret_cast<const u64*>(p);
+        p += 8 * nb;
+        const auto* textures = reinterpret_cast<__unsafe_unretained id<MTLTexture> const*>(p);
+        p += sizeof(void*) * nt;
+        const auto* samplers = reinterpret_cast<__unsafe_unretained id<MTLSamplerState> const*>(p);
+        p += sizeof(void*) * ns;
+        [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)pso];
+        if (nb) {
+            [enc setBuffers:buffers offsets:reinterpret_cast<const NSUInteger*>(offsets) withRange:NSMakeRange(0, nb)];
+        }
+        if (nt) {
+            [enc setTextures:textures withRange:NSMakeRange(0, nt)];
+        }
+        if (ns) {
+            [enc setSamplerStates:samplers withRange:NSMakeRange(0, ns)];
+        }
+        [enc setBytes:p length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
+        p += 4 * 32;
+        [enc setBytes:p length:sizeof(Shader::PushData) atIndex:PushDataBufferIndex];
+        if (indirect_raw) {
+            [enc dispatchThreadgroupsWithIndirectBuffer:(__bridge id<MTLBuffer>)indirect_raw
+                                   indirectBufferOffset:indirect_offset
+                                  threadsPerThreadgroup:threads];
+        } else {
+            [enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        }
+    });
     if (b.writes_memory) {
         MetalScheduler::NoteUntrackedWrite(scheduler);
         NoteGuestWrite();

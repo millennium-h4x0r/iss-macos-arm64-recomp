@@ -132,12 +132,16 @@ void Dispatch(Vulkan::Scheduler& scheduler, id<MTLComputePipelineState> pso,
     if (Vulkan::MetalScheduler::LabelMode()) {
         std::snprintf(label, sizeof(label), "tile %u groups", dim_x);
     }
-    id<MTLComputeCommandEncoder> enc = Vulkan::MetalScheduler::Compute(scheduler, label);
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:Metal::Buffer(tiled->Handle()) offset:tiled_offset atIndex:0];
-    [enc setBuffer:Metal::Buffer(linear->Handle()) offset:linear_offset atIndex:1];
-    [enc setBytes:&params length:sizeof(params) atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(dim_x, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    id<MTLBuffer> tiled_buffer = Metal::Buffer(tiled->Handle());
+    id<MTLBuffer> linear_buffer = Metal::Buffer(linear->Handle());
+    Vulkan::MetalScheduler::RecordCompute(scheduler, label[0] ? label : "tile",
+                                          [=](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:tiled_buffer offset:tiled_offset atIndex:0];
+        [enc setBuffer:linear_buffer offset:linear_offset atIndex:1];
+        [enc setBytes:&params length:sizeof(params) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(dim_x, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    });
 }
 
 } // namespace

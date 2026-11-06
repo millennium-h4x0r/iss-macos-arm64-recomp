@@ -104,13 +104,14 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
     }
     id<MTLBuffer> s = Metal::Buffer(src->Handle());
     id<MTLBuffer> d = Metal::Buffer(dst->Handle());
-    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler, "CopyBuffer");
     for (const auto& c : copies) {
         if (c.size == 0) {
             continue;
         }
-        [blit copyFromBuffer:s sourceOffset:c.srcOffset toBuffer:d destinationOffset:c.dstOffset
-                        size:c.size];
+        const u64 so = c.srcOffset, dof = c.dstOffset, size = c.size;
+        MetalScheduler::RecordBlit(scheduler, "CopyBuffer", [s, d, so, dof, size](id<MTLBlitCommandEncoder> blit) {
+            [blit copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:dof size:size];
+        });
     }
     if (IsUntracked(d)) {
         MetalScheduler::NoteUntrackedWrite(scheduler);
@@ -124,16 +125,19 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
     id<MTLBuffer> d = Metal::Buffer(dst->Handle());
     const u8 b = value & 0xff;
     if (value == u32(b) * 0x01010101u) {
-        [MetalScheduler::Blit(scheduler, "FillBuffer") fillBuffer:d range:NSMakeRange(offset, size) value:b];
+        MetalScheduler::RecordBlit(scheduler, "FillBuffer", [d, offset, size, b](id<MTLBlitCommandEncoder> blit) {
+            [blit fillBuffer:d range:NSMakeRange(offset, size) value:b];
+        });
     } else {
         ASSERT_MSG(offset % 4 == 0 && size % 4 == 0, "unaligned u32 fill");
-        id<MTLComputeCommandEncoder> enc = MetalScheduler::Compute(scheduler, "fill");
-        [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)fill_pipeline];
-        [enc setBuffer:d offset:offset atIndex:0];
-        const u32 params[2] = {value, u32(size / 4)};
-        [enc setBytes:params length:sizeof(params) atIndex:1];
-        [enc dispatchThreads:MTLSizeMake(size / 4, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        void* const pso = fill_pipeline;
+        MetalScheduler::RecordCompute(scheduler, "fill", [d, offset, size, value, pso](id<MTLComputeCommandEncoder> enc) {
+            [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)pso];
+            [enc setBuffer:d offset:offset atIndex:0];
+            const u32 params[2] = {value, u32(size / 4)};
+            [enc setBytes:params length:sizeof(params) atIndex:1];
+            [enc dispatchThreads:MTLSizeMake(size / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        });
     }
     if (IsUntracked(d)) {
         MetalScheduler::NoteUntrackedWrite(scheduler);
@@ -173,7 +177,6 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     }
     const FormatInfo& f = Metal::GetFormat(dst->info.pixel_format);
     id<MTLBuffer> buffer = Metal::Buffer(src->Handle());
-    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler, "UploadImage");
     const bool is_3d = texture.textureType == MTLTextureType3D;
     for (const auto& c : upload_copies) {
         const auto [bytes, option] = AspectBytes(f, c.imageSubresource.aspectMask);
@@ -200,16 +203,21 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                 !is_3d) {
                 break;
             }
-            [blit copyFromBuffer:buffer
-                       sourceOffset:c.bufferOffset + layer * bpi
-                  sourceBytesPerRow:bpr
-                sourceBytesPerImage:bpi
-                         sourceSize:size
-                          toTexture:texture
-                   destinationSlice:is_3d ? 0 : slice
-                   destinationLevel:level
-                  destinationOrigin:origin
-                            options:option];
+            const u64 src_offset = c.bufferOffset + layer * bpi;
+            const u32 dst_slice = is_3d ? 0 : slice;
+            const MTLBlitOption opt = option;
+            MetalScheduler::RecordBlit(scheduler, "UploadImage", [=](id<MTLBlitCommandEncoder> blit) {
+                [blit copyFromBuffer:buffer
+                           sourceOffset:src_offset
+                      sourceBytesPerRow:bpr
+                    sourceBytesPerImage:bpi
+                             sourceSize:size
+                              toTexture:texture
+                       destinationSlice:dst_slice
+                       destinationLevel:level
+                      destinationOrigin:origin
+                                options:opt];
+            });
         }
     }
 }
@@ -224,7 +232,6 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     texture = Metal::Texture(src->GetImage());
     const FormatInfo& f = Metal::GetFormat(src->info.pixel_format);
     id<MTLBuffer> buffer = Metal::Buffer(dst->Handle());
-    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler, "DownloadImage");
     const bool is_3d = texture.textureType == MTLTextureType3D;
     for (const auto& c : download_copies) {
         const auto [bytes, option] = AspectBytes(f, c.imageSubresource.aspectMask);
@@ -250,16 +257,21 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
             if (!is_3d && slice >= texture.arrayLength) {
                 break;
             }
-            [blit copyFromTexture:texture
-                             sourceSlice:is_3d ? 0 : slice
-                             sourceLevel:level
-                            sourceOrigin:origin
-                              sourceSize:size
-                                toBuffer:buffer
-                       destinationOffset:c.bufferOffset + layer * bpi
-                  destinationBytesPerRow:bpr
-                destinationBytesPerImage:bpi
-                                 options:option];
+            const u64 dst_offset = c.bufferOffset + layer * bpi;
+            const u32 src_slice = is_3d ? 0 : slice;
+            const MTLBlitOption opt = option;
+            MetalScheduler::RecordBlit(scheduler, "DownloadImage", [=](id<MTLBlitCommandEncoder> blit) {
+                [blit copyFromTexture:texture
+                                 sourceSlice:src_slice
+                                 sourceLevel:level
+                                sourceOrigin:origin
+                                  sourceSize:size
+                                    toBuffer:buffer
+                           destinationOffset:dst_offset
+                      destinationBytesPerRow:bpr
+                    destinationBytesPerImage:bpi
+                                     options:opt];
+            });
         }
     }
     if (IsUntracked(buffer)) {
@@ -300,7 +312,6 @@ void Runtime::CopyRegion(VideoCore::Image* src, VideoCore::Image* dst, const vk:
         LogOnce("image copy between incompatible formats skipped");
         return;
     }
-    id<MTLBlitCommandEncoder> blit = MetalScheduler::Blit(scheduler, "CopyRegion");
     for (u32 layer = 0; layer < layers; ++layer) {
         const u32 src_slice = s3d ? 0 : r.srcSubresource.baseArrayLayer + layer;
         const u32 dst_slice = d3d ? 0 : r.dstSubresource.baseArrayLayer + layer;
@@ -318,15 +329,17 @@ void Runtime::CopyRegion(VideoCore::Image* src, VideoCore::Image* dst, const vk:
             continue;
         }
         if (direct) {
-            [blit copyFromTexture:s
-                      sourceSlice:src_slice
-                      sourceLevel:src_level
-                     sourceOrigin:so
-                       sourceSize:size
-                        toTexture:d
-                 destinationSlice:dst_slice
-                 destinationLevel:dst_level
-                destinationOrigin:dor];
+            MetalScheduler::RecordBlit(scheduler, "CopyRegion", [=](id<MTLBlitCommandEncoder> blit) {
+                [blit copyFromTexture:s
+                          sourceSlice:src_slice
+                          sourceLevel:src_level
+                         sourceOrigin:so
+                           sourceSize:size
+                            toTexture:d
+                     destinationSlice:dst_slice
+                     destinationLevel:dst_level
+                    destinationOrigin:dor];
+            });
             continue;
         }
         // Same block size, different format: through a staging buffer.
@@ -334,24 +347,27 @@ void Runtime::CopyRegion(VideoCore::Image* src, VideoCore::Image* dst, const vk:
         const u64 bpi = bpr * Metal::BlockRows(sf, size.height);
         const auto staging = staging_pool.Request(bpi * size.depth, VideoCore::MemoryType::DeviceLocal, 256);
         id<MTLBuffer> buf = Metal::Buffer(staging.buffer->Handle());
-        [blit copyFromTexture:s
-                         sourceSlice:src_slice
-                         sourceLevel:src_level
-                        sourceOrigin:so
-                          sourceSize:size
-                            toBuffer:buf
-                   destinationOffset:staging.offset
-              destinationBytesPerRow:bpr
-            destinationBytesPerImage:bpi];
-        [blit copyFromBuffer:buf
-                   sourceOffset:staging.offset
-              sourceBytesPerRow:bpr
-            sourceBytesPerImage:bpi
-                     sourceSize:size
-                      toTexture:d
-               destinationSlice:dst_slice
-               destinationLevel:dst_level
-              destinationOrigin:dor];
+        const u64 staging_offset = staging.offset;
+        MetalScheduler::RecordBlit(scheduler, "CopyRegion", [=](id<MTLBlitCommandEncoder> blit) {
+            [blit copyFromTexture:s
+                             sourceSlice:src_slice
+                             sourceLevel:src_level
+                            sourceOrigin:so
+                              sourceSize:size
+                                toBuffer:buf
+                       destinationOffset:staging_offset
+                  destinationBytesPerRow:bpr
+                destinationBytesPerImage:bpi];
+            [blit copyFromBuffer:buf
+                       sourceOffset:staging_offset
+                  sourceBytesPerRow:bpr
+                sourceBytesPerImage:bpi
+                         sourceSize:size
+                          toTexture:d
+                   destinationSlice:dst_slice
+                   destinationLevel:dst_level
+                  destinationOrigin:dor];
+        });
     }
 }
 
@@ -460,18 +476,19 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
     if (MetalScheduler::PassStatsEnabled()) {
         MetalScheduler::NoteRenderBreak(scheduler, "ResolveImage");
     }
-    scheduler.EndEncoding();
-    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass.colorAttachments[0].texture = s;
-    pass.colorAttachments[0].slice = src_range.base.layer;
-    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
-    pass.colorAttachments[0].resolveTexture = d;
-    pass.colorAttachments[0].resolveLevel = dst_range.base.level;
-    pass.colorAttachments[0].resolveSlice = dst_range.base.layer;
-    id<MTLRenderCommandEncoder> enc =
-        [MetalScheduler::CommandBuffer(scheduler) renderCommandEncoderWithDescriptor:pass];
-    scheduler.SetRenderEncoder((__bridge void*)enc, ~0ull);
+    const u32 src_layer = src_range.base.layer, dst_level = dst_range.base.level,
+              dst_layer = dst_range.base.layer;
+    MetalScheduler::BeginRender(scheduler, ~0ull, [=] {
+        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = s;
+        pass.colorAttachments[0].slice = src_layer;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+        pass.colorAttachments[0].resolveTexture = d;
+        pass.colorAttachments[0].resolveLevel = dst_level;
+        pass.colorAttachments[0].resolveSlice = dst_layer;
+        return pass;
+    });
     scheduler.EndEncoding();
 }
 
@@ -498,23 +515,26 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         const u32 slices = is_3d ? std::max<u32>(d.depth >> level, 1) : range.extent.layers;
         for (u32 i = 0; i < slices; ++i) {
             const u32 slice = is_3d ? i : range.base.layer + i;
+            const bool fdepth = f.depth, fstencil = f.stencil;
+            const vk::ClearValue cv = clear_value;
+            MetalScheduler::BeginRender(scheduler, ~0ull, [=] {
             MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-            if (f.depth || f.stencil) {
-                if (f.depth) {
+            if (fdepth || fstencil) {
+                if (fdepth) {
                     pass.depthAttachment.texture = d;
                     pass.depthAttachment.level = level;
                     pass.depthAttachment.slice = is_3d ? 0 : slice;
                     pass.depthAttachment.loadAction = MTLLoadActionClear;
                     pass.depthAttachment.storeAction = MTLStoreActionStore;
-                    pass.depthAttachment.clearDepth = clear_value.depthStencil.depth;
+                    pass.depthAttachment.clearDepth = cv.depthStencil.depth;
                 }
-                if (f.stencil) {
+                if (fstencil) {
                     pass.stencilAttachment.texture = d;
                     pass.stencilAttachment.level = level;
                     pass.stencilAttachment.slice = is_3d ? 0 : slice;
                     pass.stencilAttachment.loadAction = MTLLoadActionClear;
                     pass.stencilAttachment.storeAction = MTLStoreActionStore;
-                    pass.stencilAttachment.clearStencil = clear_value.depthStencil.stencil;
+                    pass.stencilAttachment.clearStencil = cv.depthStencil.stencil;
                 }
             } else {
                 auto* att = pass.colorAttachments[0];
@@ -527,12 +547,11 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
                 }
                 att.loadAction = MTLLoadActionClear;
                 att.storeAction = MTLStoreActionStore;
-                const auto& c = clear_value.color.float32;
+                const auto& c = cv.color.float32;
                 att.clearColor = MTLClearColorMake(c[0], c[1], c[2], c[3]);
             }
-            id<MTLRenderCommandEncoder> enc =
-                [MetalScheduler::CommandBuffer(scheduler) renderCommandEncoderWithDescriptor:pass];
-            scheduler.SetRenderEncoder((__bridge void*)enc, ~0ull);
+            return pass;
+            });
             scheduler.EndEncoding();
         }
     }

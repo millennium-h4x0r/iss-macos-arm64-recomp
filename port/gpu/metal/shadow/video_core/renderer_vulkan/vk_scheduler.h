@@ -2,6 +2,13 @@
 // tlg Metal renderer: command submission. A tick is one MTLCommandBuffer: CurrentTick() is the
 // one being recorded, Flush() commits it, IsFree/Wait follow its completion. At most one encoder
 // is open at a time (render, compute or blit).
+//
+// Encoder thread (the draw scheduler; TLG_METAL_ENCODER_THREAD=0: off): the recording thread
+// (the GPU command processor) records closures holding the Metal calls (mtl_scheduler_internal.h:
+// Record, RecordRender, RecordCompute, RecordBlit, BeginRender); a thread of the scheduler runs
+// them in order and owns the command buffers and encoders. The recording thread keeps the ticks,
+// the deferred operations and a mirror of which kind of encoder is open. Off, the closures run
+// at once on the recording thread.
 
 #pragma once
 
@@ -59,19 +66,18 @@ public:
     void SignalOnCompletion(std::function<void()> func);
     /// Waits for every SignalOnCompletion function queued so far to have run.
     void WaitSignals();
+    /// The SignalOnCompletion functions queued so far (a target for RunAfterSignals).
+    [[nodiscard]] u64 SignalsQueued();
+    /// Waits until the first `target` SignalOnCompletion functions have run.
+    void WaitSignalsUpTo(u64 target);
+    /// Runs `func` once the first `target` SignalOnCompletion functions have run: now (on this
+    /// thread) when they have, else on the completion thread right after them. Never waits.
+    void RunAfterSignals(u64 target, std::function<void()> func);
 
-    // Encoders (Objective-C objects as void*: id<MTL...CommandEncoder>, borrowed).
-    void* CommandBuffer();
     /// Ends the open encoder.
     void EndEncoding();
     /// Ends a render encoder (other encoders stay open).
     void EndRendering();
-    void* ComputeEncoder();
-    void* BlitEncoder();
-    /// The open render encoder, or null.
-    void* CurrentRenderEncoder() const noexcept;
-    /// Installs a render encoder created by the rasterizer (ends the open encoder first).
-    void SetRenderEncoder(void* encoder, u64 pass_key);
     [[nodiscard]] u64 RenderPassKey() const noexcept {
         return render_pass_key;
     }
@@ -79,17 +85,38 @@ public:
         return render_pass_key != 0;
     }
 
-    /// tlg: TLG_METAL_ASYNC_COMPUTE=1: the guest's compute queues record into a second Metal
-    /// queue (lane 1) that runs beside the graphics one (lane 0), as on the console. Selecting a
-    /// lane takes effect at the next command buffer or encoder (the other lane's open command
-    /// buffer is committed then). Graphics command buffers wait for the compute work committed
-    /// before them; compute does not wait for graphics (the guest's label waits order that).
+    /// tlg: TLG_METAL_ASYNC_COMPUTE=1 (no encoder thread then): the guest's compute queues
+    /// record into a second Metal queue (lane 1) that runs beside the graphics one (lane 0), as
+    /// on the console. Selecting a lane takes effect at the next command buffer or encoder (the
+    /// other lane's open command buffer is committed then). Graphics command buffers wait for
+    /// the compute work committed before them; compute does not wait for graphics (the guest's
+    /// label waits order that).
     void SelectLane(int lane) noexcept;
     [[nodiscard]] static bool AsyncCompute() noexcept;
 
-    /// Encoders opened since the start (statistics).
+    /// Encoders opened since the start, as recorded (a new value: a new encoder).
     [[nodiscard]] u64 EncoderCount() const noexcept {
         return encoders;
+    }
+
+    /// The recording side's mirror of the open encoder.
+    enum class Kind : u8 { None, Render, Compute, Blit };
+    [[nodiscard]] Kind OpenKind() const noexcept {
+        return open_kind;
+    }
+    /// Records that an encoder of `kind` is used next (a new one when another kind is open).
+    void UseEncoder(Kind kind, u64 pass_key = 0) noexcept {
+        if (kind == Kind::Render) {
+            open_kind = kind;
+            render_pass_key = pass_key ? pass_key : 1;
+            ++encoders;
+            return;
+        }
+        if (open_kind != kind) {
+            open_kind = kind;
+            render_pass_key = 0;
+            ++encoders;
+        }
     }
 
     // Vulkan renderer API kept for the shared code.
@@ -117,6 +144,7 @@ private:
     std::atomic<u64> completed_tick{0};
     u64 render_pass_key = 0;
     u64 encoders = 0;
+    Kind open_kind = Kind::None;
 };
 
 } // namespace Vulkan

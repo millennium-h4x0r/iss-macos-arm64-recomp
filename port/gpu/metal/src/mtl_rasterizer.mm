@@ -287,6 +287,62 @@ bool Rasterizer::DeferUnifiedFence(Common::UniqueFunction<void>&& write) {
     return true;
 }
 
+void Rasterizer::RunAtEncode(Common::UniqueFunction<void>&& write) {
+    // TLG_METAL_LABEL_NOW_MODE: block (the encoder thread waits for the labels queued before it,
+    // then writes), after (written after them on the completion thread, never waiting), encode
+    // (when encoded, not ordered with them), record (here and now, not ordered).
+    enum class Mode { Block, After, Encode, Record };
+    static const Mode mode = [] {
+        const char* v = std::getenv("TLG_METAL_LABEL_NOW_MODE");
+        if (!v) {
+            return Mode::After;
+        }
+        return std::strcmp(v, "block") == 0    ? Mode::Block
+               : std::strcmp(v, "encode") == 0 ? Mode::Encode
+               : std::strcmp(v, "record") == 0 ? Mode::Record
+                                               : Mode::After;
+    }();
+    if (mode == Mode::Record) {
+        write();
+        return;
+    }
+    auto shared = std::make_shared<Common::UniqueFunction<void>>(std::move(write));
+    const u64 target = scheduler.SignalsQueued();
+    Scheduler* const s = &scheduler;
+    MetalScheduler::Record(scheduler, [s, shared, target] {
+        if (mode == Mode::Block) {
+            s->WaitSignalsUpTo(target);
+            (*shared)();
+        } else if (mode == Mode::After) {
+            s->RunAfterSignals(target, [shared] { (*shared)(); });
+        } else {
+            (*shared)();
+        }
+    });
+    if (auto* ring = scheduler.impl_()->ring.get()) {
+        ring->Publish(); // the guest may wait for it: not left in a partial batch
+    }
+}
+
+bool Rasterizer::WriteDataGpu(VAddr address, const u32* data, u32 bytes) {
+    if (bytes == 0 || bytes % 4 != 0 || !buffer_cache.IsInPlace(address, bytes)) {
+        return false;
+    }
+    auto& stream = buffer_cache.GetStreamBuffer();
+    const auto [p, offset] = stream.Map(bytes, 4);
+    if (!p) {
+        return false;
+    }
+    std::memcpy(p, data, bytes);
+    stream.Commit();
+    texture_cache.InvalidateMemoryFromGPU(address, bytes);
+    const auto [buffer, buffer_offset] = buffer_cache.ObtainBuffer(address, bytes, true);
+    const vk::BufferCopy copy{.srcOffset = offset, .dstOffset = buffer_offset, .size = bytes};
+    runtime.CopyBuffer(&stream, buffer, std::span{&copy, 1});
+    NoteGuestWrite();
+    return true;
+}
+
 bool Rasterizer::DeferWriteAfterCopy(Common::UniqueFunction<void>&& write) {
     // Off by default: the compute fence fix made it unnecessary for inFAMOUS's fires, and a
     // deferred write may land after later GPU work that reads it. TLG_METAL_ORDERED_WRITES=1: on.
