@@ -123,6 +123,10 @@ public:
     u64 hash = 0;
     MetalStage stage{};
     void* pso = nullptr; ///< id<MTLComputePipelineState>, retained
+    /// tlg: still compiling on GCD's threads (pso null meanwhile): the encoder thread waits for
+    /// it at the dispatch (null: failed, the dispatch is skipped).
+    std::shared_ptr<DeferredPso> deferred;
+    bool tried = false; ///< pipeline creation attempted (pso null: failed)
     std::array<u32, 3> workgroup_size{1, 1, 1};
 };
 

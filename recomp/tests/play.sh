@@ -96,6 +96,17 @@ step_dash() {    # smoke dash: run forward holding circle in 3 s bursts (Delsin'
 step_idle() {    # no input at all: a fixed view of where the save loads (A/B frame comparisons)
     pad
 }
+step_roam() {    # open-world running (Seattle): long runs with slow turns, jumps and dashes,
+    local t=$1    # a full camera turn every 32 s, so new areas (new shaders) keep coming into view
+    (( t < 35 )) && { (( t > 20 )) && tap cross; return; }
+    local k=$(( t % 32 ))
+    if (( k < 12 )); then pad ly=0 rx=$(( 128 + 30 ))
+    elif (( k < 14 )); then pad ly=0 cross
+    elif (( k < 20 )); then pad ly=0 circle rx=$(( 128 - 20 ))
+    elif (( k < 24 )); then pad ly=0 rx=255
+    elif (( k < 26 )); then pad ly=0 ry=60
+    else pad ly=0 lx=200 rx=$(( 128 + 10 )); fi
+}
 step_explore() {
     local t=$1
     (( t < 35 )) && { (( t > 20 )) && tap cross; return; }   # load, skip any cutscene

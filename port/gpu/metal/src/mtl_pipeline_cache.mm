@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <utility>
 
+#include <pthread/qos.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
@@ -64,6 +65,7 @@ std::atomic<u64> g_stage_ns[4]{}; // tlg: recompile+SPIR-V, SPIRV-Cross, MSL com
 // tlg: the same, never reset (TLG_METAL_HITCH_MS: a slow frame prints what it compiled).
 std::atomic<u64> g_stage_total_ns[4]{};
 std::atomic<u64> g_stage_total_count[4]{};
+std::atomic<u64> g_cs_total_ns{}, g_cs_total_count{}; // tlg: compute shader work on the CP (whole miss)
 std::atomic<u64> g_pso_build_ns{0}; // tlg: deferred pipelines' build time (GCD threads)
 std::atomic<u64> g_first_modules{0}, g_first_ns{0}; // tlg: of those, a program's first permutation
 inline u64 NsSince(std::chrono::steady_clock::time_point t) {
@@ -120,7 +122,26 @@ struct Module {
     id<MTLFunction> function = nil;
     MetalStage meta{};
     bool cold = false; ///< first compiled in this run (not in the MSL cache): async pipeline
+    /// tlg: compute: the MSL compile and the pipeline build run on GCD's threads (function nil);
+    /// the dispatch waits for them on the encoder thread (DeferredCompute).
+    std::shared_ptr<DeferredPso> cs_deferred;
 };
+
+// tlg: deferred compute pipelines (TLG_METAL_DEFERRED_COMPUTE=0: off). A new compute shader is
+// not skipped like a new graphics permutation (the game runs some only once: setup work), so
+// its ~60 ms Metal compile was on the command processor thread, one after another: running
+// into a new part of Seattle brought 30+ at once (seconds). Now they compile in parallel on
+// GCD's threads while the command processor goes on recording; only the encoder thread waits,
+// at the dispatch. Needs the encoder thread.
+bool DeferredCompute() {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_DEFERRED_COMPUTE");
+        return MetalScheduler::EncoderThreadEnabled() && !(v && v[0] == '0');
+    }();
+    return on;
+}
+std::atomic<u32> g_cs_deferred{0}, g_cs_deferred_failed{0};
+std::atomic<u64> g_cs_cross_ns{0}; // SPIRV-Cross time of deferred compute shaders (GCD)
 
 struct Program {
     Program(HwStage hw, SwStage sw, const Shader::ShaderParams& params) : info{hw, sw, params} {}
@@ -130,7 +151,13 @@ struct Program {
     bool failed = false;
     /// Async shaders: permutations whose MSL compiles in the background (lookup
     /// specialization, MSL source); their draws are skipped meanwhile.
-    std::vector<std::pair<Shader::StageSpecialization, std::string>> pending;
+    /// tlg: the source is filled in on GCD (SPIRV-Cross off the command processor) while
+    /// `translating` is set.
+    struct PendingSource {
+        std::atomic<bool> translating{false};
+        std::string source; ///< MSL source (empty: translation failed)
+    };
+    std::vector<std::pair<Shader::StageSpecialization, std::shared_ptr<PendingSource>>> pending;
     /// The inputs of the last permutation lookup: when a draw repeats them (user data, the
     /// flattened user data, runtime info, binding start and vertex attribute sharps), the
     /// permutation is the same and its specialization is not rebuilt (~15% of the command
@@ -159,11 +186,17 @@ struct MslResult {
     std::string error;
     u32 num_buffers = 0, num_textures = 0, num_samplers = 0;
     bool uses_buffer_sizes = false;
-    bool cache_hit = false; ///< from the MSL disk cache: compiled in an earlier run
+    bool cache_hit = false; ///< from the MSL disk cache (translated before)
+    /// from the cache file: compiled in an earlier run (Metal's own cache has it). A record
+    /// translated in this run may still be waiting for its first compile.
+    bool earlier_run = false;
     u64 key = 0;            ///< the MSL disk cache key (0: not cached)
+    /// tlg: reflected only (resource counts; msl empty): the SPIR-V to translate later
+    /// (deferred compute: SPIRV-Cross runs on GCD's threads with the Metal compile).
+    std::shared_ptr<const std::vector<u32>> pending_spirv;
 };
 
-MslResult TranslateStage(const std::vector<u32>& spirv, bool flip_y) {
+MslResult TranslateStage(const std::vector<u32>& spirv, bool flip_y, bool reflect_only = false) {
     MslResult out;
     try {
         spirv_cross::CompilerMSL compiler(spirv.data(), spirv.size());
@@ -256,6 +289,9 @@ MslResult TranslateStage(const std::vector<u32>& spirv, bool flip_y) {
         push.binding = spirv_cross::kPushConstBinding;
         push.msl_buffer = PushDataBufferIndex;
         compiler.add_msl_resource_binding(push);
+        if (reflect_only) {
+            return out;
+        }
 
         out.msl = compiler.compile();
         out.uses_buffer_sizes = compiler.needs_buffer_size_buffer();
@@ -287,6 +323,15 @@ MTLCompileOptions* MslOptions() {
         return o;
     }();
     return options;
+}
+
+extern "C" const char* runtime_file_user_dir(void);
+
+// tlg: where the MSL and translation caches live: the user folder, or TLG_METAL_CACHE_DIR
+// (tests: an empty folder = a first run with no caches, without touching the player's).
+std::string MetalCacheDir() {
+    const char* dir = std::getenv("TLG_METAL_CACHE_DIR");
+    return dir && dir[0] ? std::string(dir) : std::string(runtime_file_user_dir());
 }
 
 std::string MslSource(const std::string& msl) {
@@ -360,6 +405,17 @@ public:
         return running.load(std::memory_order_relaxed) != 0;
     }
 
+    /// tlg: Metal's own shader cache is cold (startup precompiles of earlier runs' shaders
+    /// average over 8 ms): those shaders then also compile in the background (async shaders)
+    /// instead of on the command processor. TLG_METAL_CACHE_COLD=0/1 forces it.
+    bool MetalCacheCold() const {
+        static const int force = [] {
+            const char* v = std::getenv("TLG_METAL_CACHE_COLD");
+            return v ? (v[0] == '1' ? 1 : 0) : -1;
+        }();
+        return force >= 0 ? force == 1 : startup_ms.load(std::memory_order_relaxed) > 8.f;
+    }
+
     // Async shaders: the finished library for this source without taking it, or nil with
     // `pending` set while it compiles (queued on first ask). nil without `pending`: compile it
     // here (claimed, or already taken).
@@ -422,14 +478,26 @@ private:
         id<MTLLibrary> library = nil;
     };
 
+    static void SetQos(qos_class_t qos) {
+        static thread_local qos_class_t current = QOS_CLASS_UNSPECIFIED;
+        static const bool off = [] {
+            const char* v = std::getenv("TLG_METAL_PREWARM_QOS");
+            return v && v[0] == '0';
+        }();
+        if (!off && qos != current) {
+            pthread_set_qos_class_self_np(qos, 0);
+            current = qos;
+        }
+    }
+
     void Work() {
         for (;;) {
             u64 key;
             std::string source;
+            bool got = false; // an urgent item (a draw waits for it), not a startup precompile
             {
                 std::unique_lock lock{mutex};
                 // tlg: shaders a draw waits for (async) go before the startup precompile queue.
-                bool got = false;
                 for (;;) {
                     while (!urgent.empty()) {
                         auto item = std::move(urgent.front());
@@ -457,13 +525,26 @@ private:
                     work_cv.wait(lock);
                 }
                 slots[key].state = State::Compiling;
+                // tlg: priorities: a compute shader the frame waits for (GCD, user-interactive)
+                // > a draw's shader (skipped meanwhile) > the startup precompile queue.
+                SetQos(got ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY);
             }
             id<MTLLibrary> library;
+            const auto tc = std::chrono::steady_clock::now();
             @autoreleasepool {
                 NSError* error = nil;
                 library = [Metal::Device() newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
                                                         options:MslOptions()
                                                           error:&error];
+            }
+            if (!got) {
+                // A startup precompile: a shader of an earlier run. Fast (~1 ms) when Metal's own
+                // cache has it; tens of ms when that cache is cold (after a macOS update, or the
+                // unbundled test binary, whose Metal cache does not persist).
+                const float ms = std::chrono::duration<float, std::milli>(
+                                     std::chrono::steady_clock::now() - tc).count();
+                const float old = startup_ms.load(std::memory_order_relaxed);
+                startup_ms.store(old == 0.f ? ms : old * 0.9f + ms * 0.1f, std::memory_order_relaxed);
             }
             {
                 std::lock_guard lock{mutex};
@@ -472,12 +553,13 @@ private:
                 slot.state = State::Done;
                 ++compiled;
                 if (startup_left && --startup_left == 0) {
-                    std::printf("GPU (Metal): precompiled %u shaders in %.1f s (%u used so far)\n",
+                    std::printf("GPU (Metal): precompiled %u shaders in %.1f s (%u used so far; "
+                                "~%.1f ms each: Metal's shader cache %s)\n",
                                 compiled,
                                 std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                                               start_time)
                                     .count(),
-                                taken);
+                                taken, startup_ms.load(), MetalCacheCold() ? "cold" : "warm");
                 }
             }
             done_cv.notify_all();
@@ -493,6 +575,7 @@ private:
     std::deque<std::pair<u64, std::string>> urgent;
     size_t next = 0;
     u32 compiled = 0, taken = 0;
+    std::atomic<float> startup_ms{0.f}; ///< moving average of startup precompile times
     std::atomic<u32> running{0};
     std::chrono::steady_clock::time_point start_time;
 };
@@ -502,7 +585,6 @@ private:
 // append-only file in the user folder, keyed by a hash of the SPIR-V; Metal's own cache then
 // makes the MSL compile cheap. Bump kMslCacheVersion when TranslateStage's options or the
 // SPIRV-Cross version change. TLG_METAL_NO_MSL_CACHE=1 disables it.
-extern "C" const char* runtime_file_user_dir(void);
 
 class MslDiskCache {
 public:
@@ -513,15 +595,17 @@ public:
         return cache;
     }
 
-    MslResult Translate(const std::vector<u32>& spirv, bool flip_y) {
-        if (!enabled) {
+    // reflect_on_miss: a miss is only reflected (resource counts), with the SPIR-V kept in
+    // pending_spirv for a later Translate on another thread.
+    MslResult Translate(const std::vector<u32>& spirv, bool flip_y, bool reflect_on_miss = false) {
+        if (!enabled && !reflect_on_miss) {
             return TranslateStage(spirv, flip_y);
         }
         const u64 key = XXH3_64bits_withSeed(spirv.data(), spirv.size() * sizeof(u32),
                                              kMslCacheVersion * 2 + (flip_y ? 1 : 0));
         {
             std::lock_guard lock{mutex};
-            if (auto it = entries.find(key); it != entries.end()) {
+            if (auto it = enabled ? entries.find(key) : entries.end(); it != entries.end()) {
                 ++hits;
                 MslResult r = it->second;
                 r.cache_hit = true;
@@ -529,8 +613,16 @@ public:
                 return r;
             }
         }
+        if (reflect_on_miss) {
+            MslResult r = TranslateStage(spirv, flip_y, true);
+            if (r.error.empty()) {
+                r.key = enabled ? key : 0;
+                r.pending_spirv = std::make_shared<const std::vector<u32>>(spirv);
+            }
+            return r;
+        }
         MslResult r = TranslateStage(spirv, flip_y);
-        if (!r.error.empty()) {
+        if (!r.error.empty() || !enabled) {
             return r;
         }
         r.key = key;
@@ -546,6 +638,10 @@ public:
         }
         entries.emplace(key, r);
         return r;
+    }
+
+    bool Enabled() const {
+        return enabled;
     }
 
     /// tlg: the MSL of `key` (a key Translate returned in this or an earlier run).
@@ -578,7 +674,7 @@ private:
             MslPrewarm::Get().Start({}); // the workers also serve async shaders
             return;
         }
-        const std::string path = std::string(runtime_file_user_dir()) + "/metal-msl-cache.bin";
+        const std::string path = MetalCacheDir() + "/metal-msl-cache.bin";
         constexpr u64 kMagic = 0x31434c534d474c54ull; // "TLGMSLC1"
         // Load whatever complete records the file has; a torn last record is dropped.
         size_t valid = 0;
@@ -605,6 +701,7 @@ private:
                     r.num_textures = head[3];
                     r.num_samplers = head[4];
                     r.uses_buffer_sizes = head[5] != 0;
+                    r.earlier_run = true;
                     if (entries.emplace(key, std::move(r)).second) {
                         order.push_back(key);
                     }
@@ -773,7 +870,7 @@ private:
         if (!enabled) {
             return;
         }
-        const std::string path = std::string(runtime_file_user_dir()) + "/metal-xlat-cache.bin";
+        const std::string path = MetalCacheDir() + "/metal-xlat-cache.bin";
         size_t valid = 0;
         if (FILE* in = std::fopen(path.c_str(), "rb")) {
             u64 head[2]{};
@@ -1164,8 +1261,14 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         pending_key.emplace(info, runtime_info, profile, start);
         for (auto it = program.pending.begin(); it != program.pending.end(); ++it) {
             if (it->first == *pending_key) {
+                if (it->second->translating.load(std::memory_order_acquire)) {
+                    g_async_skips.fetch_add(1, std::memory_order_relaxed);
+                    return nullptr;
+                }
                 bool still = false;
-                MslPrewarm::Get().Poll(it->second, still);
+                if (!it->second->source.empty()) {
+                    MslPrewarm::Get().Poll(it->second->source, still);
+                }
                 if (still) {
                     g_async_skips.fetch_add(1, std::memory_order_relaxed);
                     return nullptr;
@@ -1232,7 +1335,14 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         // No Y flip in the shader: the viewport maps Vulkan's clip space (see mtl_draw.mm).
         { const u64 ns_ = NsSince(t0); g_stage_ns[0].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_ns[0].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_count[0].fetch_add(1, std::memory_order_relaxed); }
         const auto t1 = std::chrono::steady_clock::now();
-        msl = MslDiskCache::Get().Translate(spirv, false);
+        // Deferred compute: SPIRV-Cross runs later on GCD (not with the MSL debugging tools).
+        static const bool defer_cross = !std::getenv("TLG_METAL_DUMP") &&
+                                        !std::getenv("TLG_METAL_MSL_OVERRIDE");
+        msl = MslDiskCache::Get().Translate(
+            spirv, false,
+            defer_cross && !cached &&
+                (sw_stage == SwStage::Compute ? DeferredCompute()
+                                              : async && MslDiskCache::Get().Enabled()));
         { const u64 ns_ = NsSince(t1); g_stage_ns[1].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_ns[1].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_count[1].fetch_add(1, std::memory_order_relaxed); }
         if (cached) {
             // TLG_METAL_XLAT_VERIFY=1: the cached translation must be this one.
@@ -1359,20 +1469,83 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
     // tlg: shaders of earlier runs (MSL cache hit) compile here at once: Metal's own cache has
     // them (~1 ms). Going async for them too skipped their draws for a frame or more whenever a
     // new permutation showed up (flames that started, stopped and started again).
-    if (async && !msl.cache_hit) {
+    if (async && msl.pending_spirv) {
+        // SPIRV-Cross and then the Metal compile on GCD / the prewarm workers.
+        auto pending = std::make_shared<Program::PendingSource>();
+        pending->translating.store(true, std::memory_order_relaxed);
+        auto spirv_in = msl.pending_spirv;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            MslResult full = MslDiskCache::Get().Translate(*spirv_in, false);
+            if (full.error.empty()) {
+                pending->source = MslSource(full.msl);
+                bool still = false;
+                MslPrewarm::Get().Poll(pending->source, still); // queue the Metal compile
+            }
+            pending->translating.store(false, std::memory_order_release);
+        });
+        program.pending.emplace_back(*pending_key, std::move(pending));
+        g_async_skips.fetch_add(1, std::memory_order_relaxed);
+        g_async_queued.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    if (async && (!msl.earlier_run || MslPrewarm::Get().MetalCacheCold())) {
         std::string source = MslSource(msl.msl);
         bool still = false;
         MslPrewarm::Get().Poll(source, still);
         if (still) {
-            program.pending.emplace_back(*pending_key, std::move(source));
+            auto pending = std::make_shared<Program::PendingSource>();
+            pending->source = std::move(source);
+            program.pending.emplace_back(*pending_key, std::move(pending));
             g_async_skips.fetch_add(1, std::memory_order_relaxed);
             g_async_queued.fetch_add(1, std::memory_order_relaxed);
             return nullptr;
         }
     }
-    id<MTLFunction> fn = CompileMsl(msl, params.hash, sw_stage == SwStage::Compute ? "compute" : "graphics");
+    std::shared_ptr<DeferredPso> cs_deferred;
+    id<MTLFunction> fn = nil;
+    if (sw_stage == SwStage::Compute && DeferredCompute()) {
+        cs_deferred = std::make_shared<DeferredPso>();
+        auto job = std::make_shared<MslResult>(msl);
+        const u64 shader_hash = params.hash;
+        auto deferred = cs_deferred;
+        g_cs_deferred.fetch_add(1, std::memory_order_relaxed);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            void* state = nullptr;
+            @autoreleasepool {
+                if (job->pending_spirv) {
+                    const auto ts = std::chrono::steady_clock::now();
+                    MslResult full = MslDiskCache::Get().Translate(*job->pending_spirv, false);
+                    g_cs_cross_ns.fetch_add(NsSince(ts), std::memory_order_relaxed);
+                    if (!full.error.empty() && g_failed.fetch_add(1) < 32) {
+                        std::printf("GPU (Metal): compute shader %016llx: SPIRV-Cross failed: %s\n",
+                                    (unsigned long long)shader_hash, full.error.c_str());
+                    }
+                    *job = std::move(full);
+                }
+                id<MTLFunction> f = job->msl.empty() ? nil : CompileMsl(*job, shader_hash, "compute");
+                if (f) {
+                    NSError* error = nil;
+                    id<MTLComputePipelineState> pso =
+                        [Metal::Device() newComputePipelineStateWithFunction:f error:&error];
+                    if (pso) {
+                        state = (__bridge_retained void*)pso;
+                    } else if (g_failed.fetch_add(1) < 32) {
+                        std::printf("GPU (Metal): compute pipeline %016llx failed: %s\n",
+                                    (unsigned long long)shader_hash,
+                                    error.localizedDescription.UTF8String);
+                    }
+                }
+            }
+            if (!state) {
+                g_cs_deferred_failed.fetch_add(1, std::memory_order_relaxed);
+            }
+            deferred->Set(state);
+        });
+    } else {
+        fn = CompileMsl(msl, params.hash, sw_stage == SwStage::Compute ? "compute" : "graphics");
+    }
     { const u64 ns_ = NsSince(t2); g_stage_ns[2].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_ns[2].fetch_add(ns_, std::memory_order_relaxed); g_stage_total_count[2].fetch_add(1, std::memory_order_relaxed); }
-    if (!fn) {
+    if (!fn && !cs_deferred) {
         if (program.modules.empty()) {
             program.failed = true;
         }
@@ -1400,9 +1573,14 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
     module.meta.num_samplers = msl.num_samplers;
     module.meta.uses_buffer_sizes = msl.uses_buffer_sizes;
     module.cold = !msl.cache_hit;
+    module.cs_deferred = std::move(cs_deferred);
     program.modules.push_back(std::move(module));
     program.last_used = program.modules.size() - 1;
     remember(program.last_used);
+    if (sw_stage == SwStage::Compute) {
+        g_cs_total_ns.fetch_add(NsSince(t0), std::memory_order_relaxed);
+        g_cs_total_count.fetch_add(1, std::memory_order_relaxed);
+    }
     g_compiles.fetch_add(1, std::memory_order_relaxed);
     g_compile_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - t0)
@@ -1896,6 +2074,14 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         slot = std::make_unique<ComputePipeline>();
         slot->hash = found->hash;
         slot->stage = module->meta;
+        slot->workgroup_size = {cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
+                                cs_pgm.num_thread_z.full};
+    }
+    if (!slot->tried && module->cs_deferred) {
+        slot->tried = true;
+        slot->deferred = module->cs_deferred; // building on GCD (DeferredCompute)
+    } else if (!slot->tried) {
+        slot->tried = true;
         NSError* error = nil;
         const auto tc = std::chrono::steady_clock::now();
         id<MTLComputePipelineState> pso =
@@ -1910,11 +2096,13 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         } else {
             slot->pso = (__bridge_retained void*)pso;
         }
-        slot->workgroup_size = {cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
-                                cs_pgm.num_thread_z.full};
+    }
+    if (slot->deferred && slot->deferred->Ready()) {
+        slot->pso = slot->deferred->Wait(); // retained; null: failed, skipped from now on
+        slot->deferred.reset();
     }
     slot->stage.info = info;
-    return slot->pso ? slot.get() : nullptr;
+    return slot->pso || slot->deferred ? slot.get() : nullptr;
 }
 
 void PipelineCache::ReportCompilerStats() {
@@ -1964,6 +2152,10 @@ void TlgCompileTotals(u64 ns[4], u64 count[4]) {
         ns[i] = g_stage_total_ns[i].load(std::memory_order_relaxed);
         count[i] = g_stage_total_count[i].load(std::memory_order_relaxed);
     }
+}
+void TlgComputeTotals(u64& count, u64& ns) {
+    count = g_cs_total_count.load(std::memory_order_relaxed);
+    ns = g_cs_total_ns.load(std::memory_order_relaxed);
 }
 void TlgFirstModules(u64& count, u64& ns) {
     count = g_first_modules.load(std::memory_order_relaxed);

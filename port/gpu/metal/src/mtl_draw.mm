@@ -364,6 +364,7 @@ namespace {
 thread_local bool tls_skip_draws = false;
 } // namespace
 void TlgFirstModules(u64& count, u64& ns);
+void TlgComputeTotals(u64& count, u64& ns);
 
 namespace FrameLog {
 u64 g_draws = 0;
@@ -396,7 +397,9 @@ void EndFrame(bool dumped) {
     if (hitch_ms > 0) {
         static auto last = std::chrono::steady_clock::now();
         static u64 last_ns[4]{}, last_n[4]{};
-        static u64 frame = 0, last_fm = 0, last_fns = 0, last_wait = 0;
+        static u64 frame = 0, last_fm = 0, last_fns = 0, last_wait = 0, last_cn = 0, last_cns = 0;
+        u64 cn, cns;
+        TlgComputeTotals(cn, cns);
         const u64 wait = g_tlg_pso_wait_ns.load(std::memory_order_relaxed);
         u64 fm, fns;
         TlgFirstModules(fm, fns);
@@ -406,15 +409,18 @@ void EndFrame(bool dumped) {
         TlgCompileTotals(ns, n);
         if (ms > hitch_ms) {
             std::printf("hitch: frame %llu %.0f ms; compiled recompile %llu/%.0f ms, cross %llu/%.0f "
-                        "ms, msl %llu/%.0f ms, pso %llu/%.0f ms (encoder waited %.0f ms); new programs %llu/%.0f ms\n",
+                        "ms, msl %llu/%.0f ms, pso %llu/%.0f ms (encoder waited %.0f ms); new programs %llu/%.0f ms; compute %llu/%.0f ms\n",
                         (unsigned long long)frame, ms, (unsigned long long)(n[0] - last_n[0]),
                         (ns[0] - last_ns[0]) / 1e6, (unsigned long long)(n[1] - last_n[1]),
                         (ns[1] - last_ns[1]) / 1e6, (unsigned long long)(n[2] - last_n[2]),
                         (ns[2] - last_ns[2]) / 1e6, (unsigned long long)(n[3] - last_n[3]),
                         (ns[3] - last_ns[3]) / 1e6, (wait - last_wait) / 1e6,
                         (unsigned long long)(fm - last_fm),
-                        (fns - last_fns) / 1e6);
+                        (fns - last_fns) / 1e6, (unsigned long long)(cn - last_cn),
+                        (cns - last_cns) / 1e6);
         }
+        last_cn = cn;
+        last_cns = cns;
         last_fm = fm;
         last_fns = fns;
         last_wait = wait;
@@ -2388,12 +2394,26 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     put(b.sizes.data(), 4 * 32);
     put(&push_data, sizeof(push_data));
     const MTLSize groups = MTLSizeMake(cs.dim_x, cs.dim_y, cs.dim_z);
-    void* const pso = pipeline->pso;
+    void* const ready_pso = pipeline->pso;
+    // tlg: a pipeline still compiling (DeferredCompute): the encoder thread waits for it here.
+    std::shared_ptr<DeferredPso> deferred = ready_pso ? nullptr : pipeline->deferred;
     MetalScheduler::detail::UseCompute(scheduler, label[0] ? label : "dispatch");
     Scheduler::Impl* const si = scheduler.impl_();
     const bool barrier = std::exchange(dispatch_barrier, true);
-    si->RecordWith(block, at, [si, barrier, nb, nt, ns, threads, groups, pso, indirect_raw, indirect_offset,
+    si->RecordWith(block, at, [si, barrier, nb, nt, ns, threads, groups, ready_pso, deferred = std::move(deferred),
+                               indirect_raw, indirect_offset,
                                name = MetalScheduler::LabelMode() ? std::string(label) : std::string()](const void* copy) {
+        void* pso = ready_pso;
+        if (!pso) {
+            const auto t = std::chrono::steady_clock::now();
+            pso = deferred->Wait();
+            g_tlg_pso_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - t).count(),
+                                        std::memory_order_relaxed);
+            if (!pso) {
+                return; // failed to compile: skipped
+            }
+        }
         id<MTLComputeCommandEncoder> enc = MetalScheduler::detail::ComputeFor(*si, name);
         MetalScheduler::BeforeGuestDispatch(*si, enc, barrier);
         const u8* p = static_cast<const u8*>(copy);
