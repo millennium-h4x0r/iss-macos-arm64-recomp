@@ -915,7 +915,7 @@ public:
 
 private:
     static constexpr u64 kMagic = 0x31544c584d474c54ull; // "TLGMXLT1"
-    static constexpr u64 kVersion = 1;
+    static constexpr u64 kVersion = 2; // 2: graphics loop guard
     static constexpr u8 kInfo = 1, kPerm = 2;
 
     XlatCache() {
@@ -1376,10 +1376,24 @@ const Module* PipelineCache::Impl::GetProgram(const Shader::Profile& profile,
         Shader::Info translated(hw_stage, sw_stage, params);
         auto compile_runtime = runtime_info;
         std::vector<u32> spirv;
+        // tlg: a graphics shader looping on garbage (the game recycles a GPU job's memory
+        // ~6 ms after it sees the job's flag, written when recorded, while the GPU is a frame
+        // behind) ran until the loop guard per pixel: minutes, which macOS ends as a GPU hang
+        // (fire road, Seattle, 2026-11-06). Graphics stages get a short guard (a hitch instead
+        // of a hang); compute keeps the long one (a bounded loop there is a few threads).
+        // TLG_METAL_LOOP_GUARD_GFX=<n> (0: the compute guard).
+        static const u32 gfx_guard = [] {
+            const char* v = std::getenv("TLG_METAL_LOOP_GUARD_GFX");
+            return v ? u32(std::strtoul(v, nullptr, 0)) : 4096u;
+        }();
+        Shader::Profile stage_profile = profile;
+        if (sw_stage != SwStage::Compute && gfx_guard && profile.loop_guard) {
+            stage_profile.loop_guard = gfx_guard;
+        }
         try {
             const auto ir = Shader::TranslateProgram(params.code, pools, translated, compile_runtime,
-                                                     profile);
-            spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, compile_runtime, ir, binding);
+                                                     stage_profile);
+            spirv = Shader::Backend::SPIRV::EmitSPIRV(stage_profile, compile_runtime, ir, binding);
         } catch (const std::exception& e) {
             if (g_failed.fetch_add(1) < 32) {
                 std::printf("GPU (Metal): shader %016llx refused: %s\n",

@@ -13,6 +13,7 @@
 #include <source_location>
 #include <string>
 #include <thread>
+#include <chrono>
 #include <vector>
 
 #include <boost/icl/interval_set.hpp>
@@ -198,6 +199,31 @@ public:
     void SyncUnifiedRead(VAddr address, u64 size);
     void WaitDeferredSignals() {
         scheduler.WaitSignals();
+    }
+    /// tlg: a render pass is open on the recording side (a commit now would split it).
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return scheduler.IsRendering();
+    }
+    /// tlg: the tick of the last copy into guest memory recorded for the GPU (a DMA_DATA the
+    /// console's command processor would have run itself); a WRITE_DATA waits for it.
+    u64 last_copy_tick = 0;
+    bool copy_pending = false;
+    void NotePendingCopy() {
+        last_copy_tick = scheduler.CurrentTick();
+        copy_pending = true;
+    }
+    /// Waits for the command buffer of the last pending copy; the wait in ns (0: none).
+    u64 WaitPendingCopies() {
+        if (!copy_pending) {
+            return 0;
+        }
+        copy_pending = false;
+        if (scheduler.IsFree(last_copy_tick)) {
+            return 0;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        scheduler.Wait(last_copy_tick);
+        return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
     void SignalAfterHostCopies(std::function<void()> signal) {
         signal();

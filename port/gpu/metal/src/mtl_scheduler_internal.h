@@ -42,12 +42,13 @@ struct Scheduler::Impl {
     bool fence_pendings[2] = {false, false}; ///< an earlier encoder of the lane updated its fence
     int lane = 0;      ///< the lane recording goes to
     int open_lane = 0; ///< the lane of cmdbuf
+    u64 lane_tick = 0; ///< the tick the lane was selected in (the open command buffer's)
     id<MTLSharedEvent> compute_event = nil;
     u64 compute_signaled = 0; ///< the event value of the last committed compute command buffer
     u64 graphics_waited = 0;  ///< the value the last graphics command buffer waits for
     u64 graphics_signaled = 0; ///< TLG_METAL_ASYNC_COMPUTE_SERIAL: compute waits for graphics
     id<MTLSharedEvent> graphics_event = nil;
-    std::set<u64> inflight; ///< committed ticks not completed (the lanes complete out of order)
+    std::multiset<u64> inflight; ///< committed ticks not completed (the lanes complete out of order; a tick may be two command buffers, one per lane)
     u64 committed = 0;      ///< the last committed tick
 
     id<MTLCommandBuffer> cmdbuf = nil;
@@ -75,6 +76,9 @@ struct Scheduler::Impl {
     void SetRenderEncoder(id<MTLRenderCommandEncoder> enc);
     void Commit(u64 tick, std::vector<std::function<void()>>&& signals,
                 std::atomic<u64>* completed, const char* queue_name);
+    /// Commits `cb` (the open command buffer) as part of `tick`; `final`: the tick's last one.
+    void CommitBuffer(id<MTLCommandBuffer> cb, u64 tick, std::vector<std::function<void()>>&& signals,
+                      std::atomic<u64>* completed, const char* queue_name, bool final);
 
     Scheduler* owner = nullptr;
 

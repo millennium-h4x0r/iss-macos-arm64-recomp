@@ -68,6 +68,8 @@ public:
     void WaitSignals();
     /// The SignalOnCompletion functions queued so far (a target for RunAfterSignals).
     [[nodiscard]] u64 SignalsQueued();
+    /// The SignalOnCompletion functions that have run so far.
+    [[nodiscard]] u64 SignalsDone();
     /// Waits until the first `target` SignalOnCompletion functions have run.
     void WaitSignalsUpTo(u64 target);
     /// Runs `func` once the first `target` SignalOnCompletion functions have run: now (on this
@@ -145,6 +147,7 @@ private:
     u64 render_pass_key = 0;
     u64 encoders = 0;
     Kind open_kind = Kind::None;
+    int rec_lane = 0; ///< tlg: the lane selected on the recording side (SelectLane)
 };
 
 } // namespace Vulkan

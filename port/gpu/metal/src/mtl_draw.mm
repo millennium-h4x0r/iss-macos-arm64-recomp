@@ -2436,6 +2436,80 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
             }
         });
     }
+    // Diagnosis: TLG_METAL_SORT_WATCH=1: after each dispatch of the merge sort, a thread polls
+    // its widths (buffer 2) and the scheduler's completed tick: how long after recording the
+    // game overwrites them, and how long until the GPU has run the dispatch. "RACE" when the
+    // game wrote first (the GPU read recycled memory).
+    if (static const bool sort_watch = std::getenv("TLG_METAL_SORT_WATCH") != nullptr;
+        sort_watch && pipeline->hash == 0xa16fa93aull && b.num_buffers >= 3 && b.buffers[2]) {
+        struct Entry {
+            const u32* p;
+            u32 w, maxw;
+            u64 tick;
+            std::chrono::steady_clock::time_point t0;
+            double changed = -1; // ms after t0, -1: not yet
+        };
+        struct Watch {
+            std::mutex m;
+            std::vector<Entry> entries;
+            Scheduler* sched = nullptr;
+            std::thread thread;
+            std::atomic<u32> printed{0};
+            double min_changed = 1e9, max_done = 0, sum_done = 0;
+            u32 n_done = 0, raced = 0;
+            void Run() {
+                pthread_setname_np("SortWatch");
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    const u64 done = sched->CompletedTick();
+                    const auto now = std::chrono::steady_clock::now();
+                    std::scoped_lock lk{m};
+                    for (size_t i = 0; i < entries.size();) {
+                        Entry& e = entries[i];
+                        const double ms = std::chrono::duration<double, std::milli>(now - e.t0).count();
+                        if (e.changed < 0 && (e.p[0] != e.w || e.p[1] != e.maxw)) {
+                            e.changed = ms;
+                        }
+                        if (done >= e.tick || ms > 2000) {
+                            const bool race = e.changed >= 0 && done < e.tick + 1; // changed before (or as) done
+                            ++n_done;
+                            sum_done += ms;
+                            max_done = std::max(max_done, ms);
+                            if (e.changed >= 0) {
+                                min_changed = std::min(min_changed, e.changed);
+                                raced += race;
+                            }
+                            if (race || printed.fetch_add(1) < 40) {
+                                std::printf("sort watch: tick %llu GPU done after %.1f ms, widths %u/%u %s%s\n",
+                                            (unsigned long long)e.tick, ms, e.w, e.maxw,
+                                            e.changed >= 0 ? "changed after " : "unchanged",
+                                            e.changed >= 0 ? (std::to_string(int(e.changed * 10) / 10.0) + " ms" +
+                                                              (race ? " RACE" : ""))
+                                                                 .c_str()
+                                                           : "");
+                            }
+                            if (n_done % 200 == 0) {
+                                std::printf("sort watch: %u dispatches, GPU done mean %.1f max %.1f ms, earliest overwrite %.1f ms, %u races\n",
+                                            n_done, sum_done / n_done, max_done, min_changed, raced);
+                            }
+                            entries.erase(entries.begin() + i);
+                            continue;
+                        }
+                        ++i;
+                    }
+                }
+            }
+        };
+        static Watch* watch = [&] {
+            auto* w = new Watch;
+            w->sched = &scheduler;
+            w->thread = std::thread([w] { w->Run(); });
+            return w;
+        }();
+        const u32* p = reinterpret_cast<const u32*>(static_cast<const u8*>(b.buffers[2].contents) + b.offsets[2]);
+        std::scoped_lock lk{watch->m};
+        watch->entries.push_back({p, p[0], p[1], scheduler.CurrentTick(), std::chrono::steady_clock::now()});
+    }
     if (FrameLog::Enabled()) {
         FrameLog::NoteDispatch(pipeline->hash, u64(cs.dim_x) * cs.dim_y * cs.dim_z, indirect_args != 0);
     }

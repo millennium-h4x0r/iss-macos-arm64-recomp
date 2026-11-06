@@ -416,7 +416,52 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // Copies deferred to the recording thread, and fences deferred to it (RecorderFences),
     // precede writes the guest sees.
     rasterizer.WaitHostCopies();
+#ifdef TLG_METAL
+    // tlg: the console's command processor writes at once, before the end-of-pipe labels of
+    // the work still running, but after the DMA_DATA copies before it (it runs those itself:
+    // inFAMOUS copies a GDS particle count to memory and sets a flag beside it). Here the copy
+    // runs on the GPU: the write waits for its command buffer only. Waiting for every label
+    // that waits for the GPU (TLG_METAL_WRITE_DATA=wait, the old way) had the command
+    // processor blocked 85% of the time on the fire road (2026-11-06, ~100 ms frames while the
+    // game spun waiting for it). TLG_METAL_WRITE_DATA=now: never waits. TLG_METAL_WRITE_DATA_STATS=1.
+    enum class WriteMode { Copy, Wait, Now };
+    static const WriteMode mode = [] {
+        const char* v = std::getenv("TLG_METAL_WRITE_DATA");
+        return !v ? WriteMode::Copy : std::strcmp(v, "wait") == 0 ? WriteMode::Wait
+               : std::strcmp(v, "now") == 0 ? WriteMode::Now : WriteMode::Copy;
+    }();
+    static const bool stats = std::getenv("TLG_METAL_WRITE_DATA_STATS") != nullptr;
+    static std::atomic<u64> writes{0}, waits{0}, wait_ns{0}, last_print{0};
+    const auto now_ns = [] {
+        return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count());
+    };
+    ++writes;
+    if (mode == WriteMode::Wait) {
+        const u64 t0 = stats ? now_ns() : 0;
+        rasterizer.WaitDeferredSignals();
+        if (stats) {
+            ++waits;
+            wait_ns += now_ns() - t0;
+        }
+    } else if (mode == WriteMode::Copy) {
+        if (const u64 ns = rasterizer.WaitPendingCopies(); ns) {
+            ++waits;
+            wait_ns += ns;
+        }
+    }
+    if (stats) {
+        const u64 now = now_ns();
+        if (u64 l = last_print.load(); now - l > 5000000000ull && last_print.compare_exchange_strong(l, now)) {
+            std::printf("WRITE_DATA: %llu in 5 s, %llu waited %.1f ms in all\n",
+                        (unsigned long long)writes.exchange(0), (unsigned long long)waits.exchange(0),
+                        wait_ns.exchange(0) / 1e6);
+        }
+    }
+#else
     rasterizer.WaitDeferredSignals();
+#endif
     TlgWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), TlgWriteLog::WriteData);
     std::memcpy(write_data->Address<u64*>(), write_data->data,
@@ -696,6 +741,16 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
         rasterizer.ProcessDownloadImages();
         const auto* packet = reinterpret_cast<const PM4CmdReleaseMem*>(task.packet);
         const u32 pipe_id = task.pipe_id;
+        // TLG_METAL_LABEL_FLUSH=1: a job flag that waits for the GPU goes out now, so the GPU
+        // reaches the job (and the game sees the flag) as soon as possible.
+        if (static const bool label_flush = [] {
+                const char* v = std::getenv("TLG_METAL_LABEL_FLUSH");
+                return v && v[0] == '1';
+            }();
+            label_flush && packet->data_sel.Value() == DataSelect::Data32Low && packet->DataDWord() == 1 &&
+            !rasterizer.IsRendering()) {
+            rasterizer.Flush(); // between passes only: a split pass reloads (or re-clears) its targets
+        }
         const auto irq = [pipe_id] {
             Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
         };
@@ -745,6 +800,20 @@ immediate:
         const auto* packet = reinterpret_cast<const PM4CmdReleaseMem*>(task.packet);
         const bool flag = packet->data_sel.Value() == DataSelect::Data32Low &&
                           packet->DataDWord() == 1 && !TlgIsCounter(packet->Address<VAddr>());
+        // TLG_METAL_LABEL_FLUSH=1: the job's command buffer is committed now, so the GPU gets it
+        // without waiting for the batch to close: the game recycles the job's memory ~6 ms after
+        // it sees the flag, and the GPU read it after 34 ms on average (fire road), 12 ms with
+        // the flush (sort dispatches reading a recycled width: 827 -> 3 in 100 s). Off by
+        // default: with it Walk to Seattle had gray frames again (26 of 350 vs 0), cause unknown.
+        if (static const bool label_flush = [] {
+                const char* v = std::getenv("TLG_METAL_LABEL_FLUSH");
+                return v && v[0] == '1';
+            }();
+            label_flush && flag && !rasterizer.IsRendering()) {
+            // Between passes only: a pass split by a commit came back re-cleared (white frames
+            // in Seattle, 10% of them, 2026-11-06).
+            rasterizer.Flush();
+        }
         rasterizer.RunAtEncode([copy] {
             reinterpret_cast<const PM4CmdReleaseMem*>(copy.packet)->SignalFence(
                 [pipe_id = copy.pipe_id] {

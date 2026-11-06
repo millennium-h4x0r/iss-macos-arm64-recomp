@@ -228,7 +228,7 @@ bool ConcurrentDispatch() {
 bool EncoderThreadEnabled() {
     static const bool on = [] {
         const char* v = std::getenv("TLG_METAL_ENCODER_THREAD");
-        return !(v && v[0] == '0') && !Scheduler::AsyncCompute();
+        return !(v && v[0] == '0');
     }();
     return on;
 }
@@ -383,10 +383,18 @@ bool Scheduler::AsyncCompute() noexcept {
 }
 
 void Scheduler::SelectLane(int lane) noexcept {
-    if (impl->queues[1]) {
-        // Async compute runs without the encoder thread: the lane is encoding-side state.
-        impl->lane = lane;
+    if (!impl->queues[1] || rec_lane == lane) {
+        return;
     }
+    rec_lane = lane;
+    // The lane is encoding-side state (the encoder thread's when it runs), recorded in order
+    // with the work; the tick is the open command buffer's (Commit closes it).
+    Impl* const i = impl.get();
+    const u64 tick = CurrentTick();
+    i->Record([i, lane, tick] {
+        i->lane = lane;
+        i->lane_tick = tick;
+    });
 }
 
 Scheduler::~Scheduler() {
@@ -406,9 +414,9 @@ Scheduler::~Scheduler() {
 id<MTLCommandBuffer> Scheduler::Impl::CommandBuffer() {
     if (!cmdbuf || open_lane != lane) {
         if (cmdbuf) {
-            // Async compute only (it runs without the encoder thread): the other lane's work
-            // goes to its queue now.
-            owner->Flush();
+            // Async compute: the other lane's work goes to its queue now (as part of the same
+            // tick: the tick's Commit adds this lane's command buffer).
+            CommitBuffer(cmdbuf, lane_tick, {}, &owner->completed_tick, owner->name, false);
         }
         MTLCommandBufferDescriptor* desc = [MTLCommandBufferDescriptor new];
         desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
@@ -528,7 +536,20 @@ void Scheduler::Impl::SetRenderEncoder(id<MTLRenderCommandEncoder> enc) {
 void Scheduler::Impl::Commit(u64 tick, std::vector<std::function<void()>>&& signals_in,
                              std::atomic<u64>* completed, const char* queue_name) {
     EndEncoding();
-    id<MTLCommandBuffer> cb = CommandBuffer();
+    // Async compute: an open command buffer of the other lane goes out first (without the
+    // signals: they belong with the selected lane's work, on an empty command buffer of that
+    // lane when nothing is open, which completes after the lane's earlier ones).
+    if (cmdbuf && open_lane != lane) {
+        CommitBuffer(cmdbuf, tick, {}, completed, queue_name, false);
+    }
+    if (!cmdbuf) {
+        open_lane = lane;
+    }
+    CommitBuffer(cmdbuf ? cmdbuf : CommandBuffer(), tick, std::move(signals_in), completed, queue_name, true);
+}
+
+void Scheduler::Impl::CommitBuffer(id<MTLCommandBuffer> cb, u64 tick, std::vector<std::function<void()>>&& signals_in,
+                                   std::atomic<u64>* completed, const char* queue_name, bool final) {
     Impl* const state = this;
     std::vector<std::function<void()>> signals = std::move(signals_in);
     if (queues[1]) {
@@ -539,9 +560,14 @@ void Scheduler::Impl::Commit(u64 tick, std::vector<std::function<void()>>&& sign
         }
     }
     {
+        // `committed` advances with a tick's closing command buffer only: an earlier buffer of
+        // the tick (the other lane's, with async compute) completing while the tick is still
+        // open must not mark the tick complete (done_to stays at tick - 1).
         std::scoped_lock lock{mutex};
         inflight.insert(tick);
-        committed = tick;
+        if (final) {
+            committed = tick;
+        }
     }
     // TLG_METAL_LANE_STATS=1: per lane and second, the command buffers' wait before the GPU
     // started them, their GPU time, and the delay of their completion handler.
@@ -637,7 +663,9 @@ void Scheduler::Impl::Commit(u64 tick, std::vector<std::function<void()>>&& sign
             // A tick is complete when it and every tick before it are (the two lanes'
             // command buffers complete out of order).
             std::scoped_lock lock{state->mutex};
-            state->inflight.erase(tick);
+            if (auto it = state->inflight.find(tick); it != state->inflight.end()) {
+                state->inflight.erase(it);
+            }
             const u64 done_to = state->inflight.empty() ? state->committed : *state->inflight.begin() - 1;
             u64 prev = completed->load(std::memory_order_relaxed);
             while (prev < done_to && !completed->compare_exchange_weak(prev, done_to)) {
@@ -728,6 +756,21 @@ void Scheduler::Flush() {
             n = sum = max = 0;
         }
     }
+    // Diagnosis: TLG_METAL_MAX_AHEAD=<n>: recording waits until at most n command buffers are
+    // committed and not completed (the GPU's backlog bounds how stale the memory it reads is).
+    if (static const u64 max_ahead = [] {
+            const char* v = std::getenv("TLG_METAL_MAX_AHEAD");
+            return v ? std::strtoull(v, nullptr, 10) : 0ull;
+        }();
+        max_ahead && std::strcmp(name, "draw") == 0 && tick > max_ahead) {
+        if (i->ring) {
+            i->ring->Publish();
+        }
+        if (!IsFree(tick - max_ahead)) {
+            std::unique_lock lock{i->mutex};
+            i->cv.wait(lock, [&] { return IsFree(tick - max_ahead); });
+        }
+    }
     if (i->ring) {
         i->ring->Publish(); // the commit goes out now (recording publishes in batches)
         // TLG_METAL_ENCODER_STATS=1: closures run, kernel sleeps of the encoder thread and
@@ -806,6 +849,11 @@ void Scheduler::SignalOnCompletion(std::function<void()> func) {
 u64 Scheduler::SignalsQueued() {
     std::scoped_lock lock{impl->signal_mutex};
     return impl->signals_queued;
+}
+
+u64 Scheduler::SignalsDone() {
+    std::scoped_lock lock{impl->signal_mutex};
+    return impl->signals_done;
 }
 
 void Scheduler::RunAfterSignals(u64 target, std::function<void()> func) {
