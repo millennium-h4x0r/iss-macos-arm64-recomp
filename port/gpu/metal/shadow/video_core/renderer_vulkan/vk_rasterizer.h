@@ -13,6 +13,7 @@
 #include <source_location>
 #include <string>
 #include <thread>
+#include <algorithm>
 #include <chrono>
 #include <vector>
 
@@ -199,6 +200,35 @@ public:
     void SyncUnifiedRead(VAddr address, u64 size);
     void WaitDeferredSignals() {
         scheduler.WaitSignals();
+    }
+    /// tlg: guest memory ranges the GPU writes in work not yet complete (dispatch and draw
+    /// buffers the shader writes, GPU copies): a record-time copy of such a range would be
+    /// stale, so the input snapshots (DispatchCompute) skip them.
+    struct GpuWrite {
+        VAddr start, end;
+        u64 tick;
+    };
+    std::vector<GpuWrite> gpu_writes;
+    void NoteGpuWrite(VAddr start, u64 size) {
+        if (!start || !size) {
+            return;
+        }
+        if (gpu_writes.size() > 4096) {
+            gpu_writes.erase(std::remove_if(gpu_writes.begin(), gpu_writes.end(),
+                                            [&](const GpuWrite& w) { return scheduler.IsFree(w.tick); }),
+                             gpu_writes.end());
+        }
+        gpu_writes.push_back({start, start + size, scheduler.CurrentTick()});
+    }
+    [[nodiscard]] bool GpuWritePending(VAddr start, u64 size) {
+        const VAddr end = start + size;
+        const u64 done = scheduler.CompletedTick();
+        for (const GpuWrite& w : gpu_writes) {
+            if (w.tick > done && w.start < end && start < w.end) {
+                return true;
+            }
+        }
+        return false;
     }
     /// tlg: a render pass is open on the recording side (a commit now would split it).
     [[nodiscard]] bool IsRendering() const noexcept {

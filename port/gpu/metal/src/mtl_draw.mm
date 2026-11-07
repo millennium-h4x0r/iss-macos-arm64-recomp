@@ -14,6 +14,9 @@
 #include <unordered_map>
 #include <chrono>
 #include <atomic>
+#include <pthread.h>
+#include <thread>
+#include <xxhash.h>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -472,7 +475,11 @@ void EndFrame(bool dumped) {
     // "d": the dumped frames only.
     static const bool dumped_only = std::getenv("TLG_METAL_FRAME_CS")[0] == 'd';
     static const u64 first = std::strtoull(std::getenv("TLG_METAL_FRAME_CS"), nullptr, 0);
-    if (dumped_only ? dumped : (g_frame >= first && g_frame < first + 200)) {
+    static const u64 count = [] {
+        const char* v = std::getenv("TLG_METAL_FRAME_CS_FRAMES"); // frames logged from `first` (default 200)
+        return v ? std::strtoull(v, nullptr, 0) : 200ull;
+    }();
+    if (dumped_only ? dumped : (g_frame >= first && g_frame < first + count)) {
         std::string line;
         for (const auto& [h, c] : g_cs) {
             char b[64];
@@ -793,6 +800,8 @@ struct StageBindings {
     std::array<__unsafe_unretained id<MTLBuffer>, 32> buffers;
     std::array<u64, 32> offsets;
     std::array<u32, 32> sizes;
+    std::array<VAddr, 32> guest_addrs{}; ///< tlg: the guest address of a buffer bound in place (0: none)
+    u32 written_mask = 0;                ///< tlg: slots the shader writes
     std::array<__unsafe_unretained id<MTLTexture>, 128> textures;
     std::array<__unsafe_unretained id<MTLSamplerState>, 16> samplers;
     u32 num_buffers = 0, num_textures = 0, num_samplers = 0;
@@ -949,7 +958,9 @@ bool Rasterizer::BindStage(const MetalStage& stage, Shader::Backend::Bindings& b
                 if (desc.is_written) {
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, bytes);
                     out.writes_memory = true;
+                    out.written_mask |= 1u << slot;
                 }
+                out.guest_addrs[slot] = vsharp.base_address;
             }
         }
         out.buffers[slot] = buffer;
@@ -1241,6 +1252,11 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         if (pipeline->stages[i].info) {
             BindStage(pipeline->stages[i], binding, push_data, stage_bindings[i]);
             writes_memory |= stage_bindings[i].writes_memory;
+            for (u32 k = 0; k < stage_bindings[i].num_buffers; ++k) {
+                if (stage_bindings[i].written_mask & (1u << k)) {
+                    NoteGpuWrite(stage_bindings[i].guest_addrs[k], stage_bindings[i].sizes[k]);
+                }
+            }
             writes_images |= stage_bindings[i].writes_images;
         }
     }
@@ -2510,6 +2526,94 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
         std::scoped_lock lk{watch->m};
         watch->entries.push_back({p, p[0], p[1], scheduler.CurrentTick(), std::chrono::steady_clock::now()});
     }
+    // Diagnosis: TLG_METAL_INPUT_WATCH=1: for every dispatch from the guest's compute queues, the
+    // read-only guest buffers it binds (up to 4 KB each) are hashed when recorded and again
+    // once the GPU has run the dispatch: which shaders' inputs the game overwrites before the
+    // GPU reads them (the recycled-memory race), per shader, every 5 s.
+    if (static const bool input_watch = std::getenv("TLG_METAL_INPUT_WATCH") != nullptr;
+        input_watch && lane_ == 1) {
+        struct Entry {
+            u64 cs;
+            u32 slot, size;
+            const u8* p;
+            u64 hash0, tick;
+        };
+        struct Stat {
+            u32 dispatches = 0, slots = 0, changed = 0, max_size = 0;
+            u32 changed_slots[32]{};
+        };
+        struct Watch {
+            std::mutex m;
+            std::vector<Entry> entries;
+            std::map<u64, Stat> stats;
+            Scheduler* sched = nullptr;
+            std::thread thread;
+            void Run() {
+                pthread_setname_np("InputWatch");
+                auto last = std::chrono::steady_clock::now();
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                    const u64 done = sched->CompletedTick();
+                    std::scoped_lock lk{m};
+                    for (size_t i = 0; i < entries.size();) {
+                        const Entry& e = entries[i];
+                        if (done < e.tick) {
+                            ++i;
+                            continue;
+                        }
+                        Stat& st = stats[e.cs];
+                        ++st.slots;
+                        if (XXH3_64bits(e.p, e.size) != e.hash0) {
+                            ++st.changed;
+                            ++st.changed_slots[e.slot];
+                        }
+                        entries[i] = entries.back();
+                        entries.pop_back();
+                    }
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - last > std::chrono::seconds(5)) {
+                        last = now;
+                        u32 total = 0, changed = 0;
+                        for (auto& [cs, st] : stats) {
+                            total += st.slots;
+                            changed += st.changed;
+                            if (st.changed) {
+                                std::string slots;
+                                for (u32 k = 0; k < 32; ++k) {
+                                    if (st.changed_slots[k]) {
+                                        slots += " b" + std::to_string(k) + ":" + std::to_string(st.changed_slots[k]);
+                                    }
+                                }
+                                std::printf("input watch: cs %08llx: %u dispatches, %u/%u inputs overwritten before the GPU read them (max %u B)%s\n",
+                                            (unsigned long long)cs, st.dispatches, st.changed, st.slots, st.max_size,
+                                            slots.c_str());
+                            }
+                        }
+                        std::printf("input watch: %u inputs checked, %u overwritten in 5 s\n", total, changed);
+                        stats.clear();
+                    }
+                }
+            }
+        };
+        static Watch* watch = [&] {
+            auto* w = new Watch;
+            w->sched = &scheduler;
+            w->thread = std::thread([w] { w->Run(); });
+            return w;
+        }();
+        std::scoped_lock lk{watch->m};
+        Stat& st = watch->stats[pipeline->hash];
+        ++st.dispatches;
+        const u64 tick = scheduler.CurrentTick();
+        for (u32 i = 0; i < b.num_buffers; ++i) {
+            if (!b.guest_addrs[i] || (b.written_mask & (1u << i)) || !b.sizes[i] || b.sizes[i] > 4096) {
+                continue;
+            }
+            const u8* p = static_cast<const u8*>(b.buffers[i].contents) + b.offsets[i];
+            st.max_size = std::max(st.max_size, b.sizes[i]);
+            watch->entries.push_back({pipeline->hash, i, b.sizes[i], p, XXH3_64bits(p, b.sizes[i]), tick});
+        }
+    }
     if (FrameLog::Enabled()) {
         FrameLog::NoteDispatch(pipeline->hash, u64(cs.dim_x) * cs.dim_y * cs.dim_z, indirect_args != 0);
     }
@@ -2521,7 +2625,13 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     // per dispatch (TLG_METAL_ENC_TIMES=1 shows them). The widths are what the game had in place
     // at submit time, so the dispatch gets a copy of that buffer taken here instead.
     // TLG_METAL_SORT_SNAPSHOT=0: off.
-    constexpr u32 SnapshotMax = 512;
+    // tlg: the same holds for every job of the guest's compute queues: TLG_METAL_INPUT_WATCH
+    // showed ~10% of the dispatches of its particle shaders (f91084e3, f6c5d640, f23bc319...)
+    // reading parameter blocks of 0.5-3 KB the game had already overwritten (fires shed and
+    // relit). Their read-only guest inputs up to 4 KB are copied when recorded and bound as
+    // inline data (TLG_METAL_INPUT_SNAPSHOT=0: off; the sort's widths stay covered by
+    // TLG_METAL_SORT_SNAPSHOT).
+    constexpr u32 SnapshotMax = 512, InputSnapshotMax = 4096;
     u32 snap_len = 0;
     if (static const bool snapshot = [] {
             const char* v = std::getenv("TLG_METAL_SORT_SNAPSHOT");
@@ -2530,10 +2640,26 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
         snapshot && pipeline->hash == 0xa16fa93aull && b.num_buffers >= 3 && b.buffers[2] && b.sizes[2]) {
         snap_len = std::min(b.sizes[2], SnapshotMax);
     }
-    // The bindings travel as one block: buffers, offsets, textures, samplers, sizes, push data.
+    u32 input_mask = 0;  // slots copied (each InputSnapshotMax bytes at most, their sizes in b.sizes)
+    u32 input_bytes = 0;
+    if (static const bool input_snapshot = [] {
+            const char* v = std::getenv("TLG_METAL_INPUT_SNAPSHOT");
+            return !v || v[0] != '0';
+        }();
+        input_snapshot && lane_ == 1) {
+        for (u32 i = 0; i < b.num_buffers; ++i) {
+            if (b.guest_addrs[i] && !(b.written_mask & (1u << i)) && b.sizes[i] && b.sizes[i] <= InputSnapshotMax &&
+                !(snap_len && i == 2) && !GpuWritePending(b.guest_addrs[i], b.sizes[i])) {
+                input_mask |= 1u << i;
+                input_bytes += (b.sizes[i] + 15) & ~15u;
+            }
+        }
+    }
+    // The bindings travel as one block: buffers, offsets, textures, samplers, sizes, push data,
+    // the snapshots.
     const u32 nb = b.num_buffers, nt = b.num_textures, ns = b.num_samplers;
     alignas(16) u8 block[sizeof(void*) * 32 + 8 * 32 + sizeof(void*) * 128 + sizeof(void*) * 16 +
-                         4 * 32 + sizeof(Shader::PushData) + SnapshotMax];
+                         4 * 32 + sizeof(Shader::PushData) + SnapshotMax + 32 * InputSnapshotMax];
     size_t at = 0;
     const auto put = [&](const void* src, size_t n) {
         std::memcpy(block + at, src, n);
@@ -2548,6 +2674,12 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     if (snap_len) {
         put(static_cast<const u8*>(b.buffers[2].contents) + b.offsets[2], snap_len);
     }
+    for (u32 i = 0; i < nb; ++i) {
+        if (input_mask & (1u << i)) {
+            put(static_cast<const u8*>(b.buffers[i].contents) + b.offsets[i], b.sizes[i]);
+            at = (at + 15) & ~size_t(15);
+        }
+    }
     const MTLSize groups = MTLSizeMake(cs.dim_x, cs.dim_y, cs.dim_z);
     void* const ready_pso = pipeline->pso;
     // tlg: a pipeline still compiling (DeferredCompute): the encoder thread waits for it here.
@@ -2556,7 +2688,7 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     Scheduler::Impl* const si = scheduler.impl_();
     const bool barrier = std::exchange(dispatch_barrier, true);
     si->RecordWith(block, at, [si, barrier, nb, nt, ns, threads, groups, ready_pso, deferred = std::move(deferred),
-                               indirect_raw, indirect_offset, snap_len,
+                               indirect_raw, indirect_offset, snap_len, input_mask,
                                name = MetalScheduler::LabelMode() ? std::string(label) : std::string()](const void* copy) {
         void* pso = ready_pso;
         if (!pso) {
@@ -2590,12 +2722,23 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
         if (ns) {
             [enc setSamplerStates:samplers withRange:NSMakeRange(0, ns)];
         }
+        const u8* copy_sizes = p;
         [enc setBytes:p length:sizeof(u32) * 32 atIndex:BufferSizesBufferIndex];
         p += 4 * 32;
         [enc setBytes:p length:sizeof(Shader::PushData) atIndex:PushDataBufferIndex];
         p += sizeof(Shader::PushData);
         if (snap_len) {
             [enc setBytes:p length:snap_len atIndex:2]; // the sort's parameter buffer as recorded
+            p += snap_len;
+        }
+        if (input_mask) {
+            const u32* sizes = reinterpret_cast<const u32*>(copy_sizes);
+            for (u32 i = 0; i < nb; ++i) {
+                if (input_mask & (1u << i)) {
+                    [enc setBytes:p length:sizes[i] atIndex:i]; // the input as recorded
+                    p += (sizes[i] + 15) & ~15u;
+                }
+            }
         }
         if (indirect_raw) {
             [enc dispatchThreadgroupsWithIndirectBuffer:(__bridge id<MTLBuffer>)indirect_raw
@@ -2608,6 +2751,11 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     if (b.writes_memory) {
         MetalScheduler::NoteUntrackedWrite(scheduler);
         NoteGuestWrite();
+        for (u32 i = 0; i < b.num_buffers; ++i) {
+            if (b.written_mask & (1u << i)) {
+                NoteGpuWrite(b.guest_addrs[i], b.sizes[i]);
+            }
+        }
     }
     last_cs_hash[lane_] = pipeline->hash;
     if (NanScan::Active()) {

@@ -102,6 +102,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         pending_guest_copy = true; // a WRITE_DATA after it waits for it (DeferWriteAfterCopy)
         NotePendingCopy();         // (or for its command buffer: RunWriteData)
         NoteGuestWrite();
+        NoteGpuWrite(dst, num_bytes);
     }
     // Diagnosis: TLG_GDS_LOG=1: the GDS counters copied to memory (the values the game reads
     // back), once a second per GDS offset: copies, min / max / last value.
