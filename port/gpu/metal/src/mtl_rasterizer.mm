@@ -80,6 +80,22 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (!dst_gds) {
         texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
     }
+    // tlg: a GDS store (a GDS counter copied to guest memory, inFAMOUS's particle counts): the
+    // counter's current value (the GPU's progress so far, at most about a frame behind) is
+    // written now as well, so the game, which reads it right after the job's flag (written
+    // when recorded), sees a recent count instead of whatever the memory held: with garbage
+    // there its fires went out for ~8 frames and its smoke form vanished, again and again
+    // (2026-11-07). The GPU copy below lands the exact value later. It did not help (the game
+    // needs the exact count: the flag after the store waits for the GPU instead, see
+    // RunComputeReleaseMem), so off. TLG_METAL_GDS_EARLY=1: on.
+    if (static const bool gds_early = [] {
+            const char* v = std::getenv("TLG_METAL_GDS_EARLY");
+            return v && v[0] == '1';
+        }();
+        gds_early && src_gds && !dst_gds && buffer_cache.IsInPlace(dst, num_bytes) &&
+        src + num_bytes <= draw_state->gds->mapped_data.size()) {
+        std::memcpy(reinterpret_cast<void*>(dst), draw_state->gds->mapped_data.data() + src, num_bytes);
+    }
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {
             return {draw_state->gds.get(), src};
@@ -92,6 +108,11 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         }
         return buffer_cache.ObtainBuffer(dst, num_bytes, true);
     }();
+    if (Scheduler::ParticleLanes() && src_gds && !dst_gds) {
+        // The job's GDS store goes with its dispatches; its shaders make the job a particle job.
+        scheduler.SelectLane(job_lane);
+        particle_shaders.insert(job_shaders.begin(), job_shaders.end());
+    }
     const vk::BufferCopy copy{.srcOffset = src_offset, .dstOffset = dst_offset, .size = num_bytes};
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
     // tlg: the console's command processor runs DMA_DATA before the packets after it; here the
@@ -103,6 +124,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         NotePendingCopy();         // (or for its command buffer: RunWriteData)
         NoteGuestWrite();
         NoteGpuWrite(dst, num_bytes);
+        if (src_gds) {
+            gds_copy_since_flag = true; // the job's flag waits for this copy (RunComputeReleaseMem)
+        }
     }
     // Diagnosis: TLG_GDS_LOG=1: the GDS counters copied to memory (the values the game reads
     // back), once a second per GDS offset: copies, min / max / last value.

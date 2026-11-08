@@ -377,7 +377,15 @@ Scheduler::Scheduler(const Instance& instance, const char* name_)
 bool Scheduler::AsyncCompute() noexcept {
     static const bool on = [] {
         const char* v = std::getenv("TLG_METAL_ASYNC_COMPUTE");
-        return v && v[0] == '1';
+        return v && (v[0] == '1' || v[0] == 'p');
+    }();
+    return on;
+}
+
+bool Scheduler::ParticleLanes() noexcept {
+    static const bool on = [] {
+        const char* v = std::getenv("TLG_METAL_ASYNC_COMPUTE");
+        return v && v[0] == 'p';
     }();
     return on;
 }

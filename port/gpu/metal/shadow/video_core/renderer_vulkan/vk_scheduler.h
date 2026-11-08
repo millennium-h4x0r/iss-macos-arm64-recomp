@@ -95,6 +95,11 @@ public:
     /// label waits order that).
     void SelectLane(int lane) noexcept;
     [[nodiscard]] static bool AsyncCompute() noexcept;
+    /// tlg: TLG_METAL_ASYNC_COMPUTE=particles: only the guest's particle jobs (compute jobs that
+    /// end with a GDS store, learnt by their shaders) go to the compute lane, where they
+    /// complete within a few ms of their commit: the game reads their GDS counts right after
+    /// their flags (written when recorded). The rest of the compute stays with graphics.
+    [[nodiscard]] static bool ParticleLanes() noexcept;
 
     /// Encoders opened since the start, as recorded (a new value: a new encoder).
     [[nodiscard]] u64 EncoderCount() const noexcept {

@@ -405,6 +405,131 @@ void* Wait(DeferredPso& deferred, std::chrono::steady_clock::time_point now) {
 void TlgFirstModules(u64& count, u64& ns);
 void TlgComputeTotals(u64& count, u64& ns);
 
+// Diagnosis: TLG_METAL_INPUT_WATCH=1: guest buffers a dispatch or draw reads, hashed when
+// recorded and again once the GPU has run it (its tick completed): the game overwriting an
+// input before the GPU read it is the recycled-memory race. Kinds: 'c' covered by a
+// record-time copy (the shader reads the copy: harmless), 'g' the GPU still writes it (a
+// change is expected), 'u' uncovered. Per shader (draws: the pixel shader), every 5 s.
+// TLG_METAL_INPUT_WATCH_PS=<hex>[,..]: also watch the draws of those pixel shaders (default:
+// the indirect draws).
+namespace InputWatch {
+bool Enabled() {
+    static const bool on = std::getenv("TLG_METAL_INPUT_WATCH") != nullptr;
+    return on;
+}
+struct Entry {
+    u64 key;
+    u32 slot, size;
+    const u8* p;
+    u64 hash0, tick;
+    char kind;
+};
+struct Stat {
+    u32 uses = 0, inputs = 0;
+    u32 changed[3]{}; // c, g, u
+    u32 max_uncovered = 0;
+    u32 changed_slots[32]{};
+};
+struct State {
+    std::mutex m;
+    std::vector<Entry> entries;
+    std::map<u64, Stat> stats;
+    Scheduler* sched = nullptr;
+    std::thread thread;
+};
+State* g_state = nullptr;
+void Run(State* w) {
+    pthread_setname_np("InputWatch");
+    auto last = std::chrono::steady_clock::now();
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        const u64 done = w->sched->CompletedTick();
+        std::scoped_lock lk{w->m};
+        for (size_t i = 0; i < w->entries.size();) {
+            const Entry& e = w->entries[i];
+            if (done < e.tick) {
+                ++i;
+                continue;
+            }
+            Stat& st = w->stats[e.key];
+            ++st.inputs;
+            if (XXH3_64bits(e.p, e.size) != e.hash0) {
+                const int k = e.kind == 'c' ? 0 : e.kind == 'g' ? 1 : 2;
+                ++st.changed[k];
+                if (k == 2) {
+                    ++st.changed_slots[e.slot];
+                    st.max_uncovered = std::max(st.max_uncovered, e.size);
+                }
+            }
+            w->entries[i] = w->entries.back();
+            w->entries.pop_back();
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last > std::chrono::seconds(5)) {
+            last = now;
+            u32 total = 0, changed[3]{};
+            for (auto& [key, st] : w->stats) {
+                total += st.inputs;
+                for (int k = 0; k < 3; ++k) {
+                    changed[k] += st.changed[k];
+                }
+                if (st.changed[0] + st.changed[2]) {
+                    std::string slots;
+                    for (u32 k = 0; k < 32; ++k) {
+                        if (st.changed_slots[k]) {
+                            slots += " b" + std::to_string(k) + ":" + std::to_string(st.changed_slots[k]);
+                        }
+                    }
+                    std::printf("input watch: %s%08llx: %u uses, %u inputs: overwritten covered %u, gpu %u, UNCOVERED %u (max %u B)%s\n",
+                                key >> 63 ? "ps " : "cs ", (unsigned long long)(key & 0xffffffffull), st.uses, st.inputs,
+                                st.changed[0], st.changed[1], st.changed[2], st.max_uncovered, slots.c_str());
+                }
+            }
+            std::printf("input watch: %u inputs in 5 s: overwritten covered %u, gpu-written %u, UNCOVERED %u\n", total,
+                        changed[0], changed[1], changed[2]);
+            w->stats.clear();
+        }
+    }
+}
+void Start(Scheduler* sched) {
+    if (!g_state) {
+        g_state = new State;
+        g_state->sched = sched;
+        g_state->thread = std::thread([] { Run(g_state); });
+    }
+}
+void Note(u64 key) {
+    std::scoped_lock lk{g_state->m};
+    ++g_state->stats[key].uses;
+}
+void Add(u64 key, u32 slot, const u8* p, u32 size, u64 tick, char kind) {
+    const u32 n = std::min<u32>(size, 256u << 10);
+    std::scoped_lock lk{g_state->m};
+    g_state->entries.push_back({key, slot, n, p, XXH3_64bits(p, n), tick, kind});
+}
+/// The pixel shaders whose draws are watched (TLG_METAL_INPUT_WATCH_PS); empty: indirect draws.
+bool WatchDraw(u64 ps_hash, bool indirect) {
+    static const std::vector<u32> list = [] {
+        std::vector<u32> v;
+        if (const char* l = std::getenv("TLG_METAL_INPUT_WATCH_PS")) {
+            for (const char* q = l; *q;) {
+                char* end = nullptr;
+                v.push_back(u32(std::strtoull(q, &end, 16)));
+                if (!end || *end != ',') {
+                    break;
+                }
+                q = end + 1;
+            }
+        }
+        return v;
+    }();
+    if (list.empty()) {
+        return indirect;
+    }
+    return std::find(list.begin(), list.end(), u32(ps_hash)) != list.end();
+}
+} // namespace InputWatch
+
 namespace FrameLog {
 u64 g_draws = 0;
 namespace {
@@ -1257,6 +1382,22 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
                     NoteGpuWrite(stage_bindings[i].guest_addrs[k], stage_bindings[i].sizes[k]);
                 }
             }
+            if (InputWatch::Enabled() && pipeline->Stage(SwStage::Fragment) &&
+                InputWatch::WatchDraw(pipeline->Stage(SwStage::Fragment)->pgm_hash, indirect != nullptr)) {
+                InputWatch::Start(&scheduler);
+                const u64 key = pipeline->Stage(SwStage::Fragment)->pgm_hash | (1ull << 63);
+                const u64 tick = scheduler.CurrentTick();
+                if (i == 0) {
+                    InputWatch::Note(key);
+                }
+                const auto& sb = stage_bindings[i];
+                for (u32 k = 0; k < sb.num_buffers; ++k) {
+                    if (sb.guest_addrs[k] && !(sb.written_mask & (1u << k)) && sb.sizes[k]) {
+                        InputWatch::Add(key, k, static_cast<const u8*>(sb.buffers[k].contents) + sb.offsets[k], sb.sizes[k],
+                                        tick, GpuWritePending(sb.guest_addrs[k], sb.sizes[k]) ? 'g' : 'u');
+                    }
+                }
+            }
             writes_images |= stage_bindings[i].writes_images;
         }
     }
@@ -1468,24 +1609,35 @@ void Rasterizer::DrawImpl(bool is_indexed, u32 index_offset, const IndirectArgs*
         if (log_ind && pipeline->Stage(SwStage::Fragment) &&
             u32(pipeline->Stage(SwStage::Fragment)->pgm_hash) == u32(log_ind)) {
             static std::atomic<u32> logged{0};
-            if (logged.fetch_add(1) < 5000) {
+            static const u32 log_max = [] {
+                const char* v = std::getenv("TLG_METAL_LOG_INDIRECT_MAX"); // lines (default 5000)
+                return v ? u32(std::strtoul(v, nullptr, 0)) : 5000u;
+            }();
+            if (logged.fetch_add(1) < log_max) {
                 id<MTLBuffer> src = args_buffer, dst = new_args;
                 const u64 so = args_offset, dof = new_args_offset;
                 const u32 stride = indirect->stride, n = max_count;
                 const u32 vsgpr = indirect->vertex_sgpr_offset, isgpr = indirect->instance_sgpr_offset;
                 const bool idx = is_indexed;
                 const u64 guest_args = indirect->args;
-                scheduler.SignalOnCompletion([src, dst, so, dof, stride, n, vsgpr, isgpr, idx, guest_args] {
+                const u64 frame = FrameLog::g_frame;
+                // The arguments as recorded (the CPU's view now) beside the GPU's (the converted
+                // copy, made when the GPU ran the draw) and the guest memory at completion.
+                u32 rec[4][5]{};
+                for (u32 i = 0; i < n && i < 4; ++i) {
+                    const u32* a = reinterpret_cast<const u32*>(static_cast<const u8*>(src.contents) + so + u64(i) * stride);
+                    for (u32 k = 0; k < 5 && k * 4 < stride; ++k) {
+                        rec[i][k] = a[k];
+                    }
+                }
+                const bool gpu_pending = GpuWritePending(guest_args, u64(n) * stride);
+                scheduler.SignalOnCompletion([src, dst, so, dof, stride, n, vsgpr, isgpr, idx, guest_args, frame, rec, gpu_pending] {
                     for (u32 i = 0; i < n && i < 4; ++i) {
                         const u32* a = reinterpret_cast<const u32*>(static_cast<const u8*>(src.contents) + so + u64(i) * stride);
                         const u32* d = reinterpret_cast<const u32*>(static_cast<const u8*>(dst.contents) + dof + u64(i) * 20);
-                        static std::atomic<u32> printed{0};
-                        if (a[1] == 0 && printed.fetch_add(1) >= 20) {
-                            continue;
-                        }
-                        std::printf("indirect quad @%#llx %u/%u idx %d stride %u sgpr v%u i%u: guest %u %u %u %u %u -> %u %u %u %u %u\n",
-                                    (unsigned long long)guest_args, i, n, idx, stride, vsgpr, isgpr, a[0], a[1], a[2], a[3], stride >= 20 ? a[4] : 0,
-                                    d[0], d[1], d[2], d[3], d[4]);
+                        std::printf("indirect quad f%llu @%#llx %u/%u%s: recorded %u %u %u %u | gpu saw %u %u %u %u | now %u %u %u %u\n",
+                                    (unsigned long long)frame, (unsigned long long)guest_args, i, n, gpu_pending ? " (gpu-written)" : "",
+                                    rec[i][0], rec[i][1], rec[i][2], rec[i][3], d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3]);
                     }
                 });
             }
@@ -2526,94 +2678,6 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
         std::scoped_lock lk{watch->m};
         watch->entries.push_back({p, p[0], p[1], scheduler.CurrentTick(), std::chrono::steady_clock::now()});
     }
-    // Diagnosis: TLG_METAL_INPUT_WATCH=1: for every dispatch from the guest's compute queues, the
-    // read-only guest buffers it binds (up to 4 KB each) are hashed when recorded and again
-    // once the GPU has run the dispatch: which shaders' inputs the game overwrites before the
-    // GPU reads them (the recycled-memory race), per shader, every 5 s.
-    if (static const bool input_watch = std::getenv("TLG_METAL_INPUT_WATCH") != nullptr;
-        input_watch && lane_ == 1) {
-        struct Entry {
-            u64 cs;
-            u32 slot, size;
-            const u8* p;
-            u64 hash0, tick;
-        };
-        struct Stat {
-            u32 dispatches = 0, slots = 0, changed = 0, max_size = 0;
-            u32 changed_slots[32]{};
-        };
-        struct Watch {
-            std::mutex m;
-            std::vector<Entry> entries;
-            std::map<u64, Stat> stats;
-            Scheduler* sched = nullptr;
-            std::thread thread;
-            void Run() {
-                pthread_setname_np("InputWatch");
-                auto last = std::chrono::steady_clock::now();
-                for (;;) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(200));
-                    const u64 done = sched->CompletedTick();
-                    std::scoped_lock lk{m};
-                    for (size_t i = 0; i < entries.size();) {
-                        const Entry& e = entries[i];
-                        if (done < e.tick) {
-                            ++i;
-                            continue;
-                        }
-                        Stat& st = stats[e.cs];
-                        ++st.slots;
-                        if (XXH3_64bits(e.p, e.size) != e.hash0) {
-                            ++st.changed;
-                            ++st.changed_slots[e.slot];
-                        }
-                        entries[i] = entries.back();
-                        entries.pop_back();
-                    }
-                    const auto now = std::chrono::steady_clock::now();
-                    if (now - last > std::chrono::seconds(5)) {
-                        last = now;
-                        u32 total = 0, changed = 0;
-                        for (auto& [cs, st] : stats) {
-                            total += st.slots;
-                            changed += st.changed;
-                            if (st.changed) {
-                                std::string slots;
-                                for (u32 k = 0; k < 32; ++k) {
-                                    if (st.changed_slots[k]) {
-                                        slots += " b" + std::to_string(k) + ":" + std::to_string(st.changed_slots[k]);
-                                    }
-                                }
-                                std::printf("input watch: cs %08llx: %u dispatches, %u/%u inputs overwritten before the GPU read them (max %u B)%s\n",
-                                            (unsigned long long)cs, st.dispatches, st.changed, st.slots, st.max_size,
-                                            slots.c_str());
-                            }
-                        }
-                        std::printf("input watch: %u inputs checked, %u overwritten in 5 s\n", total, changed);
-                        stats.clear();
-                    }
-                }
-            }
-        };
-        static Watch* watch = [&] {
-            auto* w = new Watch;
-            w->sched = &scheduler;
-            w->thread = std::thread([w] { w->Run(); });
-            return w;
-        }();
-        std::scoped_lock lk{watch->m};
-        Stat& st = watch->stats[pipeline->hash];
-        ++st.dispatches;
-        const u64 tick = scheduler.CurrentTick();
-        for (u32 i = 0; i < b.num_buffers; ++i) {
-            if (!b.guest_addrs[i] || (b.written_mask & (1u << i)) || !b.sizes[i] || b.sizes[i] > 4096) {
-                continue;
-            }
-            const u8* p = static_cast<const u8*>(b.buffers[i].contents) + b.offsets[i];
-            st.max_size = std::max(st.max_size, b.sizes[i]);
-            watch->entries.push_back({pipeline->hash, i, b.sizes[i], p, XXH3_64bits(p, b.sizes[i]), tick});
-        }
-    }
     if (FrameLog::Enabled()) {
         FrameLog::NoteDispatch(pipeline->hash, u64(cs.dim_x) * cs.dim_y * cs.dim_z, indirect_args != 0);
     }
@@ -2655,6 +2719,23 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
             }
         }
     }
+    // Diagnosis: TLG_METAL_INPUT_WATCH=1 (InputWatch): the read-only guest inputs of every
+    // dispatch from the guest's compute queues, hashed when recorded and once the GPU ran it.
+    if (InputWatch::Enabled() && lane_ == 1) {
+        InputWatch::Start(&scheduler);
+        const u64 tick = scheduler.CurrentTick();
+        InputWatch::Note(pipeline->hash);
+        for (u32 i = 0; i < b.num_buffers; ++i) {
+            if (!b.guest_addrs[i] || (b.written_mask & (1u << i)) || !b.sizes[i]) {
+                continue;
+            }
+            const char kind = (input_mask & (1u << i)) || (snap_len && i == 2) ? 'c'
+                              : GpuWritePending(b.guest_addrs[i], b.sizes[i])     ? 'g'
+                                                                                   : 'u';
+            InputWatch::Add(pipeline->hash, i, static_cast<const u8*>(b.buffers[i].contents) + b.offsets[i],
+                            b.sizes[i], tick, kind);
+        }
+    }
     // The bindings travel as one block: buffers, offsets, textures, samplers, sizes, push data,
     // the snapshots.
     const u32 nb = b.num_buffers, nt = b.num_textures, ns = b.num_samplers;
@@ -2684,6 +2765,11 @@ void Rasterizer::DispatchImpl(VAddr indirect_args) {
     void* const ready_pso = pipeline->pso;
     // tlg: a pipeline still compiling (DeferredCompute): the encoder thread waits for it here.
     std::shared_ptr<DeferredPso> deferred = ready_pso ? nullptr : pipeline->deferred;
+    if (Scheduler::ParticleLanes() && lane_ == 1) {
+        job_lane = particle_shaders.count(pipeline->hash) ? 1 : 0;
+        scheduler.SelectLane(job_lane);
+        job_shaders.push_back(pipeline->hash);
+    }
     MetalScheduler::detail::UseCompute(scheduler, label[0] ? label : "dispatch");
     Scheduler::Impl* const si = scheduler.impl_();
     const bool barrier = std::exchange(dispatch_barrier, true);

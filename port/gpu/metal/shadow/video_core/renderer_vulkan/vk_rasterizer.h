@@ -15,6 +15,8 @@
 #include <thread>
 #include <algorithm>
 #include <chrono>
+#include <utility>
+#include <unordered_set>
 #include <vector>
 
 #include <boost/icl/interval_set.hpp>
@@ -108,8 +110,20 @@ public:
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
     /// tlg: 0 graphics, 1 compute (Scheduler::SelectLane, TLG_METAL_ASYNC_COMPUTE).
     void SelectLane(int lane) noexcept {
-        scheduler.SelectLane(lane);
+        // Particle lanes: a compute-queue packet selects the compute lane only through
+        // DispatchCompute / CopyBuffer (a particle job's dispatches and GDS store).
+        if (!Scheduler::ParticleLanes() || lane == 0) {
+            scheduler.SelectLane(lane);
+        }
         lane_ = lane;
+    }
+    /// tlg: particle jobs (TLG_METAL_ASYNC_COMPUTE=particles): the shaders of the compute jobs
+    /// that ended with a GDS store so far, the shaders of the job being recorded, its lane.
+    std::unordered_set<u64> particle_shaders;
+    std::vector<u64> job_shaders;
+    int job_lane = 0;
+    void EndJob() {
+        job_shaders.clear();
     }
     /// tlg: guest memory written by GPU work recorded on a lane (dispatches binding a written
     /// buffer, copies and fills into guest memory) since the last call for that lane.
@@ -229,6 +243,12 @@ public:
             }
         }
         return false;
+    }
+    /// tlg: a GDS store (a GPU copy of a GDS counter into guest memory) was recorded since the
+    /// last job flag: that flag waits for the GPU (RunComputeReleaseMem).
+    bool gds_copy_since_flag = false;
+    bool TakeGdsCopySinceFlag() {
+        return std::exchange(gds_copy_since_flag, false);
     }
     /// tlg: a render pass is open on the recording side (a commit now would split it).
     [[nodiscard]] bool IsRendering() const noexcept {

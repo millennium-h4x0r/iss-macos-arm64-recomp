@@ -679,6 +679,26 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
         return v && v[0] == '1';
     }();
     const bool guest_writes = rasterizer.TakeGuestWrites(1);
+    // tlg: a job flag after a GDS store waits for the GPU like the store's copy: the game reads
+    // the stored particle count right after the flag (inFAMOUS), and written when recorded the
+    // flag had it read a stale count, so its fires went out for ~8 frames, again and again
+    // (2026-11-07). Other flags stay written when recorded (lighting jobs seen late are
+    // dropped: gray frames). Exact, and the game then waits for the GPU at every particle job
+    // (on a loaded machine Seattle 27.5 -> 17.2 fps, the walk 29.9 -> 23.6; quiet: ~4%). Nothing
+    // cheaper worked: the counter's current value written early (TLG_METAL_GDS_EARLY) and the
+    // particle jobs on the second Metal queue (TLG_METAL_ASYNC_COMPUTE=particles) left the
+    // dropouts. TLG_METAL_CF_GDS_FLAG_DEFER=0: off (fast, fires and the smoke form drop out).
+    static const bool gds_flag_defer = [] {
+        const char* v = std::getenv("TLG_METAL_CF_GDS_FLAG_DEFER");
+        return !(v && v[0] == '0');
+    }();
+    const auto* rel = reinterpret_cast<const PM4CmdReleaseMem*>(task.packet);
+    const bool is_flag = rel->data_sel.Value() == DataSelect::Data32Low && rel->DataDWord() == 1 &&
+                         !TlgIsCounter(rel->Address<VAddr>());
+    const bool after_gds = is_flag && gds_flag_defer && rasterizer.TakeGdsCopySinceFlag();
+    if (is_flag) {
+        rasterizer.EndJob(); // particle lanes: the next dispatches belong to a new job
+    }
     // TLG_METAL_CF_NOW_CS=<hex>,...: labels after those compute shaders are written when
     // recorded (default a16fa93a: inFAMOUS's GPU merge sort, whose label written once the GPU
     // ran it left "Walk to Seattle" without lighting, gray. Its output is correct
@@ -707,7 +727,7 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
             const char* v = std::getenv("TLG_METAL_CF_NOW_CS");
             return v ? v : "a16fa93a";
         }();
-        list && listed(list)) {
+        list && !after_gds && listed(list)) {
         goto immediate;
     }
     // Diagnosis: TLG_METAL_CF_FINISH_CS=<hex>,...: after those shaders, wait for the GPU to
@@ -735,8 +755,8 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
                         (unsigned long long)deferred.exchange(0), (unsigned long long)now.exchange(0));
         }
     }
-    if (!TlgComputeFenceNow() && (guest_writes || !guest_rule) &&
-        !TlgComputeLabelNow(*reinterpret_cast<const PM4CmdReleaseMem*>(task.packet))) {
+    if (after_gds || (!TlgComputeFenceNow() && (guest_writes || !guest_rule) &&
+                      !TlgComputeLabelNow(*reinterpret_cast<const PM4CmdReleaseMem*>(task.packet)))) {
         rasterizer.WaitHostCopies();
         rasterizer.ProcessDownloadImages();
         const auto* packet = reinterpret_cast<const PM4CmdReleaseMem*>(task.packet);
