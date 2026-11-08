@@ -32,14 +32,32 @@ rm -f "$OUT"/frame_t*.png "$OUT"/*.raw "$OUT"/fps.txt
 # process name at the end, so never run it while the player's game is open.
 if pgrep -x iss-recomp >/dev/null; then echo "play.sh: the game is running (iss-recomp); quit it first" >&2; exit 1; fi
 
-# Save fixture
+# Only one play.sh at a time: two runs swapping the save folder at once deleted the player's
+# saves (2026-11-07: the second run stashed the first run's fixture copy, the first restored the
+# real saves, the second removed them and put the fixture copy back).
+LOCK=$WORK/play/.lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+    if [[ -f $LOCK/pid ]] && kill -0 "$(cat "$LOCK/pid")" 2>/dev/null; then
+        echo "play.sh: another run is in progress (pid $(cat "$LOCK/pid"))" >&2; exit 1
+    fi
+    rm -rf "$LOCK"; mkdir "$LOCK"
+fi
+echo $$ > "$LOCK/pid"
+# Save fixture. The player's saves are backed up first (work/saves/auto-backup-<time>, the last
+# 8 kept) and moved aside; a run that dies without restoring leaves them in .stash-<pid>.
 SAVES=$WORK/user/savedata
 STASH=
 if [[ $SAVE != keep ]]; then
-    if [[ -d $SAVES ]]; then STASH=$WORK/saves/.stash-$$; mv "$SAVES" "$STASH"; fi
+    if [[ -d $SAVES ]]; then
+        B=$WORK/saves/auto-backup-$(date +%Y%m%d-%H%M%S)
+        cp -R "$SAVES" "$B"
+        ls -dt "$WORK"/saves/auto-backup-* | tail -n +9 | xargs rm -rf 2>/dev/null
+        STASH=$WORK/saves/.stash-$$; mv "$SAVES" "$STASH"
+    fi
     if [[ $SAVE != fresh ]]; then cp -R "$WORK/saves/$SAVE" "$SAVES"; fi
 fi
 restore_save() {
+    rm -rf "$LOCK"
     [[ $SAVE == keep ]] && return
     rm -rf "$SAVES"
     [[ -n $STASH ]] && mv "$STASH" "$SAVES"
