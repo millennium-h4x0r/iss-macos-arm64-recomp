@@ -4,9 +4,6 @@ A native macOS port of inFAMOUS Second Son (PS4) for Apple Silicon. The game's x
 **statically recompiled** to ARM64 ahead of time (no Rosetta, no CPU emulator), the PS4 system
 is reimplemented, and graphics go through a **native Metal renderer**.
 
-This repository is a fork of [HayatoG/iss_pc](https://github.com/HayatoG/iss_pc), whose PS4
-runtime it builds on, and is focused solely on macOS.
-
 > **No game code, files or keys are included.** You need your own copy of the game, dumped from
 > your own PS4. The recompiler runs on your Mac against your dump and keeps everything it
 > generates in `recomp/work/`, which git ignores.
@@ -190,11 +187,12 @@ at a time.
 Without `TLG_METAL=1`, `recomp/build.sh` builds the older Vulkan renderer, which needs a Vulkan
 driver with sparse buffer support and is not covered here.
 
-## License and credits
+## License
 
-Forked from [HayatoG/iss_pc](https://github.com/HayatoG/iss_pc). Source files carry their own
-license headers; the GPU library under `port/gpu`, including the Metal renderer, is
-GPL-2.0-or-later.
+Forked from [HayatoG/iss_pc](https://github.com/HayatoG/iss_pc).
+
+Source files carry their own license headers; the GPU library under `port/gpu`, including the
+Metal renderer, is GPL-2.0-or-later.
 
 No game code, assets or keys are distributed here. inFAMOUS is a trademark of Sony Interactive
 Entertainment. This project is not affiliated with Sony Interactive Entertainment or Sucker Punch
