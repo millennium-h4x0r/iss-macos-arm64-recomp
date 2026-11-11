@@ -3,7 +3,7 @@
 # from Finder, Launchpad or Spotlight like any other app. The app holds a copy of the built
 # binary and a launcher; the game files, saves and settings stay where run.sh has them
 # (work/user, work/tlg.ini), and its output goes to work/game.log.
-#   ./install-app.sh [--vulkan] [destination.app]
+#   ISS_GAME_DIR=<dump> ./install-app.sh [--vulkan] [destination.app]
 # Metal build (TLG_METAL=1 ./build.sh runtime) by default; --vulkan installs the Vulkan one.
 # Run it again after a rebuild (the app keeps its own copy of the binary).
 set -euo pipefail
@@ -40,6 +40,7 @@ cat > "$STAGE/Contents/Resources/launcher" <<LAUNCH
 # Written by install-app.sh: starts the game through run.sh (its environment and arguments).
 export ISS_APP_BIN="\$(cd "\$(dirname "\$0")/../MacOS" && pwd)/iss-recomp"
 export ISS_METAL=$METAL
+export ISS_GAME_DIR="\${ISS_GAME_DIR:-$GAME}"   # the game folder given at install time
 exec "$ROOT/run.sh" "\$@"
 LAUNCH
 chmod +x "$STAGE/Contents/Resources/launcher"

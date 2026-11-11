@@ -30,6 +30,8 @@
 
 > **No game files come with this project.** To play, you need your own copy, dumped from your own PS4.
 
+> **macOS (Apple Silicon):** a native build for Apple Silicon Macs (static recompilation to ARM64 and a Metal renderer) is in [`recomp/`](recomp/README.md).
+
 By **HayatoG** · YouTube [@hayatog-dev](https://www.youtube.com/@hayatog-dev) · Discord [discord.gg/UMkdMYZh9g](https://discord.gg/UMkdMYZh9g)
 
 | | |
@@ -436,6 +438,8 @@ This project is not affiliated with Sony Interactive Entertainment or Sucker Pun
 **inFAMOUS Second Son** (PS4, CUSA00223, jogo base 1.00 + update 1.07) rodando no PC sem emulador de CPU: o código original do jogo roda nativo no processador, o sistema do PS4 é reimplementado e a GPU é traduzida para Vulkan. Usa o mesmo núcleo dos ports de [The Last Guardian](https://github.com/HayatoG/tlg_pc) e [Gravity Rush 2](https://github.com/HayatoG/gr2_pc).
 
 > **Nenhum arquivo do jogo vem com este projeto.** Para jogar, você precisa da sua própria cópia, tirada do seu PS4.
+
+> **macOS (Apple Silicon):** uma versão nativa para Macs com Apple Silicon (recompilação estática para ARM64 e um renderizador Metal) está em [`recomp/`](recomp/README.md).
 
 Por **HayatoG** · YouTube [@hayatog-dev](https://www.youtube.com/@hayatog-dev) · Discord [discord.gg/UMkdMYZh9g](https://discord.gg/UMkdMYZh9g)
 

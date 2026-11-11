@@ -1,170 +1,194 @@
-# iss_pc on Apple Silicon: static recompilation
+# inFAMOUS Second Son on Apple Silicon
 
-inFAMOUS Second Son running natively on Apple Silicon Macs (no Rosetta): the game's x86-64 code
-(eboot 1.07 + its `libc.prx` and `libSceFios2.prx`) is translated **once** into C and compiled
-for ARM64; the PS4 runtime (`port/src`) and the GPU library (`port/gpu`, shadPS4's video core)
-are compiled natively; graphics go through Vulkan on Metal (Mesa KosmicKrisp).
+A native Apple Silicon build of the [iss_pc](https://github.com/HayatoG/iss_pc) port. The game's
+x86-64 PS4 code is **statically recompiled** to ARM64 ahead of time (no Rosetta, no CPU
+emulator); the PS4 system runtime is the port's (`port/src`); graphics go through a **native
+Metal renderer** built on shadPS4's video core (`port/gpu/metal`).
 
-No game code is in this repository: the recompiler runs on your machine against your own dump
-and writes the generated sources to `recomp/work/` (git-ignored).
+> **No game code or assets are in this repository.** The recompiler runs on your machine,
+> against your own dump, and writes the generated sources to `recomp/work/` (git-ignored).
 
-## Layout
+## Status
 
-| Path | What |
+- **Playable from start to the Seattle open world** on an M1 Max (64 GB, macOS 27): the opening,
+  the cannery, the fire road, the walk to Seattle and free roam in Seattle, with lighting, fire,
+  smoke and particle effects rendering.
+- **About 30 FPS in most scenes at 1080p**, more in lighter ones. Heavy scenes are GPU-bound.
+- Recompiles the whole linked image: ~46,000 functions, ~2.5 M instructions, ~910 switch tables.
+- Only tested on one machine. Other Apple Silicon Macs should work but have not been tried.
+
+Known issues:
+
+- **Shader pop-in after an update.** The first launch of a new build compiles shaders: for a few
+  minutes, effects can appear a moment late (Metal's shader cache is per binary).
+- **A rare gray frame.** On the walk to Seattle, about one frame in several hundred can come out
+  gray. See [How the renderer works](#how-the-renderer-works) for the cause.
+- **Speed depends on what else uses the GPU.** Several high-resolution or scaled external displays
+  keep WindowServer busy and cost frames; fullscreen helps.
+
+## Requirements
+
+- An Apple Silicon Mac. macOS 14 is the minimum the app declares; tested on macOS 27.
+- Xcode Command Line Tools (`clang`, `swiftc`): `xcode-select --install`.
+- [Homebrew](https://brew.sh) packages:
+  ```
+  brew install cmake ninja pkgconf sdl3 ffmpeg freetype fmt boost robin-map xxhash zydis \
+               vulkan-headers vulkan-loader spirv-cross glslang python@3.13
+  ```
+- Python 3 with [Capstone](https://www.capstone-engine.org) for the recompiler (a venv below).
+- **Your own copy of the game**, dumped from your own PS4: inFAMOUS Second Son with the 1.07
+  update merged into one folder (the one with `eboot.bin`). Tested with CUSA00004 1.07; the
+  upstream port targets CUSA00223 (US) 1.07. See the main [README](../README.md#required-game-files).
+- About 1 GB of disk for the generated sources and the build, plus shader caches over time.
+
+## Build
+
+```sh
+git clone --recursive <this repository> iss_pc && cd iss_pc/recomp
+GAME="/path/to/your/dump"        # the folder with eboot.bin
+
+# Third-party headers the build expects (not committed)
+git clone --depth 1 https://github.com/simd-everywhere/simde third_party/simde
+mkdir -p third_party/vma/include
+curl -L -o third_party/vma/include/vk_mem_alloc.h \
+  https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/master/include/vk_mem_alloc.h
+
+# 1. Prepare the guest image from your dump (the port's scripts)
+mkdir -p work/out
+python3 ../port/scripts/prepare.py      "$GAME" --out work/out
+python3 ../port/scripts/link_libc.py    "$GAME" --out work/out
+python3 ../port/scripts/link_modules.py "$GAME" --out work/out
+python3 ../port/scripts/content_profile.py "$GAME" --out work/out --sku full
+
+# 2. Recompile the game's code to C (once; again after changing the lifter)
+python3 -m venv work/venv && work/venv/bin/pip install capstone
+work/venv/bin/python -I lifter/lift.py work/out/boot-linked.bin "$GAME" work/gen
+
+# 3. Build with the Metal renderer
+TLG_METAL=1 ./build.sh
+
+# 4. Install as an app ("/Applications/inFAMOUS Second Son.app")
+ISS_GAME_DIR="$GAME" ./install-app.sh
+```
+
+Then start **inFAMOUS Second Son** from Finder, Launchpad or Spotlight. After a rebuild, run
+`./install-app.sh` again (the app keeps its own copy of the binary; it refuses while the game is
+running).
+
+To run from a terminal instead: `ISS_METAL=1 ISS_GAME_DIR="$GAME" ./run.sh`. If the dump lives
+next to the repository as `CUSA00004[Infamous Second Son]/extracted/uroot`, `ISS_GAME_DIR` is not
+needed.
+
+`./build.sh runtime` relinks without recompiling the generated code. `./build.sh` without
+`TLG_METAL=1` builds the older Vulkan renderer (see [Vulkan renderer](#vulkan-renderer-older)).
+
+## Playing
+
+- **Port menu:** F12, the key left of 1 (Macs have no Insert key), or R3+L2 on a controller.
+  Settings are saved to `work/tlg.ini`.
+- **Saves** are in `work/user/savedata/`, the log in `work/game.log`.
+- **Native render resolution:** `iss_native_output=1` and `iss_native_percent=<25..100>` in
+  `work/tlg.ini` (or the menu's Native rendering tab) render the 3D scene below 1920x1080 with the
+  HUD at full size.
+- The game runs as an app bundle on purpose: macOS treats an unbundled binary as a background
+  process, evicts its GPU memory and pages it back in under the kernel GPU lock (a desktop-wide
+  freeze), and gives it no Game Mode.
+- A small guard (`tests/wsguard.swift`, started by `run.sh`) pauses the game while WindowServer
+  stops answering, so a long GPU stall can never reach WindowServer's watchdog, which would restart
+  the desktop. `ISS_WSGUARD=0` turns it off.
+
+Switches for terminal runs (`./run.sh`):
+
+| Variable | Effect |
 |---|---|
-| `lifter/image.py` | reads the linked guest image (`port/scripts/link_modules.py` output) and the modules' unwind tables |
-| `lifter/lift.py` | function discovery (unwind tables, calls, relocations, address-taken code), switch tables, C emission |
-| `lifter/x86emit.py`, `simd.py`, `x87emit.py` | x86-64 / SSE / AVX / F16C / SSE4a / x87 instruction semantics |
-| `lifter/audit_tables.py` | lists indirect jumps that look like switch tables but did not resolve |
-| `rt/x86.h`, `x87.h`, `pcmpstr.h` | guest CPU state (`Ctx`) and the helpers the generated code calls |
-| `rt/dispatch.c` | guest address -> function table, import thunks, guest calls from host code, threads, cpuid/rdtsc/MXCSR |
-| `rt/hostcall.S` | System V argument registers -> AAPCS64 call into the PS4 runtime |
-| `rt/main.c` | loader: address-space reservation, relocation, imports, GPU start, module init, entry |
-| `rt/compat_include/` | Linux/x86 API stand-ins for macOS (timed locks, x86 intrinsics via SIMDe, ...) |
-| `third_party/simde`, `third_party/vma` | SIMDe (x86 SIMD on NEON), Vulkan Memory Allocator header |
-| `build.sh`, `run.sh` | build everything into `work/iss-recomp`; prepare the image and run |
+| `ISS_GAME_DIR=<dir>` | the game folder (with `eboot.bin`) |
+| `ISS_METAL=1` | use the Metal build (`work/iss-recomp-metal`); the app always does |
+| `ISS_DIRECT=1` | run the binary directly (debuggers, `sample`) |
+| `TLG_METAL_CF_GDS_FLAG_DEFER=0` | faster in heavy scenes, but fires and the smoke form can drop out |
+| `TLG_METAL_SHADER_WAIT_MS=<ms>` | how long a frame may wait for new shaders per second (default 100) |
+| `TLG_METAL_HITCH_MS=<ms>` | log frames slower than that, with what they waited for |
 
 ## How it works
 
-- Every guest function becomes `void F_<offset>(Ctx *c)`. Guest registers are C locals (spilled
-  to `Ctx` around calls); flags are locals the C compiler removes when unused. The guest stack is
-  real memory: calls push return addresses exactly as on x86, so stack arguments, varargs and the
-  guest's own `longjmp`-free unwinding keep working.
-- Indirect calls/jumps go through `recomp_lookup` (hash of guest offset -> function). Switch
-  tables become C `switch`es on the computed target; register/vtable tail calls use `musttail`.
-- Imports are fake guest addresses; their thunks call the port's runtime through `hostcall.S`.
-  Host function pointers handed to the guest (exit handler, dlsym) get a slot on first use.
-- Guest memory layout on Apple Silicon (below the 1 TiB the guest's 40-bit pointers allow, above
-  the commpage/GPU carveout at `[0xfc0000000, 0x7000000000)`): PS4 user range
-  `0x7000000000-0xe000000000`, image at `0xe000000000`, guest stacks/TLS from `0xe100000000`.
-- GPU page tracking uses 16 KiB pages (the host page size); the shader recompiler's SRT walker is
-  a bytecode interpreter instead of x86 JIT code.
+### Static recompilation
 
-## Build and run
+- Every guest function becomes `void F_<offset>(Ctx *c)` in `work/gen/`. Guest registers are C
+  locals (spilled to `Ctx` around calls); flags are locals the C compiler removes when unused.
+  The guest stack is real memory: calls push return addresses exactly as on x86, so stack
+  arguments, varargs and the guest's own unwinding keep working.
+- Indirect calls and jumps go through `recomp_lookup` (a hash of the guest offset); switch tables
+  become C `switch`es on the computed target; register and vtable tail calls use `musttail`.
+- Imports are fake guest addresses whose thunks call the port's runtime through `rt/hostcall.S`
+  (System V to AAPCS64).
+- Guest loads and stores (other than stack-relative ones) are acquire/release (`LDAPR`/`STLR`),
+  which gives x86's TSO ordering between threads.
+- Guest memory layout below the 1 TiB that the guest's 40-bit pointers allow: PS4 user range
+  `0x7000000000-0xe000000000`, image at `0xe000000000`, guest stacks and TLS from
+  `0xe100000000`.
 
-```
-brew install cmake ninja pkg-config sdl3 ffmpeg freetype fmt boost robin-map xxhash zydis vulkan-loader vulkan-headers llvm meson
-python3 -m venv /tmp/venv && /tmp/venv/bin/pip install capstone      # the lifter's disassembler
-# KosmicKrisp with sparse buffers (shadPS4's build): see "Vulkan driver" below
-/tmp/venv/bin/python -I lifter/lift.py work/out/boot-linked.bin <game dir> work/gen   # once per lifter change
-./build.sh
-./run.sh            # ISS_GAME_DIR=<dump> to choose the game folder
-```
+### How the renderer works
 
-`run.sh` prepares `work/out/boot-linked.bin` with the port's scripts on first use. It runs the
-game as an app bundle (`work/inFAMOUS.app`, launched through LaunchServices with `open`): an
-unbundled binary is a background process to macOS (RunningBoard `anon<...> running-NotVisible`),
-whose GPU memory the system evicted mid-game (17 GB down to 7 GB) and paged back in under the
-kernel GPU lock, freezing the whole desktop; the bundle also carries the games category for Game
-Mode. Output goes to `work/game.log` and is echoed. `ISS_DIRECT=1` runs the binary directly
-(debuggers, `sample`).
+`port/gpu/metal` replaces shadPS4's Vulkan backend: its command processor and shader recompiler
+(GCN to SPIR-V) feed Metal, with SPIRV-Cross translating SPIR-V to MSL.
 
-`run.sh` also starts `work/wsguard` (`tests/wsguard.swift`), which pings WindowServer every
-0.5 s and pauses the game (SIGSTOP) while WindowServer does not answer for 1.5 s, resuming it
-afterwards: a stall then cannot reach WindowServer's 40 s watchdog, which restarts the desktop.
-It never kills the game: tearing down its GPU memory needs the same kernel lock. `ISS_WSGUARD=0`
-turns it off.
+- **Unified memory:** guest memory is one `MTLBuffer` over the game's own pages, so the GPU writes
+  results in place and CPU reads of GPU data need no download.
+- **Shaders:** translations and compiled MSL are cached on disk (`work/user/metal-*-cache.bin`).
+  New shaders compile in parallel off the command processor, and a frame waits for them within a
+  budget instead of skipping draws, so effects do not blink.
+- **Encoding:** a separate encoder thread turns the recorded work into Metal command buffers.
+  Writes to guest memory are ordered with fences, since Metal does not track that buffer.
+- **Labels and timing:** the GPU runs about a frame behind the game, while the game waits on GPU
+  labels in memory and recycles a job's memory soon after it sees the job's completion flag.
+  Job flags are written when the work is recorded (a job seen late is dropped, which gave gray
+  frames); timeline counters, and flags after a GPU particle-count copy, are written when the GPU
+  has finished (an early count made fires and the smoke form vanish). Small job inputs are copied
+  when recorded, and graphics shaders get a short loop guard, so memory the game has already
+  reused cannot hang the GPU. The rare gray frame is what is left of this.
 
-Native render resolution: `iss_native_output=1` and `iss_native_percent=<25..100>` in
-`work/tlg.ini` (or the port menu's Native rendering tab) render the 3D scene below 1920x1080
-with the HUD at full size. The port's patch is for the US 01.07 executable; the EU 01.07 one
-matches it byte for byte at every site. The lifter patches the resolution-independent sites
-(`lifter/iss_native_sites.json`, written by `tools/native_sites.c`) and reads the six size
-immediates from guest memory, where `rt/main.c` writes the chosen values after checking every
-site. Scenes above 1080p need the exposure patches and are refused.
+The development log, with measurements and the reasoning behind each choice, is in
+[`docs/metal-backend.md`](docs/metal-backend.md).
 
-### Vulkan driver
+## Repository layout
 
-The GPU library needs sparse buffers. Homebrew's Mesa KosmicKrisp lacks them; shadPS4's build
-(`github.com/shadexternals/mesa-kosmickrisp`, a Mesa fork with sparse buffers and geometry
-shaders) has them. Build it next to this repository; `run.sh` prefers it.
+| Path | What |
+|---|---|
+| `lifter/` | the recompiler: image reader, function discovery, switch tables, x86-64 / SSE / AVX / x87 semantics, C emission |
+| `rt/` | the runtime the generated code runs on: CPU state, dispatch, host calls, loader (`main.c`), macOS stand-ins for Linux/x86 APIs |
+| `../port/gpu/metal/` | the Metal renderer |
+| `build.sh`, `run.sh`, `install-app.sh` | build, run, install as an app |
+| `tests/play.sh` | plays a route with scripted controller input and reports frame times, frame dumps and logs |
+| `tests/semtest/` | lifted instruction semantics checked against real x86 (Rosetta as the oracle) on random states |
+| `tests/wsguard.swift` | the WindowServer guard |
+| `tools/native_sites.c` | finds the native-resolution patch sites |
+| `patches/kosmickrisp.patch` | for the older Vulkan renderer's driver |
 
-Apply `patches/kosmickrisp.patch` to its `externals/mesa` first. After changing it, rebuild
-with `ninja` in `build/externals/mesa/build-target` and copy the dylib to `build/outputs/` (the
-top-level CMake build does not notice source edits; never copy it over a running game). It:
+`tests/play.sh <route> [seconds] [save]` routes include `opening`, `explore`, `dash` and `roam`. A
+save fixture is a copy of a `work/user/savedata` folder kept as `work/saves/<name>`. The script
+backs up your own saves to `work/saves/auto-backup-*` before swapping them in, and only one run
+can be active at a time.
 
-- commits the device residency set only when allocations changed (upstream committed and
-  re-requested residency of all ~14 GB on every `vkQueueSubmit`, holding the kernel GPU lock long
-  enough for WindowServer's watchdog to restart the desktop);
-- recycles command-buffer upload BOs (pool cap 32 -> 1024) and large scratch BOs (a 1 GB device
-  cache) instead of creating and destroying ~500 MTLHeaps a second, each a residency commit;
-- adds a GPU watchdog: when a residency commit or queue submit holds the GPU for over 100 ms,
-  submissions are spaced 20 ms apart for a while so WindowServer gets the lock
-  (`KK_GPU_WATCHDOG=0` disables);
-- `KK_RESIDENCY_STATS=1`: every 2 s, residency commits, BO churn, GPU busy time, encoders,
-  render passes and their split reasons, barrier stage masks and estimated attachment traffic;
-- `KK_LIGHT_BARRIERS=1` (opt-in): replaces the full barrier after every encoder with queue
-  barriers where needed. No gain measured: the port records a barrier between nearly every
-  pair of passes.
-- keys the pipeline cache on `MESA_KK_DISABLE_WORKAROUNDS` (the workarounds change the MSL);
-- `KK_MSL_DUMP=<dir>`: writes each generated MSL shader as `<SPIR-V blake3>_<stage>_<n>.metal`
-  (Mesa's `MESA_SPIRV_DUMP_PATH` names the SPIR-V the same way);
-- `KK_PRIVATE_MEMORY=1` (opt-in): a second, device-local-only memory type backed by private
-  Metal heaps; optimal-tiling images go there (lossless compression possible, ~6 GB less
-  "in use" GPU memory). No frame time gain measured.
+## Vulkan renderer (older)
 
-## Performance notes (2026-11-02)
+`./build.sh` without `TLG_METAL=1` builds shadPS4's Vulkan renderer, which runs on Vulkan-on-Metal
+(Mesa KosmicKrisp). It needs a KosmicKrisp build with sparse buffers, such as
+[shadexternals/mesa-kosmickrisp](https://github.com/shadexternals/mesa-kosmickrisp) cloned next to
+this repository, with `patches/kosmickrisp.patch` applied (residency, buffer recycling and a GPU
+watchdog for macOS). It is slower than the Metal renderer and kept for comparison;
+`./install-app.sh --vulkan` installs it as a separate app.
 
-Cannery gameplay (`tests/play.sh explore`, fullscreen): ~24-25 FPS, median frame 33 ms (was
-~21-23 FPS, median 50 ms). Opening (spray scene): ~31 FPS. Measured with the Metal System
-Trace (`xcrun xctrace`), `/usr/bin/sample` and the counters below.
+## Credits and legal
 
-- **Readbacks (fixed).** The game reads GPU-written memory ~80 times a second. Each read made
-  the draw recording thread download it with `Scheduler::Finish`: the whole GPU drained, about
-  half of that thread's time, an idle GPU gap every frame (`TLG_READBACK_STATS=1` shows them,
-  with the guest regions). `run.sh` now turns on unified memory (`TLG_UNIFIED_MEMORY=1`,
-  `TLG_UNIFIED_RANGE=0x7048000000:0xc0000000`): the game's direct memory heaps are imported as
-  one Vulkan buffer, the GPU writes the guest's bytes in place and reads need no download.
-  The default range in `unified_memory.h` is the PS4 address; the recompiled image maps guest
-  memory 0x6000000000 higher. Readbacks: 0 per second.
-- **Frame pacing.** The game waits for the previous frame's GPU completion label (spin loop at
-  guest 0x1f2700), so the CPU never runs more than a frame ahead; `frames_queued` 0/1/2 makes
-  no difference. Frames land on 60 Hz vblanks (33/50 ms) because `TLG_VBLANK_HZ=60`: without
-  the frame rate patch (not available locally) the engine steps time per vblank.
-- **WindowServer** uses ~20% of the GPU with no game running (6K XDR plus two displays);
-  windowed play added ~7%. `display_mode=fullscreen` in `tlg.ini` removes that share.
-- **GPU work** is ~28 ms per frame in ~180 render passes, ~320 barriers and one ~4 ms compute
-  encoder; ~8 ms more is bubbles between encoders. Most pass ends are real data dependencies
-  (a render target sampled by the next draw). `TLG_HOIST_BARRIERS=1` (opt-in) records the
-  barriers that order nothing inside the open pass ahead of it and keeps the pass open; only
-  ~4% qualify, no frame time change. Private image memory (above) did not change it either.
-  `TLG_PASS_STATS=1` prints pass reopen statistics, the callers that end passes, and the
-  hoisting refusal reasons.
-- **Shader math (fixed).** The recompiler decorates every float add/mul `NoContraction` and
-  requests signed zero/inf/nan preservation; KosmicKrisp turns that into Metal's `safe` math
-  mode, an opaque guard on every multiply, and `coherent` on every buffer access (workarounds
-  6, 14, 17 for macOS 26 compiler bugs that only CTS edge cases hit). `run.sh` now sets
-  `TLG_FAST_FP=1` and `MESA_KK_DISABLE_WORKAROUNDS=6,14,17`: cannery ~24 -> ~30 FPS (p90
-  33 ms), no visible difference. The game has no frame cap (it sets flip rate 0; at 60 Hz a
-  quarter of frames take 16.7 ms): it runs as fast as CPU and GPU allow. `ISS_STRICT_SHADERS=1` restores them.
-  SPIRV-Cross would carry the same cost (`[[clang::optnone]]` fma helpers per `NoContraction`
-  op), so this is a property of the shaders, not of the Vulkan layer.
-- Lowering the scene resolution (native resolution above, 75%) gained ~2%: not pixel bound.
-- iTerm2's Metal renderer can take a large share of the GPU while its window is visible.
+- [HayatoG/iss_pc](https://github.com/HayatoG/iss_pc): the PC port this builds on (PS4 runtime,
+  scripts, game fixes).
+- [shadPS4](https://github.com/shadps4-emu/shadPS4): the video core and shader recompiler
+  (GPL-2.0-or-later); the Metal renderer extends them under the same license.
+- [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross), [SIMDe](https://github.com/simd-everywhere/simde),
+  [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator),
+  [Capstone](https://www.capstone-engine.org), [SDL](https://libsdl.org), [FFmpeg](https://ffmpeg.org),
+  [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), and Mesa KosmicKrisp for the Vulkan
+  renderer.
 
-## Status (2026-11-01)
-
-- **Playable on an M1 Max**: boots to the title screen, plays the intro text and the opening
-  (Delsin at the billboard, first graffiti prompt). ~23 FPS there, limited by the GPU library's
-  command thread, not by the recompiled game code.
-- Recompiles the whole linked image: ~46,000 functions, ~2.5 M instructions, ~910 switch tables.
-- `tests/semtest`: 1,019 instruction forms the game uses, run on real x86 (Rosetta, as a test
-  oracle only) and as lifted ARM64 C on random states. Remaining differences are undefined
-  flags (imul SF/ZF/PF, multi-bit shift OF), the sign of the default NaN, rcp/rsqrt
-  approximations, and two Rosetta quirks (cmpxchg flags, 32-bit movsxd).
-- `tests/autoplay.sh`: unattended run that taps a button and dumps frames to `work/auto/`.
-- `tests/play.sh <opening|explore> [seconds] [save]`: plays with simulated controller input
-  (`TLG_PAD_FILE`) under the guards and reports FPS, GPU utilization and memory every 10 s, plus
-  frame dumps, in `work/play/<route>/`. `opening` starts without a save (cutscenes, tilt and
-  shake the can, spray); `explore` loads `work/saves/cannery-escape` and runs, turns, jumps,
-  climbs, fights and interacts. The player's own save is moved aside and put back.
-- `tests/spray.sh`: the older opening route with a WindowServer ping log.
-- `tests/flicker.sh`: dumps runs of consecutive frames and reports frame-to-frame differences.
-- Memory ordering: guest loads/stores other than rsp-relative ones are acquire/release
-  (`LDAPR`/`STLR`, x86.h), which gives x86's TSO ordering between threads; accesses straddling a
-  16-byte block take a plain access plus barrier. `-DRECOMP_WEAK_MEMORY` restores plain accesses.
-- The port's menu opens with F12 or the key left of 1 (Macs have no Insert key), or R3+L2.
-
-Known limits: SSE/x87 memory accesses are plain (ordered only through the GPR accesses around
-them); NaNs created by x86 operations have a positive sign; the dependence on
-shadPS4's KosmicKrisp build.
+No game code, assets or keys are included; play only with a copy you own, dumped from your own
+console. inFAMOUS Second Son is a trademark of Sony Interactive Entertainment. This project is not
+affiliated with Sony Interactive Entertainment or Sucker Punch Productions.
