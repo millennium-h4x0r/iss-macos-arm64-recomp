@@ -109,12 +109,11 @@ static inline int iss_native_plan(IssNativeConfig c, IssNativePlan *p) {
     p->percent=c.percent; p->hud_edges=c.hud_edges;p->ui_16_9=c.ui_16_9;
     return 1;
 }
-/* ---- Internal resolution as a height (shared by the launchers and the in-game menu) ----
+/* ---- Internal resolution as a height (used by the in-game menu) ----
  * The ini keeps only the output preset and the percent; the player thinks in "render 720p,
  * show 1440p". iss_native_pick() turns a wanted scene height into the percent to store (the
  * closest the integer percent allows, lowest percent on a tie), and reports an inexact result and
- * a refused request instead of hiding them. port/launcher/native_resolution.py is the same
- * arithmetic and tests/native_resolution_cases.txt feeds both. */
+ * a refused request instead of hiding them. */
 enum { ISS_NATIVE_STEPS = 6 };
 static const uint32_t iss_native_step_heights[ISS_NATIVE_STEPS] = {540,720,900,1080,1440,2160};
 enum { ISS_NATIVE_PICK_OK = 1, ISS_NATIVE_PICK_BUDGET = 0, ISS_NATIVE_PICK_RANGE = -1, ISS_NATIVE_PICK_OUTPUT = -2 };
