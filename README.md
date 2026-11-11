@@ -1,43 +1,51 @@
 # inFAMOUS Second Son for Apple Silicon Macs
 
-A native macOS port of inFAMOUS Second Son (PS4) for Apple Silicon. The game's x86-64 code is
-**statically recompiled** to ARM64 ahead of time (no Rosetta, no CPU emulator), the PS4 system
-is reimplemented, and graphics go through a **native Metal renderer**.
+<p align="center"><img src="docs/screenshots/hero.jpg" width="900" alt="Delsin drawing in a power, running natively on a Mac with the frame-rate overlay on"></p>
 
-> **No game code, files or keys are included.** You need your own copy of the game, dumped from
-> your own PS4. The recompiler runs on your Mac against your dump and keeps everything it
-> generates in `recomp/work/`, which git ignores.
+**inFAMOUS Second Son, running natively on Apple Silicon.** The PS4 game's code is recompiled to
+ARM64 ahead of time, so there is no emulator and no Rosetta, and every frame is drawn by a native
+Metal renderer.
 
-## Status
+- **Works well from the start to the Seattle open world**, with the game's lighting, fire, smoke
+  and particle effects.
+- **30–45 FPS at 1080p** on an M1 Max ([benchmark](#benchmark)).
+- **Native ARM64 code:** all of the game's ~46,000 functions, compiled ahead of time.
+- **Native Metal renderer:** shaders translated to Metal, compiled in the background and cached.
+- **Play your way:** DualShock 4 and DualSense with gyro and touchpad, other controllers, or
+  keyboard and mouse.
+- **A real Mac app:** installs to Applications and starts from Launchpad or Spotlight, with Game
+  Mode.
 
-- **Playable from the start to the Seattle open world** on an M1 Max (64 GB, macOS 27): the
-  opening, the cannery, the fire road, the walk to Seattle and free roam in Seattle, with
-  lighting, fire, smoke and particle effects.
-- **About 30 FPS in most scenes at 1080p**, more in lighter ones. Heavy scenes are GPU-bound.
-- Tested on one machine. Other Apple Silicon Macs should work but have not been tried.
+> **No game files included.** Bring your own copy of the game, dumped from your own PS4. The
+> recompiler runs on your Mac and keeps everything it generates in `recomp/work/`, which git
+> ignores.
 
-Known issues:
+<p align="center"><img src="docs/screenshots/seattle.jpg" width="900" alt="Delsin on a rainy street in Seattle's Queen Anne district"></p>
 
-- **Shader pop-in after an update.** The first launch of a new build compiles shaders, and for a
-  few minutes effects can appear a moment late (Metal's shader cache is per binary).
-- **A rare gray frame** on the walk to Seattle, about one frame in several hundred
-  ([why](#how-the-renderer-works)).
-- **Speed depends on what else uses the GPU.** Several high-resolution or scaled external
-  displays keep WindowServer busy and cost frames; fullscreen helps.
+## Benchmark
+
+| Scene | Average FPS |
+|---|---|
+| Walk to Seattle | 43 |
+| Seattle open world | 35 |
+| Cannery | 34 |
+| Fire road | 30 |
+
+Apple M1 Max (64 GB), 1920×1080 in a window, vsync on. Each scene is played for about a minute
+after loading, with scripted controller input (`recomp/tests/play.sh`). Fullscreen is faster.
 
 ## Requirements
 
-- An Apple Silicon Mac. macOS 14 is the minimum the app declares; tested on macOS 27.
+- An Apple Silicon Mac with a recent version of macOS.
 - Xcode Command Line Tools (`clang`, `swiftc`): `xcode-select --install`.
 - [Homebrew](https://brew.sh) packages:
   ```
   brew install cmake ninja pkgconf sdl3 ffmpeg freetype fmt boost robin-map xxhash zydis \
                vulkan-headers vulkan-loader spirv-cross glslang python@3.13
   ```
-- **Your own dump of the game** with the 1.07 update merged in (the folder with `eboot.bin`).
-  Tested with CUSA00004 1.07. Other 1.07 dumps such as CUSA00223 should work the same way, since
-  the code is recompiled from your own dump.
-- About 1 GB of disk for the generated sources and the build, plus shader caches over time.
+- **Your own dump of the game** with the 1.07 update merged in (the folder with `eboot.bin`), for
+  example CUSA00004 or CUSA00223.
+- About 1 GB of free disk space for the generated sources and the build.
 
 ## Build and install
 
@@ -82,6 +90,8 @@ not needed. `./build.sh runtime` relinks without recompiling the generated code.
 
 - **Port menu:** F12, the key left of 1 (Macs have no Insert key), or R3+L2 on a controller.
   Settings are saved to `recomp/work/tlg.ini`.
+- **Frame-rate overlay:** F10, or "Show overlay" in the menu.
+- **Fullscreen** gives the best frame rate (the menu, or `display_mode=fullscreen` in `tlg.ini`).
 - **Saves** are in `recomp/work/user/savedata/`; the log is `recomp/work/game.log`.
 - **Native render resolution:** `iss_native_output=1` and `iss_native_percent=<25..100>` in
   `tlg.ini` (or the menu's Native rendering tab) render the 3D scene below 1920x1080 with the HUD
@@ -162,10 +172,16 @@ with Metal.
   frames); timeline counters, and flags after a GPU particle-count copy, are written when the GPU
   has finished (an early count made fires and the smoke form vanish). Small job inputs are copied
   when recorded, and graphics shaders get a short loop guard, so memory the game has already
-  reused cannot hang the GPU. The rare gray frame is what is left of this.
+  reused cannot hang the GPU.
 
 The development log, with the measurements behind each choice, is in
 [`recomp/docs/metal-backend.md`](recomp/docs/metal-backend.md).
+
+## Known issues
+
+- The first start after an update compiles shaders: for a few minutes, effects can appear a
+  moment late.
+- On the walk to Seattle, a frame occasionally comes out gray.
 
 ## Repository layout
 
@@ -183,9 +199,6 @@ The development log, with the measurements behind each choice, is in
 `recomp/work/user/savedata` folder kept as `recomp/work/saves/<name>`. The script backs up your own
 saves to `recomp/work/saves/auto-backup-*` before swapping them in, and only one run can be active
 at a time.
-
-Without `TLG_METAL=1`, `recomp/build.sh` builds the older Vulkan renderer, which needs a Vulkan
-driver with sparse buffer support and is not covered here.
 
 ## License
 
